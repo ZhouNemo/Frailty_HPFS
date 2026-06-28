@@ -1,0 +1,302 @@
+---
+title: "Risk-Set Matched Piecewise Frailty Trajectories"
+author: "XZ"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 2.2_cancer record.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Builds risk-set matched piecewise frailty trajectory analyses using cancer registry or cancer record information to define incident cancer timing.
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 11, fig.height = 6
+)
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(lubridate)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(knitr)
+```
+
+### 1. Data Preparation & Initial Cohort Definition
+
+```{r data_prep}
+# Load Imputed Data
+fi_long <- readRDS("/n/home06/xyzhou/Frailty/2_data analysis/before and after cancer/data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
+target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
+
+# Extract Baseline Covariates (Cycle 86)
+baseline_covs <- fi_long %>%
+  filter(cycle == "86") %>%
+  select(
+    id,
+    age_months   = age_enrollment, 
+    base_race    = race,
+    base_marital = marital_status,
+    base_living  = living_arr,
+    base_pckgr   = pckgr
+  ) %>%
+  mutate(base_age = age_months / 12) %>%
+  select(-age_months) %>%
+  drop_na()
+
+# Standardize Years for Target Cycles
+fi_prep <- fi_long %>%
+  filter(cycle %in% target_cycles) %>%
+  mutate(
+    Year_num = case_when(
+      as.numeric(cycle) > 50 ~ 1900 + as.numeric(cycle),
+      TRUE ~ 2000 + as.numeric(cycle)
+    )
+  )
+
+# Identify and Exclude Baseline Cancer
+baseline_cancer_ids <- fi_prep %>%
+  group_by(id) %>%
+  arrange(Year_num) %>%
+  slice(1) %>%
+  filter(fi_cancer == 1) %>%
+  pull(id)
+
+# Identify Timing of Incident Cancer
+cancer_timing <- fi_prep %>%
+  filter(!id %in% baseline_cancer_ids) %>%
+  filter(fi_cancer == 1) %>%
+  group_by(id) %>%
+  summarise(Year_Cancer = min(Year_num), .groups = "drop") 
+
+# Build FULL Analytic Cohort (Cases AND Controls before matching)
+analysis_long <- fi_prep %>%
+  filter(!id %in% baseline_cancer_ids) %>%
+  left_join(cancer_timing, by = "id") %>%
+  inner_join(baseline_covs, by = "id") %>%
+  mutate(
+    everCancer = if_else(!is.na(Year_Cancer), 1L, 0L),
+    fi_score_nocancer = if_else(n_answered_nocancer < 20, NA_real_, fi_score_nocancer),
+    base_race = as.factor(base_race),
+    base_marital = as.factor(base_marital),
+    base_living = as.factor(base_living),
+    base_pckgr = as.factor(base_pckgr)
+  ) %>%
+  filter(participated == 1, !is.na(fi_score_nocancer)) %>%
+  group_by(id) %>% filter(n() >= 2) %>% ungroup() %>%
+  arrange(id, Year_num)
+```
+
+### 2. Risk-Set Matching (Incidence Density Sampling)
+
+```{r risk_set_matching}
+# Create Rigorous Patient-Level Summary File
+patient_summary <- analysis_long %>%
+  arrange(id, Year_num) %>%
+  group_by(id) %>%
+  summarise(
+    Year_base = min(Year_num),
+    Year_last_obs = max(Year_num), 
+    Year_Cancer = first(Year_Cancer), 
+    everCancer = first(everCancer),
+    base_age = first(base_age),
+    base_race = first(base_race),
+    base_fi = first(fi_score_nocancer),
+    dtdth = first(dtdth)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Convert months since 1900 to actual calendar year
+    Year_death = if_else(!is.na(dtdth), 1900 + (dtdth / 12), NA_real_)
+  )
+
+cases <- patient_summary %>% filter(everCancer == 1L)
+
+# The Risk-Set Matching Loop
+set.seed(12345) 
+
+matched_cohort <- map_dfr(1:nrow(cases), function(i) {
+  
+  current_case <- cases[i, ]
+  index_year <- current_case$Year_Cancer
+  
+  eligible_controls <- patient_summary %>%
+    filter(
+      id != current_case$id, 
+      Year_base <= index_year, 
+      (is.na(Year_death) | Year_death >= index_year),
+      Year_last_obs >= index_year,
+      (is.na(Year_Cancer) | Year_Cancer > index_year)
+    ) %>%
+    filter(
+      base_race == current_case$base_race,                   
+      abs(base_age - current_case$base_age) <= 2,            
+      abs(base_fi - current_case$base_fi) <= 0.05            
+    )
+  
+  if(nrow(eligible_controls) >= 2) {
+    selected_controls <- eligible_controls %>% sample_n(2)
+  } else if(nrow(eligible_controls) == 1) {
+    selected_controls <- eligible_controls 
+  } else {
+    selected_controls <- NULL 
+  }
+  
+  if(!is.null(selected_controls)) {
+    bind_rows(
+      current_case %>% mutate(match_id = i, role = "Case", Index_Year = index_year),
+      selected_controls %>% mutate(match_id = i, role = "Control", Index_Year = index_year)
+    )
+  } else {
+    NULL # Drop unmatched cases
+  }
+})
+
+# Rebuild the Longitudinal Dataset & Restrict Biological Window
+matched_analysis_long <- matched_cohort %>%
+  select(id, match_id, role, Index_Year) %>%
+  left_join(analysis_long, by = "id") %>%
+  # Join the death data from your patient_summary
+  left_join(patient_summary %>% select(id, Year_death), by = "id") %>%
+  mutate(
+    tRel = Year_num - Index_Year,
+    is_case = if_else(role == "Case", 1L, 0L),
+    
+    postEvent = if_else(tRel >= 0, 1L, 0L),
+    timeAfterEvent = if_else(postEvent == 1L, tRel, 0),
+    
+    # --- NEW MORTALITY VARIABLES ---
+    # Calculate years from this specific observation to their death
+    years_to_death = Year_death - Year_num,
+    
+    # Create the Terminal Drop indicator (Observation is within 2 years of death)
+    # If they are alive (Year_death is NA) or > 2 years away, it is 0.
+    is_terminal_drop = if_else(!is.na(years_to_death) & years_to_death <= 2 & years_to_death >= 0, 1L, 0L)
+  ) %>%
+  filter(tRel >= -12 & tRel <= 12)
+
+
+# Save the matched dataset to the specified directory
+saveRDS(matched_analysis_long, "/n/home06/xyzhou/Frailty/2_data analysis/before and after cancer/data/matched_analysis_long.rds")
+cat("Matched dataset saved successfully.\n")
+```
+
+### 3. Matched Piecewise Mixed-Effects Model
+
+```{r run_model}
+matched_mod_fixed <- lmer(
+  fi_score_nocancer ~ 
+    # 1. Main Control Trajectory (A smooth, continuous aging line)
+    tRel + 
+    
+    # 2. Pre-Event Baseline Differences for Cases
+    is_case +                # Did cases start at a different frailty level?
+    tRel:is_case +           # Were cases aging at a different speed BEFORE the cancer?
+    
+    # 3. Post-Event Discontinuities (RESTRICTED TO CASES ONLY using ':')
+    postEvent:is_case +      # The acute jump in frailty caused by the cancer
+    timeAfterEvent:is_case + # The change in aging speed caused by the cancer
+    
+    # 4. Covariates
+    base_marital + base_living + base_pckgr + is_terminal_drop +
+    
+    # 5. Random Effects (Accounting for matched pairs and individual repeated measures)
+    (1 + tRel | match_id/id), 
+  
+  data = matched_analysis_long,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(matched_mod_fixed)
+```
+
+### 4. Visualization
+
+```{r visualization, fig.width=11, fig.height=6}
+# -------------------------------------------------------------------
+# 4. Visualization (Mortality-Adjusted)
+# -------------------------------------------------------------------
+
+# 1. Create Explicit Pre and Post Prediction Grids
+grid_pre <- expand.grid(
+  tRel = seq(-12, 0, by = 0.25),
+  role = c("Case", "Control")
+) %>%
+  mutate(
+    is_case = if_else(role == "Case", 1L, 0L),
+    postEvent = 0L,
+    timeAfterEvent = 0,
+    
+    # Hold the terminal drop variable constant at 0 (Not dying)
+    is_terminal_drop = 0L,
+    
+    base_marital = levels(matched_analysis_long$base_marital)[1],
+    base_living  = levels(matched_analysis_long$base_living)[1],
+    base_pckgr   = levels(matched_analysis_long$base_pckgr)[1]
+  )
+
+grid_post <- expand.grid(
+  tRel = seq(0, 12, by = 0.25),
+  role = c("Case", "Control")
+) %>%
+  mutate(
+    is_case = if_else(role == "Case", 1L, 0L),
+    postEvent = 1L,
+    timeAfterEvent = tRel,
+    
+    # Hold the terminal drop variable constant at 0 (Not dying)
+    is_terminal_drop = 0L,
+    
+    base_marital = levels(matched_analysis_long$base_marital)[1],
+    base_living  = levels(matched_analysis_long$base_living)[1],
+    base_pckgr   = levels(matched_analysis_long$base_pckgr)[1]
+  )
+
+# 2. Predict Marginal Means using the mortality-adjusted model
+grid_pre$pred_FI <- predict(matched_mod_fixed, newdata = grid_pre, re.form = NA)
+grid_post$pred_FI <- predict(matched_mod_fixed, newdata = grid_post, re.form = NA)
+
+# 3. Clean Split for Plotting the "Jump"
+jump_points <- bind_rows(grid_pre, grid_post) %>%
+  filter(tRel == 0) %>%
+  select(role, postEvent, pred_FI) %>%
+  pivot_wider(names_from = postEvent, values_from = pred_FI, names_prefix = "post_") %>%
+  rename(y_pre = post_0, y_post = post_1)
+
+# 4. Plot the Trajectories
+ggplot() +
+  geom_line(data = grid_pre, aes(x = tRel, y = pred_FI, color = role), linewidth = 1.2) +
+  geom_line(data = grid_post, aes(x = tRel, y = pred_FI, color = role), linewidth = 1.2) +
+  geom_segment(data = jump_points, 
+               aes(x = 0, xend = 0, y = y_pre, yend = y_post, color = role), 
+               linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "gray30") +
+  scale_color_manual(values = c("Case" = "#D55E00", "Control" = "#0072B2")) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    plot.title = element_text(face = "bold", size = 15),
+    legend.position = "bottom",
+    legend.title = element_blank()
+  ) +
+  labs(
+    title = "Mortality-Adjusted Frailty Trajectories",
+    subtitle = "Matched controls vs. incident cancer, controlling for terminal decline",
+    x = "Years relative to Index Year (0 = Diagnosis for Cases)",
+    y = "Predicted non-cancer FI"
+  )
+```

@@ -1,0 +1,224 @@
+---
+title: "Frailty Trajectories Before and After Incident Cancer: Case only cohort"
+author: "XZ"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 2.1_case only trajectory.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Analyzes frailty trajectories among cancer cases only, focusing on within-case frailty patterns before and after incident cancer diagnosis.
+```
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+
+# Required Libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+library(lmerTest) # For p-values in lmer
+library(ggeffects)
+library(patchwork)
+```
+
+# 1. Data Preparation
+
+**Inclusion & Exclusion Criteria:**
+1. Available covariates at baseline.
+2. Participants need to have cancer diagnosis during the follow-up.
+3. We remove prevalent cancers at baseline.
+4. We ensure all participants have at least 2 longitudinal observations with FI.
+5. FI is considered missing if with less than 20 out of 27 frailty items measured.
+
+```{r data_prep}
+# Define data path
+data_path <- "/n/home06/xyzhou/Frailty/2_data analysis/before and after cancer/data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds"
+fi_long <- readRDS(data_path)
+
+target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
+
+# 1A. Extract Baseline Covariates (Cycle 86)
+baseline_covs <- fi_long %>%
+  filter(cycle == "86") %>%
+  select(
+    id,
+    age_months   = age_enrollment, 
+    base_race    = race,
+    base_marital = marital_status,
+    base_living  = living_arr,
+    base_pckgr   = pckgr
+  ) %>%
+  mutate(base_age = age_months / 12) %>% 
+  select(-age_months) %>%
+  drop_na()
+
+# 1B. Prepare Continuous Time Variables
+fi_prep <- fi_long %>%
+  filter(cycle %in% target_cycles) %>%
+  mutate(
+    worked_rtmnyr = as.numeric(worked_rtmnyr),
+    cancer_dateca = as.numeric(cancer_dateca),
+    dbmy09        = as.numeric(dbmy09)
+  )
+
+# 1C. Establish Participant Timelines & Filter to Incident Cancer Only
+participant_timelines <- fi_prep %>%
+  arrange(id, worked_rtmnyr) %>%
+  group_by(id) %>%
+  summarise(
+    First_Survey_Month = first(worked_rtmnyr),
+    Cancer_Month = first(cancer_dateca),
+    Has_Cancer = first(cancer_cancer) == 1,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Incident Cancer: Diagnosed strictly AFTER their first survey
+    Is_Incident_Cancer = Has_Cancer & (!is.na(Cancer_Month) & Cancer_Month > First_Survey_Month)
+  )
+
+incident_ids <- participant_timelines %>% filter(Is_Incident_Cancer) %>% pull(id)
+# 1D. Create Piecewise Model Dataset (UPDATED)
+piecewise_data <- fi_prep %>%
+  filter(id %in% incident_ids) %>%
+  inner_join(participant_timelines %>% select(id, Cancer_Month), by = "id") %>%
+  left_join(baseline_covs, by = "id") %>%
+  filter(!is.na(base_age), participated == 1, !is.na(fi_score_nocancer)) %>%
+  
+  mutate(
+    Time_to_Event_Exact = (worked_rtmnyr - Cancer_Month) / 12,
+    TimePre = if_else(Time_to_Event_Exact < 0, Time_to_Event_Exact, 0),
+    TimePost = if_else(Time_to_Event_Exact >= 0, Time_to_Event_Exact, 0),
+    CancerShift = if_else(Time_to_Event_Exact >= 0, 1, 0),
+    
+    # Center Age (this is still valid because age is numeric)
+    Age_Centered = base_age - mean(base_age, na.rm = TRUE),
+    
+    # Treat pack-years as a factor and safely handle the original NAs
+    base_pckgr = as.factor(if_else(is.na(base_pckgr), "Missing", as.character(base_pckgr)))
+  ) %>%
+  
+  # Ensure other covariates are factors
+  mutate(
+    base_race = as.factor(base_race),
+    base_marital = as.factor(base_marital),
+    base_living = as.factor(base_living)
+  )
+```
+
+------------------------------------------------------------------------
+
+# 2. Exploratory Data Analysis (EDA)
+
+Before modeling, it is essential to visualize the raw trajectories to ensure the linear piecewise assumption is appropriate for this data.
+
+```{r eda_spaghetti}
+set.seed(123)
+sample_ids <- sample(unique(piecewise_data$id), 100)
+
+spaghetti_data <- piecewise_data %>%
+  filter(id %in% sample_ids, Time_to_Event_Exact >= -16, Time_to_Event_Exact <= 12)
+
+ggplot(spaghetti_data, aes(x = Time_to_Event_Exact, y = fi_score_nocancer, group = id)) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", linewidth = 1) +
+  geom_line(alpha = 0.3, color = "#E15759") +
+  geom_point(alpha = 0.4, size = 1, color = "#E15759") +
+  geom_smooth(aes(group = 1), method = "loess", se = FALSE, color = "black", linewidth = 1.5) +
+  theme_minimal() +
+  labs(
+    title = "Raw Individual Frailty Trajectories (Sample of N=100)",
+    subtitle = "Black line represents the LOESS smoothed trend.",
+    x = "Exact Years Relative to Cancer Diagnosis",
+    y = "Non-Cancer Frailty Index Score"
+  )
+```
+
+------------------------------------------------------------------------
+
+# 4. Piecewise Linear Mixed-Effects Models
+
+We fit two models to evaluate the pre-diagnosis slope, the immediate shift at diagnosis, and the post-diagnosis slope. We use a random intercept model `(1 | id)`.
+
+### 4A. Crude Model
+
+Unadjusted for baseline demographic covariates (only centering age for mathematical stability).
+
+```{r model_crude}
+model_crude <- lmer(
+  fi_score_nocancer ~ TimePre + CancerShift + TimePost + Age_Centered + (1 + TimePre + TimePost | id), 
+  data = piecewise_data,
+  REML = TRUE
+)
+
+summary(model_crude)
+```
+
+### 4B. Fully Adjusted Model
+
+Adjusted for baseline age, race, marital status, living arrangement, and pack-years of smoking.
+
+```{r model_adjusted}
+model_adj <- lmer(
+  fi_score_nocancer ~ TimePre + CancerShift + TimePost + 
+    Age_Centered + base_race + base_marital + base_living + base_pckgr + 
+    (1 + TimePre + TimePost | id), 
+  data = piecewise_data,
+  REML = TRUE
+)
+
+summary(model_adj)
+```
+
+------------------------------------------------------------------------
+
+# 5. Visualizing the Model-Predicted Trajectory
+
+Using the fully adjusted LME model, we predict and plot the expected trajectory of frailty for an "average" participant (holding covariates at their reference levels or sample means).
+
+```{r plot_predicted_model}
+# Update the dummy data generation for the plot
+dummy_data <- data.frame(Time_to_Event_Exact = seq(-16, 16, by = 0.5)) %>%
+  mutate(
+    TimePre = if_else(Time_to_Event_Exact < 0, Time_to_Event_Exact, 0),
+    TimePost = if_else(Time_to_Event_Exact >= 0, Time_to_Event_Exact, 0),
+    CancerShift = if_else(Time_to_Event_Exact >= 0, 1, 0),
+    Age_Centered = 0,             
+    
+    # Set factors to their reference levels
+    base_race = levels(piecewise_data$base_race)[1],          
+    base_marital = levels(piecewise_data$base_marital)[1],     
+    base_living = levels(piecewise_data$base_living)[1],
+    base_pckgr = "Never" # Or whatever level you want as the reference!
+  )
+
+# Predict and plot as normal
+dummy_data$Predicted_FI <- predict(model_adj, newdata = dummy_data, re.form = NA)
+
+# 3. Plot
+ggplot(dummy_data, aes(x = Time_to_Event_Exact, y = Predicted_FI)) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", linewidth = 1) +
+  geom_line(color = "#E15759", linewidth = 1.5) +
+  scale_x_continuous(breaks = seq(-16, 16, by = 4)) +
+  theme_minimal() +
+  labs(
+    title = "Model-Predicted Frailty Trajectory (Incident Cancer Cohort)",
+    subtitle = paste("Adjusted for Baseline Age, Race (", dummy_data$base_race[1], 
+                     "), Marital Status (", dummy_data$base_marital[1], 
+                     "), \nLiving Arrangement (", dummy_data$base_living[1], 
+                     "), and Pack-years.", sep=""),
+    x = "Exact Years Relative to Cancer Diagnosis",
+    y = "Predicted Non-Cancer Frailty Index"
+  ) +
+  theme(axis.text.x = element_text(face = "bold", size = 11))
+```

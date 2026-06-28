@@ -1,0 +1,338 @@
+---
+title: "Frailty Index Pre/Post Cancer Trajectory Analysis"
+author: "XZ"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 1_EDA.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Performs early exploratory data analysis for frailty trajectories around cancer diagnosis, including demographic summaries and trajectory visualizations.
+```
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(gtsummary) # For demographic tables
+```
+
+# 1. Data Preparation
+
+```{r data_prep}
+# Load the Imputed Data
+fi_long <-  
+  readRDS("/n/home06/xyzhou/Frailty/2_data analysis/before and after cancer/data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
+
+target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
+year_levels <- c("1988", "1992", "1996", "2000", "2004", "2008", "2012", "2016", "2020")
+
+# 1. Standardize Years, Convert to Numeric, & Calculate Exact Age
+fi_prep <- fi_long %>%
+  filter(cycle %in% target_cycles) %>%
+  mutate(
+    Year = case_when(
+      as.numeric(cycle) > 50 ~ paste0("19", cycle),
+      TRUE ~ paste0("20", cycle)
+    ),
+    Year = factor(Year, levels = year_levels),
+    Year_num = as.numeric(as.character(Year)),
+    
+    # Calculate exact Age using your specific timeline logic
+    Age = (worked_rtmnyr - dbmy09) / 12
+  )
+
+# 2. Identify Baseline Cancer (To Exclude)
+baseline_cancer_ids <- fi_prep %>%
+  group_by(id) %>%
+  arrange(Year_num) %>%
+  slice(1) %>% 
+  filter(fi_cancer == 1) %>%
+  pull(id)
+
+# 3. Identify Timing of Incident Cancer
+cancer_timing <- fi_prep %>%
+  filter(!id %in% baseline_cancer_ids) %>%
+  filter(fi_cancer == 1) %>%
+  group_by(id) %>%
+  summarise(Year_Cancer = min(Year_num), .groups = "drop") 
+
+incident_cancer_ids <- cancer_timing$id
+
+# 4. Filter for Incident Cancer Cohort & Apply validity rules
+fi_incident_base <- fi_prep %>%
+  filter(id %in% incident_cancer_ids) %>%
+  mutate(
+    # Force FI to NA if they answered fewer than 20 non-cancer items
+    fi_score_nocancer = if_else(n_answered_nocancer < 20, NA_real_, fi_score_nocancer),
+    frailty_cat_nocancer = if_else(is.na(fi_score_nocancer), NA_character_, frailty_cat_nocancer)
+  )
+
+# 5. Create the purely valid dataset for trajectory plotting
+fi_valid <- fi_incident_base %>%
+  filter(participated == 1, !is.na(fi_score_nocancer))
+```
+
+***
+
+# 2. Descriptive Characteristics
+
+## 2.1 At Baseline (Study Entry)
+
+This table summarizes the incident cancer cohort at their very first valid study cycle (well before their cancer diagnosis).
+
+```{r baseline_table}
+baseline_data <- fi_valid %>%
+  group_by(id) %>%
+  arrange(Year_num) %>%
+  slice(1) %>% 
+  ungroup() %>%
+  select(Age, frailty_cat_nocancer, fi_score_nocancer)
+
+baseline_data %>%
+  tbl_summary(
+    label = list(
+      Age ~ "Age at Baseline (years)",
+      frailty_cat_nocancer ~ "Frailty Category",
+      fi_score_nocancer ~ "Frailty Index Score"
+    ),
+    statistic = list(all_continuous() ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    missing = "no"
+  ) %>%
+  modify_header(label = "**Baseline Characteristic**") %>%
+  bold_labels()
+```
+
+## 2.2 At Cancer Diagnosis (Time = 0)
+
+This table summarizes the cohort exactly at the cycle they were first diagnosed with incident cancer. 
+
+```{r cancer_diagnosis_descriptives}
+diagnosis_data <- fi_valid %>%
+  inner_join(cancer_timing, by = "id") %>%
+  filter(Year_num == Year_Cancer) %>%
+  ungroup() %>%
+  select(Age, frailty_cat_nocancer, fi_score_nocancer) 
+
+diagnosis_data %>%
+  tbl_summary(
+    label = list(
+      Age ~ "Age at Diagnosis (years)",
+      frailty_cat_nocancer ~ "Frailty Category",
+      fi_score_nocancer ~ "Frailty Index Score"
+    ),
+    statistic = list(all_continuous() ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    missing = "no"
+  ) %>%
+  modify_header(label = "**Characteristics at Diagnosis**") %>%
+  bold_labels()
+```
+
+***
+
+# 3. Cross-Sectional Descriptive Analysis (Calendar Year)
+
+```{r attrition_plot}
+# Denominator = active participants (participated == 1) in that specific cycle
+attrition_data <- fi_incident_base %>%
+  filter(participated == 1) %>%
+  group_by(Year) %>%
+  summarise(
+    N_Eligible = n(),
+    N_Valid_FI = sum(!is.na(fi_score_nocancer)),
+    .groups = "drop"
+  ) %>%
+  mutate(Percent_Active = (N_Valid_FI / N_Eligible) * 100)
+
+ggplot(attrition_data, aes(x = Year, y = Percent_Active)) +
+  geom_bar(stat = "identity", fill = "#E15759", width = 0.7) +
+  geom_text(aes(label = sprintf("%.1f%%", Percent_Active)), 
+            vjust = -0.5, fontface = "bold", size = 3) +
+  geom_text(aes(label = paste0("(n=", N_Valid_FI, "/", N_Eligible, ")")), 
+            vjust = 1.5, color = "white", size = 2.5) +
+  scale_y_continuous(limits = c(0, 115), labels = scales::label_percent(scale = 1)) +
+  theme_minimal() +
+  labs(title = "Data Usability Rate per Cycle (Incident Cancer Cohort)", 
+       subtitle = "Percentage of active participants in a given cycle providing >= 20 valid items.",
+       x = "Study Year", y = "% Usable Data")
+```
+
+```{r cross_sectional_boxplot}
+medians_df <- fi_valid %>%
+  group_by(Year) %>%
+  summarise(Median_Val = median(fi_score_nocancer, na.rm=TRUE), .groups="drop")
+
+ggplot(fi_valid, aes(x = Year, y = fi_score_nocancer)) +
+  geom_boxplot(fill = "#E15759", outlier.shape = 1, outlier.alpha = 0.2, alpha = 0.6) +
+  geom_text(data = medians_df, aes(x = Year, y = Median_Val, label = sprintf("%.3f", Median_Val)),
+            vjust = -1.2, color = "black", fontface = "bold", size = 3.5) +
+  theme_minimal() +
+  labs(title = "Distribution of Frailty Scores by Calendar Year", 
+       x = "Year", y = "Non-Cancer FI Score")
+```
+
+```{r category_prevalence}
+cat_data <- fi_valid %>%
+  filter(!is.na(frailty_cat_nocancer)) %>%
+  mutate(frailty_cat_nocancer = factor(frailty_cat_nocancer, 
+                                       levels = c("Non-frail", "Pre-frail", "Mildly frail", "Mod/Sev frail"))) %>%
+  group_by(Year, frailty_cat_nocancer) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(Year) %>%
+  mutate(Percentage = (Count / sum(Count)) * 100)
+
+ggplot(cat_data, aes(x = Year, y = Percentage, fill = frailty_cat_nocancer)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +
+  scale_fill_manual(values = c("Non-frail" = "#2c7bb6", "Pre-frail" = "#abd9e9", 
+                               "Mildly frail" = "#fdae61", "Mod/Sev frail" = "#d7191c")) +
+  geom_text(aes(label = ifelse(Percentage > 4, paste0(round(Percentage, 0), "%"), "")), 
+            position = position_stack(vjust = 0.5), size = 3, color = "black") +
+  theme_minimal() +
+  labs(title = "Clinical Frailty Category Prevalence by Calendar Year", 
+       x = "Year", y = "Percentage (%)", fill = "Category") +
+  theme(legend.position = "top")
+```
+
+***
+
+# 4. Event-Centered Trajectories (Time = 0 at Diagnosis)
+
+```{r setup_event_centered}
+plot_window <- seq(-16, 12, by = 4)
+
+# Create Event-Centered Dataset for Availability (Includes NAs to calculate denominator)
+fi_event_base <- fi_incident_base %>%
+  inner_join(cancer_timing, by = "id") %>%
+  mutate(Time_to_Cancer = Year_num - Year_Cancer) %>%
+  filter(Time_to_Cancer %in% plot_window)
+
+# Create purely valid Event-Centered Dataset for Trajectories
+fi_event_cancer <- fi_valid %>%
+  inner_join(cancer_timing, by = "id") %>%
+  mutate(Time_to_Cancer = Year_num - Year_Cancer) %>%
+  filter(Time_to_Cancer %in% plot_window)
+```
+
+## Data Availability & Distribution
+
+```{r data_availability}
+n_data_event <- fi_event_base %>%
+  filter(participated == 1) %>%
+  group_by(Time_to_Cancer) %>%
+  summarise(
+    N_Eligible = n(),
+    N_Valid_FI = sum(!is.na(fi_score_nocancer)),
+    .groups = "drop"
+  ) %>%
+  mutate(Percent_Active = (N_Valid_FI / N_Eligible) * 100)
+
+ggplot(n_data_event, aes(x = factor(Time_to_Cancer), y = Percent_Active)) +
+  geom_bar(stat = "identity", fill = "#E15759", width = 0.6) +
+  geom_text(aes(label = sprintf("%.1f%%", Percent_Active)), 
+            vjust = -0.5, fontface = "bold", size = 3) +
+  geom_text(aes(label = paste0("(n=", N_Valid_FI, "/", N_Eligible, ")")), 
+            vjust = 1.5, color = "white", size = 2.5) +
+  scale_y_continuous(limits = c(0, 115), labels = scales::label_percent(scale = 1)) +
+  theme_minimal() +
+  labs(title = "Data Availability Relative to Cancer Diagnosis",
+       subtitle = "Percentage of active participants at each relative timepoint providing valid data.",
+       x = "Years Relative to Cancer Diagnosis (0 = Diagnosis Year)", y = "% Usable Data")
+```
+
+```{r event_centered_boxplot}
+label_data <- fi_event_cancer %>%
+  group_by(Time_to_Cancer) %>%
+  summarise(Median_FI = median(fi_score_nocancer), N = n(), .groups = "drop")
+
+ggplot(fi_event_cancer, aes(x = factor(Time_to_Cancer), y = fi_score_nocancer)) +
+  geom_vline(xintercept = which(levels(factor(fi_event_cancer$Time_to_Cancer)) == "0"), 
+             color = "darkred", linetype = "dashed", linewidth = 1) +
+  geom_boxplot(fill = "#E15759", alpha = 0.6, outlier.alpha = 0.3) +
+  geom_text(data = label_data, aes(y = Median_FI, label = sprintf("%.2f", Median_FI)),
+            vjust = -0.8, color = "black", fontface = "bold", size = 3.5) +
+  geom_text(data = label_data, aes(y = -0.02, label = paste0("N=", N)),
+            color = "black", size = 3.5, fontface = "italic") +
+  theme_minimal() +
+  labs(title = "Distribution of Frailty Relative to Cancer Diagnosis", 
+       x = "Years Relative to Diagnosis", y = "Non-Cancer FI Score")
+```
+
+## Individual & Mean Trajectories
+
+```{r spaghetti_plot}
+set.seed(123)
+sample_ids <- sample(unique(fi_event_cancer$id), 100) 
+
+fi_spaghetti <- fi_event_cancer %>% filter(id %in% sample_ids)
+
+ggplot(fi_spaghetti, aes(x = Time_to_Cancer, y = fi_score_nocancer, group = id)) +
+  geom_vline(xintercept = 0, color = "darkred", linetype = "dashed", linewidth = 1) +
+  geom_line(alpha = 0.2, color = "#E15759") +
+  geom_point(alpha = 0.4, size = 1, color = "#E15759") +
+  geom_smooth(aes(group = 1), method = "loess", color = "black", linewidth = 1.5, se = FALSE) +
+  scale_x_continuous(breaks = plot_window) +
+  theme_minimal() +
+  labs(title = "Individual Trajectories (Random Subsample N=100)",
+       subtitle = "Black line represents the LOESS smoothed average.",
+       x = "Years Relative to Cancer Diagnosis", y = "Non-Cancer FI Score")
+```
+
+```{r mean_trajectory}
+mean_data_all <- fi_event_cancer %>%
+  group_by(Time_to_Cancer) %>%
+  summarise(Mean_FI = mean(fi_score_nocancer), SD_FI = sd(fi_score_nocancer), N = n(), .groups = "drop") %>%
+  mutate(SE = SD_FI / sqrt(N), Lower_CI = Mean_FI - (1.96 * SE), Upper_CI = Mean_FI + (1.96 * SE))
+
+ggplot(mean_data_all, aes(x = Time_to_Cancer, y = Mean_FI)) +
+  geom_vline(xintercept = 0, color = "darkred", linetype = "dashed", linewidth = 1) +
+  geom_errorbar(aes(ymin = Lower_CI, ymax = Upper_CI), width = 0.3, alpha = 0.5) +
+  geom_point(size = 3, color = "#d7191c") +
+  geom_line(linewidth = 1, color = "#d7191c") +
+  scale_x_continuous(breaks = plot_window) +
+  theme_minimal() +
+  labs(title = "Unadjusted Mean Frailty Trajectory",
+       subtitle = "Error bars represent 95% CIs. Notice the slope changes around Time 0.",
+       x = "Years Relative to Diagnosis", y = "Mean Non-Cancer FI Score")
+```
+
+***
+
+# 5. Check for Informative Censoring (Survivor Bias)
+
+```{r survivor_bias_check}
+# Determine if a participant has data at Time_to_Cancer == 4
+retained_at_plus4 <- fi_event_cancer %>%
+  filter(Time_to_Cancer == 4) %>%
+  pull(id) %>%
+  unique()
+
+survivor_check_data <- fi_event_cancer %>%
+  filter(Time_to_Cancer == 0) %>%
+  mutate(Status_at_Next_Cycle = if_else(id %in% retained_at_plus4, "Remained in Study", "Dropped Out / Deceased"))
+
+ggplot(survivor_check_data, aes(x = Status_at_Next_Cycle, y = fi_score_nocancer, fill = Status_at_Next_Cycle)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_minimal() +
+  scale_fill_manual(values = c("Dropped Out / Deceased" = "#d7191c", "Remained in Study" = "#abd9e9")) +
+  labs(title = "Informative Censoring Check at Diagnosis (Time = 0)",
+       subtitle = "Are those who drop out at the next cycle systematically more frail at diagnosis?",
+       x = "Status at Next Study Cycle (Time = +4)", y = "FI Score at Diagnosis (Time = 0)") +
+  theme(legend.position = "none")
+```
+```

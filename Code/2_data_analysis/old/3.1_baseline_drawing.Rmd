@@ -1,0 +1,763 @@
+---
+title: "Frailty Trajectory Analysis"
+output: html_document
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 3.1_baseline_drawing.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Creates baseline-based frailty trajectory visualizations and mixed-model summaries using the longitudinal frailty dataset with cancer information.
+```
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+# library(gtsummary) # install.packages("gtsummary") if needed
+```
+
+## 1. Load Data and Define Target FI Cycles
+
+```{r load-data}
+fi_long_merged <- readRDS(
+  "~/OneDrive - Harvard University/Research/Frailty Project/Data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds"
+)
+
+target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
+```
+
+## 2. Prepare Time Variables
+
+```{r prep-time}
+fi_time_prepped <- fi_long_merged %>%
+  mutate(
+    id               = as.character(id),
+    cycle            = as.character(cycle),
+    cancer_dateca    = as.numeric(as.character(cancer_dateca)),
+    dtdth            = as.numeric(as.character(dtdth)),
+    dbmy09           = as.numeric(as.character(dbmy09)),
+    worked_rtmnyr    = as.numeric(as.character(worked_rtmnyr)),
+    fi_score_nocancer = as.numeric(as.character(fi_score_nocancer)),
+    participated     = as.numeric(as.character(participated)),
+    age_at_death     = (dtdth - dbmy09) / 12,
+    age_at_cancer    = (cancer_dateca - dbmy09) / 12
+  )
+```
+
+## 3. Build Longitudinal FI Trajectory Panel
+
+Only keep FI from the planned 4-year waves starting in 1988.
+
+```{r build-trajectory}
+fi_trajectory <- fi_time_prepped %>%
+  filter(
+    participated == 1,
+    cycle %in% target_cycles,
+    !is.na(fi_score_nocancer),
+    !is.na(worked_rtmnyr)
+  ) %>%
+  mutate(
+    age_at_cycle = (worked_rtmnyr - dbmy09) / 12,
+    years_to_death = (worked_rtmnyr - dtdth) / 12,
+    years_to_cancer = (worked_rtmnyr - cancer_dateca) / 12
+  ) %>%
+  arrange(id, worked_rtmnyr) %>%
+  group_by(id) %>%
+  mutate(
+    years_since_baseline = (worked_rtmnyr - first(worked_rtmnyr)) / 12
+  ) %>%
+  ungroup()
+```
+
+## 4. Extract 1986 Baseline Covariates
+
+Covariates stay anchored to cycle 1986.
+
+```{r baseline-covariates}
+baseline_covs <- fi_time_prepped %>%
+  filter(cycle == "86") %>%
+  distinct(id, .keep_all = TRUE) %>%
+  transmute(
+    id,
+    base_race    = factor(if_else(is.na(race), "Missing", as.character(race))),
+    base_marital = factor(if_else(is.na(marital_status), "Missing", as.character(marital_status))),
+    base_living  = factor(if_else(is.na(living_arr), "Missing", as.character(living_arr))),
+    base_pckgr   = factor(if_else(is.na(pckgr), "Missing", as.character(pckgr)))
+  )
+```
+
+## 5. Build the Analytic Longitudinal Dataset
+
+```{r build-analysis-long}
+analysis_long <- fi_trajectory %>%
+  left_join(baseline_covs, by = "id") %>%
+  arrange(id, worked_rtmnyr) %>%
+  group_by(id) %>%
+  mutate(
+    baseline_time = first(worked_rtmnyr),
+    base_age = first(age_at_cycle),
+    true_event_time = (first(cancer_dateca) - baseline_time) / 12,
+    is_prevalent = if_else(!is.na(true_event_time) & true_event_time <= 0, 1L, 0L),
+    n_visits = n_distinct(worked_rtmnyr, na.rm = TRUE),
+    max_followup = (max(worked_rtmnyr, na.rm = TRUE) - min(worked_rtmnyr, na.rm = TRUE)) / 12,
+    Ever_Cancer = if_else(!is.na(true_event_time) & true_event_time > 0, 1L, 0L),
+    Cancer_Status_TimeVarying = if_else(
+      Ever_Cancer == 1L & years_since_baseline >= true_event_time,
+      1L,
+      0L
+    )
+  ) %>%
+  filter(is_prevalent == 0) %>%
+  filter(n_visits >= 2, max_followup > 0) %>%
+  ungroup()
+
+base_age_scaling <- analysis_long %>%
+  distinct(id, base_age) %>%
+  mutate(base_age_z = as.numeric(scale(base_age))) %>%
+  select(id, base_age_z)
+
+analysis_long <- analysis_long %>%
+  left_join(base_age_scaling, by = "id") %>%
+  mutate(
+    terminal_decline = if_else(
+      !is.na(years_to_death) & years_to_death >= -1 & years_to_death <= 0,
+      1L,
+      0L
+    ),
+    Group_Label = factor(Ever_Cancer, levels = c(0, 1), labels = c("Control", "Cancer Case"))
+  )
+```
+
+## 6. Check Follow-Up Structure
+
+```{r followup-checks}
+zero_fu_check <- analysis_long %>%
+  group_by(id) %>%
+  summarize(
+    num_obs = n(),
+    n_times = n_distinct(worked_rtmnyr, na.rm = TRUE),
+    max_fu = max(years_since_baseline, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(max_fu == 0)
+
+cat("analysis_long_n =", nrow(analysis_long), "\n")
+cat("patients_zero_fu =", nrow(zero_fu_check), "\n")
+
+if (nrow(zero_fu_check) > 0) {
+  print(zero_fu_check)
+} else {
+  cat("No zero follow-up patients remain in analysis_long.\n")
+}
+```
+
+## 7. Conditional Imputation of Index Time (T0) for Controls
+
+Strict version: - same 5-year baseline age bin - donor event time must be within the control's observed follow-up - controls with no eligible donor are dropped
+
+```{r impute-index-time}
+set.seed(2026)
+
+patient_summary <- analysis_long %>%
+  group_by(id) %>%
+  summarize(
+    base_age = first(base_age),
+    max_followup = first(max_followup),
+    is_case = first(Ever_Cancer),
+    true_event_time = first(true_event_time),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    age_bin = floor(base_age / 5) * 5
+  )
+
+cases_summary <- patient_summary %>%
+  filter(is_case == 1, !is.na(true_event_time), true_event_time > 0)
+
+controls_summary <- patient_summary %>%
+  filter(is_case == 0)
+
+imputed_times <- rep(NA_real_, nrow(controls_summary))
+
+for (i in seq_len(nrow(controls_summary))) {
+  current_control <- controls_summary[i, ]
+
+  eligible_cases <- cases_summary %>%
+    filter(
+      age_bin == current_control$age_bin,
+      true_event_time <= current_control$max_followup
+    )
+
+  if (nrow(eligible_cases) > 0) {
+    imputed_times[i] <- sample(eligible_cases$true_event_time, size = 1)
+  } else {
+    imputed_times[i] <- NA_real_
+  }
+}
+
+controls_summary$assigned_event_time <- imputed_times
+cases_summary$assigned_event_time <- cases_summary$true_event_time
+
+assigned_times_df <- bind_rows(cases_summary, controls_summary) %>%
+  filter(!is.na(assigned_event_time)) %>%
+  select(id, assigned_event_time) %>%
+  distinct(id, .keep_all = TRUE)
+
+cat("Controls dropped for no eligible donor =", sum(is.na(imputed_times)), "\n")
+```
+
+## 8. Descriptive Analysis Before LME
+
+```{r descriptive-data}
+baseline_fi <- analysis_long %>%
+  arrange(id, years_since_baseline) %>%
+  group_by(id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(id, fi_baseline = fi_score_nocancer)
+
+followup_by_patient <- analysis_long %>%
+  group_by(id) %>%
+  summarize(
+    Group_Label = first(Group_Label),
+    Ever_Cancer = first(Ever_Cancer),
+    base_age = first(base_age),
+    base_race = first(base_race),
+    base_marital = first(base_marital),
+    base_living = first(base_living),
+    base_pckgr = first(base_pckgr),
+    true_event_time = first(true_event_time),
+    num_obs = n_distinct(worked_rtmnyr, na.rm = TRUE),
+    max_fu = max(years_since_baseline, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(baseline_fi, by = "id") %>%
+  left_join(assigned_times_df, by = "id") %>%
+  mutate(
+    Index_Group = factor(Ever_Cancer, levels = c(0, 1), labels = c("Control", "Cancer Case"))
+  )
+```
+
+### Table 1
+
+```{r table1}
+table1 <- followup_by_patient %>%
+  select(
+    Index_Group,
+    base_age,
+    fi_baseline,
+    base_race,
+    base_marital,
+    base_living,
+    base_pckgr
+  ) %>%
+  gtsummary::tbl_summary(
+    by = Index_Group,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      base_age ~ "Baseline Age at First Valid FI (years)",
+      fi_baseline ~ "Baseline Frailty Index"
+    ),
+    missing_text = "(Missing)"
+  ) %>%
+  gtsummary::add_p() %>%
+  gtsummary::add_overall() %>%
+  gtsummary::bold_labels()
+
+table1
+```
+
+### Follow-Up Summary
+
+```{r followup-summary}
+followup_summary <- followup_by_patient %>%
+  group_by(Index_Group) %>%
+  summarize(
+    Total_Patients = n(),
+    Mean_Obs = round(mean(num_obs, na.rm = TRUE), 2),
+    Median_Obs = median(num_obs, na.rm = TRUE),
+    Mean_FollowUp_Yrs = round(mean(max_fu, na.rm = TRUE), 2),
+    Median_FollowUp_Yrs = round(median(max_fu, na.rm = TRUE), 2),
+    Min_FollowUp_Yrs = round(min(max_fu, na.rm = TRUE), 2),
+    Max_FollowUp_Yrs = round(max(max_fu, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+print(as.data.frame(followup_summary))
+
+followup_wilcox <- wilcox.test(max_fu ~ Index_Group, data = followup_by_patient)
+print(followup_wilcox)
+```
+
+### Assigned Index Time Summary
+
+```{r index-time-summary}
+index_time_summary <- followup_by_patient %>%
+  group_by(Index_Group) %>%
+  summarize(
+    N = n(),
+    Mean_IndexTime_Yrs = round(mean(assigned_event_time, na.rm = TRUE), 2),
+    SD_IndexTime_Yrs = round(sd(assigned_event_time, na.rm = TRUE), 2),
+    Median_IndexTime_Yrs = round(median(assigned_event_time, na.rm = TRUE), 2),
+    Q1_IndexTime_Yrs = round(quantile(assigned_event_time, 0.25, na.rm = TRUE), 2),
+    Q3_IndexTime_Yrs = round(quantile(assigned_event_time, 0.75, na.rm = TRUE), 2),
+    Min_IndexTime_Yrs = round(min(assigned_event_time, na.rm = TRUE), 2),
+    Max_IndexTime_Yrs = round(max(assigned_event_time, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+print(as.data.frame(index_time_summary))
+
+index_time_wilcox <- wilcox.test(assigned_event_time ~ Index_Group, data = followup_by_patient)
+print(index_time_wilcox)
+
+index_time_ttest <- t.test(assigned_event_time ~ Index_Group, data = followup_by_patient)
+print(index_time_ttest)
+```
+
+### Index Time Sanity Checks
+
+```{r index-time-checks}
+control_t0_check <- followup_by_patient %>%
+  filter(Index_Group == "Control") %>%
+  summarize(
+    n_controls = n(),
+    n_bad_t0 = sum(assigned_event_time > max_fu, na.rm = TRUE),
+    pct_bad_t0 = round(100 * mean(assigned_event_time > max_fu, na.rm = TRUE), 2)
+  )
+
+print(as.data.frame(control_t0_check))
+
+case_t0_check <- followup_by_patient %>%
+  filter(Index_Group == "Cancer Case") %>%
+  summarize(
+    n_cases = n(),
+    n_mismatch = sum(abs(assigned_event_time - true_event_time) > 1e-8, na.rm = TRUE)
+  )
+
+print(as.data.frame(case_t0_check))
+```
+
+### Plots
+
+```{r descriptive-plots, fig.width=8, fig.height=5}
+p_followup_density <- ggplot(followup_by_patient, aes(x = max_fu, fill = Index_Group, color = Index_Group)) +
+  geom_density(alpha = 0.25, linewidth = 1) +
+  scale_fill_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  scale_color_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Follow-Up Time",
+    x = "Maximum Follow-Up Time (years)",
+    y = "Density",
+    fill = "Group",
+    color = "Group"
+  )
+
+print(p_followup_density)
+
+p_index_density <- ggplot(followup_by_patient, aes(x = assigned_event_time, fill = Index_Group, color = Index_Group)) +
+  geom_density(alpha = 0.25, linewidth = 1) +
+  scale_fill_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  scale_color_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Assigned Index Time (T0)",
+    x = "Assigned Index Time Since FI Baseline (years)",
+    y = "Density",
+    fill = "Group",
+    color = "Group"
+  )
+
+print(p_index_density)
+
+p_index_box <- ggplot(followup_by_patient, aes(x = Index_Group, y = assigned_event_time, fill = Index_Group)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.25) +
+  scale_fill_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Assigned Index Time by Group",
+    x = NULL,
+    y = "Assigned Index Time Since FI Baseline (years)"
+  ) +
+  theme(legend.position = "none")
+
+print(p_index_box)
+```
+
+### Pre/Post Index Observation Counts
+
+```{r pre-post-summary}
+obs_relative_to_t0 <- analysis_long %>%
+  inner_join(assigned_times_df, by = "id") %>%
+  mutate(
+    Index_Group = factor(Ever_Cancer, levels = c(0, 1), labels = c("Control", "Cancer Case")),
+    Post = if_else(years_since_baseline >= assigned_event_time, 1L, 0L)
+  ) %>%
+  group_by(id, Index_Group) %>%
+  summarize(
+    n_pre = sum(Post == 0, na.rm = TRUE),
+    n_post = sum(Post == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Index_Group) %>%
+  summarize(
+    Mean_Pre_Obs = round(mean(n_pre, na.rm = TRUE), 2),
+    Mean_Post_Obs = round(mean(n_post, na.rm = TRUE), 2),
+    Median_Pre_Obs = median(n_pre, na.rm = TRUE),
+    Median_Post_Obs = median(n_post, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(as.data.frame(obs_relative_to_t0))
+```
+
+## 9. Build Piecewise DiD Variables
+
+```{r build-model-data}
+model_data <- analysis_long %>%
+  inner_join(assigned_times_df, by = "id") %>%
+  mutate(
+    Group = Ever_Cancer,
+    Time = years_since_baseline,
+    Post = if_else(Time >= assigned_event_time, 1L, 0L),
+    TimeAfter = if_else(Post == 1L, Time - assigned_event_time, 0)
+  )
+
+zero_fu_model_check <- model_data %>%
+  group_by(id) %>%
+  summarize(
+    num_obs = n(),
+    n_times = n_distinct(worked_rtmnyr, na.rm = TRUE),
+    max_fu = max(Time, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(max_fu == 0)
+
+cat("model_data_n =", nrow(model_data), "\n")
+cat("model_zero_fu =", nrow(zero_fu_model_check), "\n")
+
+if (nrow(zero_fu_model_check) > 0) {
+  print(zero_fu_model_check)
+} else {
+  cat("No zero follow-up patients remain in model_data.\n")
+}
+```
+
+## 10. Fit the Piecewise DiD LME Model
+
+```{r fit-lme}
+fi_model <- lmer(
+  fi_score_nocancer ~
+    Time + Group + Time:Group +
+    Post + Post:Group +
+    TimeAfter + TimeAfter:Group +
+    terminal_decline + base_age_z + base_race + base_marital + base_pckgr +
+    (1 + Time | id),
+  data = model_data,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(fi_model)
+```
+
+```{R}
+plot_grid <- expand.grid(
+  Time_From_T0 = seq(-20, 20, by = 0.1),
+  Group = c(0, 1)
+) %>%
+  mutate(
+    Time = 10 + Time_From_T0,
+    assigned_event_time = 10,
+    Post = if_else(Time_From_T0 >= 0, 1L, 0L),
+    TimeAfter = if_else(Time_From_T0 >= 0, Time_From_T0, 0),
+    terminal_decline = 0L,
+    base_age_z = 0,
+    base_race = factor(levels(model_data$base_race)[1], levels = levels(model_data$base_race)),
+    base_marital = factor(levels(model_data$base_marital)[1], levels = levels(model_data$base_marital)),
+    base_pckgr = factor(levels(model_data$base_pckgr)[1], levels = levels(model_data$base_pckgr))
+  )
+
+plot_grid$pred <- predict(fi_model, newdata = plot_grid, re.form = NA)
+
+plot_grid$Group_Label <- factor(plot_grid$Group, levels = c(0, 1), labels = c("Control", "Cancer Case"))
+
+ggplot(plot_grid, aes(x = Time_From_T0, y = pred, color = Group_Label)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Model-Implied Piecewise Linear Frailty Trajectories",
+    x = "Years Relative to Index Time",
+    y = "Predicted Frailty Index",
+    color = "Group"
+  )
+
+```
+
+```{r}
+model_plot_t0_data <- model_data %>%
+  mutate(
+    pred_fi = predict(fi_model, newdata = ., re.form = NA),
+    Group_Label = factor(Group, levels = c(0, 1), labels = c("Control", "Cancer Case")),
+    Time_From_T0 = Time - assigned_event_time,
+    Time_From_T0_Rounded = round(Time_From_T0)
+  ) %>%
+  group_by(Group_Label, Time_From_T0_Rounded) %>%
+  summarize(
+    mean_pred = mean(pred_fi, na.rm = TRUE),
+    se_pred = sd(pred_fi, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 20)
+
+p_lme_traj_t0 <- ggplot(model_plot_t0_data, aes(x = Time_From_T0_Rounded, y = mean_pred, color = Group_Label)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  geom_errorbar(
+    aes(ymin = mean_pred - 1.96 * se_pred, ymax = mean_pred + 1.96 * se_pred),
+    width = 0.4
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Model-Based Frailty Trajectories Aligned at Index Time (T0)",
+    x = "Years Relative to Index Time",
+    y = "Predicted Frailty Index",
+    color = "Group"
+  )
+
+print(p_lme_traj_t0)
+
+```
+
+```{r}
+model_data_rel <- model_data %>%
+  mutate(
+    TimeRel = Time - assigned_event_time,
+    PreTime = pmin(TimeRel, 0),
+    Post = if_else(TimeRel >= 0, 1L, 0L),
+    PostTime = pmax(TimeRel, 0)
+  )
+
+```
+
+```{r}
+fi_model_rel <- lmer(
+  fi_score_nocancer ~
+    Group +
+    PreTime + Group:PreTime +
+    Post + Group:Post +
+    PostTime + Group:PostTime +
+    terminal_decline + base_age_z + base_race + base_marital + base_pckgr +
+    (1 + PreTime + PostTime | id),
+  data = model_data_rel,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(fi_model_rel)
+
+```
+
+```{r}
+plot_grid <- expand.grid(
+  TimeRel = seq(-20, 20, by = 0.1),
+  Group = c(0, 1)
+) %>%
+  mutate(
+    PreTime = pmin(TimeRel, 0),
+    Post = if_else(TimeRel >= 0, 1L, 0L),
+    PostTime = pmax(TimeRel, 0),
+    terminal_decline = 0L,
+    base_age_z = 0,
+    base_race = factor(levels(model_data_rel$base_race)[1], levels = levels(model_data_rel$base_race)),
+    base_marital = factor(levels(model_data_rel$base_marital)[1], levels = levels(model_data_rel$base_marital)),
+    base_pckgr = factor(levels(model_data_rel$base_pckgr)[1], levels = levels(model_data_rel$base_pckgr))
+  )
+
+plot_grid$pred <- predict(fi_model_rel, newdata = plot_grid, re.form = NA)
+plot_grid$Group_Label <- factor(plot_grid$Group, levels = c(0, 1), labels = c("Control", "Cancer Case"))
+
+ggplot(plot_grid, aes(x = TimeRel, y = pred, color = Group_Label)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Model-Implied Piecewise Frailty Trajectories",
+    x = "Years Relative to Index Time",
+    y = "Predicted Frailty Index",
+    color = "Group"
+  )
+
+```
+
+```{r}
+fi_model_rel_3 <- lmer(
+  fi_score_nocancer ~
+    Group +
+    PreTime + Group:PreTime +
+    PostTime + Group:PostTime +
+    terminal_decline + base_age_z + base_race + base_marital + base_pckgr +
+    (1 + PreTime + PostTime | id),
+  data = model_data_rel,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(fi_model_rel_3)
+
+
+```
+
+```{r}
+plot_grid_rel_3 <- expand.grid(
+  TimeRel = seq(-20, 20, by = 0.1),
+  Group = c(0, 1)
+) %>%
+  mutate(
+    PreTime = pmin(TimeRel, 0),
+    PostTime = pmax(TimeRel, 0),
+    terminal_decline = 0L,
+    base_age_z = 0,
+    base_race = factor(levels(model_data_rel$base_race)[1], levels = levels(model_data_rel$base_race)),
+    base_marital = factor(levels(model_data_rel$base_marital)[1], levels = levels(model_data_rel$base_marital)),
+    base_pckgr = factor(levels(model_data_rel$base_pckgr)[1], levels = levels(model_data_rel$base_pckgr))
+  )
+
+plot_grid_rel_3$pred <- predict(
+  fi_model_rel_3,
+  newdata = plot_grid_rel_3,
+  re.form = NA
+)
+
+plot_grid_rel_3$Group_Label <- factor(
+  plot_grid_rel_3$Group,
+  levels = c(0, 1),
+  labels = c("Control", "Cancer Case")
+)
+
+p_model_rel_3 <- ggplot(plot_grid_rel_3, aes(x = TimeRel, y = pred, color = Group_Label)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Model-Implied Frailty Trajectories",
+    x = "Years Relative to Index Time",
+    y = "Predicted Frailty Index",
+    color = "Group"
+  )
+
+print(p_model_rel_3)
+
+```
+
+
+```{r}
+diff_curve_rel_3 <- plot_grid_rel_3 %>%
+  select(TimeRel, Group, pred) %>%
+  tidyr::pivot_wider(
+    names_from = Group,
+    values_from = pred,
+    names_prefix = "Group_"
+  ) %>%
+  mutate(
+    diff_case_minus_control = Group_1 - Group_0
+  )
+
+p_diff_rel_3 <- ggplot(diff_curve_rel_3, aes(x = TimeRel, y = diff_case_minus_control)) +
+  geom_line(linewidth = 1.2, color = "#de2d26") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(
+    title = "Estimated Cancer-Control Difference in Frailty",
+    x = "Years Relative to Index Time",
+    y = "Predicted FI Difference (Case - Control)"
+  )
+
+print(p_diff_rel_3)
+```
+
+```{r}
+model_data_rel <- model_data_rel %>%
+  mutate(
+    PreTime10 = PreTime / 10,
+    PostTime10 = PostTime / 10,
+    PreTime10_2 = PreTime10^2,
+    PostTime10_2 = PostTime10^2
+  )
+
+fi_model_rel_quad <- lmer(
+  fi_score_nocancer ~
+    Group +
+    PreTime10 + PreTime10_2 +
+    Group:PreTime10 + Group:PreTime10_2 +
+    PostTime10 + PostTime10_2 +
+    Group:PostTime10 + Group:PostTime10_2 +
+    terminal_decline + base_age_z + base_race + base_marital + base_pckgr +
+    (1 + PreTime10 + PostTime10 || id),
+  data = model_data_rel,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(fi_model_rel_quad)
+```
+```{r}
+plot_grid_rel_quad <- expand.grid(
+  TimeRel = seq(-20, 20, by = 0.1),
+  Group = c(0, 1)
+) %>%
+  mutate(
+    PreTime = pmin(TimeRel, 0),
+    PostTime = pmax(TimeRel, 0),
+    PreTime10 = PreTime / 10,
+    PostTime10 = PostTime / 10,
+    PreTime10_2 = PreTime10^2,
+    PostTime10_2 = PostTime10^2,
+    terminal_decline = 0L,
+    base_age_z = 0,
+    base_race = factor(levels(model_data_rel$base_race)[1], levels = levels(model_data_rel$base_race)),
+    base_marital = factor(levels(model_data_rel$base_marital)[1], levels = levels(model_data_rel$base_marital)),
+    base_pckgr = factor(levels(model_data_rel$base_pckgr)[1], levels = levels(model_data_rel$base_pckgr))
+  )
+
+plot_grid_rel_quad$pred <- predict(
+  fi_model_rel_quad,
+  newdata = plot_grid_rel_quad,
+  re.form = NA
+)
+
+plot_grid_rel_quad$Group_Label <- factor(
+  plot_grid_rel_quad$Group,
+  levels = c(0, 1),
+  labels = c("Control", "Cancer Case")
+)
+
+p_model_rel_quad <- ggplot(plot_grid_rel_quad, aes(x = TimeRel, y = pred, color = Group_Label)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Quadratic Model-Implied Frailty Trajectories",
+    x = "Years Relative to Index Time",
+    y = "Predicted Frailty Index",
+    color = "Group"
+  )
+
+print(p_model_rel_quad)
+```

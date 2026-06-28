@@ -1,0 +1,438 @@
+---
+title: "Piecewise Linear Frailty Trajectories Before and After Incident Cancer Diagnosis"
+author: "XZ"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango    
+    code_folding: hide
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 2.2_self reported cancer.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Fits piecewise linear frailty trajectory models before and after self-reported incident cancer diagnosis and compares cancer and control trajectories.
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 11, fig.height = 6
+)
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(knitr)
+library(gtsummary)
+```
+
+## 1. Study Overview
+
+We use self reported cancer for cancer variable, and frailty index excluding cancer as the outcome. Therefore, there is a 4-year gap between the last data point before cancer diagnosis (t=-4) and the first data point after cancer diagnosis (t=0)
+
+**Inclusion & Exclusion Criteria:**
+1. Available covariates at baseline.
+2. We remove prevalent cancers at baseline.
+3. We ensure all participants have at least 2 longitudinal observations with FI.
+4. FI is considered missing if with less than 20 out of 27 frailty items measured.
+
+------------------------------------------------------------------------
+
+## 2. Data Preparation & Eligibility
+
+```{r data_prep}
+# Load data (imputed longitudinal FI dataset)
+fi_long <- readRDS("/n/home06/xyzhou/Frailty/2_data analysis/before and after cancer/data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
+
+# Study cycles used for repeated frailty measurement
+target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
+
+# 1) Baseline covariates (Cycle 86)
+baseline_covs <- fi_long %>%
+  filter(cycle == "86") %>%
+  select(
+    id,
+    age_months   = age_enrollment,
+    base_race    = race,
+    base_marital = marital_status,
+    base_living  = living_arr,
+    base_pckgr   = pckgr
+  ) %>%
+  mutate(base_age = age_months / 12) %>%
+  select(-age_months) %>%
+  drop_na()
+
+# 2) Prepare longitudinal repeated-measure dataset (target cycles)
+fi_prep <- fi_long %>%
+  filter(cycle %in% target_cycles) %>%
+  mutate(
+    # Convert cycle code to calendar year (e.g., 88 -> 1988; 20 -> 2020)
+    Year_num = case_when(
+      as.numeric(cycle) > 50 ~ 1900 + as.numeric(cycle),
+      TRUE ~ 2000 + as.numeric(cycle)
+    ),
+    Age = (worked_rtmnyr - dbmy09) / 12
+  )
+
+# 3) Define each participant’s baseline observation year in the analytic window
+baseline_year_by_id <- fi_prep %>%
+  group_by(id) %>%
+  summarise(Year_base = min(Year_num), .groups = "drop")
+
+# 4) Exclude baseline cancer (cancer present at first analytic observation)
+baseline_cancer_ids <- fi_prep %>%
+  inner_join(baseline_year_by_id, by = "id") %>%
+  filter(Year_num == Year_base) %>%
+  filter(fi_cancer == 1) %>%
+  pull(id) %>%
+  unique()
+
+# 5) Identify incident cancer timing among those without baseline cancer
+cancer_timing <- fi_prep %>%
+  filter(!id %in% baseline_cancer_ids) %>%
+  filter(fi_cancer == 1) %>%
+  group_by(id) %>%
+  summarise(Year_Cancer = min(Year_num), .groups = "drop")
+
+# 6) Build analytic longitudinal dataset
+analysis_long <- fi_prep %>%
+  filter(!id %in% baseline_cancer_ids) %>%
+  inner_join(baseline_year_by_id, by = "id") %>%
+  left_join(cancer_timing, by = "id") %>%
+  inner_join(baseline_covs, by = "id") %>%
+  mutate(
+    # Outcome validity rule 
+    fi_score_nocancer = if_else(n_answered_nocancer < 20, NA_real_, fi_score_nocancer),
+
+    # Follow-up time since baseline observation (years)
+    time = Year_num - Year_base,
+
+    # Time-varying post-cancer indicator
+    postCancer = if_else(!is.na(Year_Cancer) & Year_num >= Year_Cancer, 1L, 0L),
+
+    # Time since diagnosis (0 before diagnosis; increases after)
+    timeAfterCancer = if_else(postCancer == 1L, Year_num - Year_Cancer, 0),
+
+    # Useful indicators for tables/plots
+    everCancer = if_else(!is.na(Year_Cancer), 1L, 0L),
+
+    # Factor covariates
+    base_race    = factor(base_race),
+    base_marital = factor(base_marital),
+    base_living  = factor(base_living),
+    base_pckgr   = factor(base_pckgr),
+
+    # Scale baseline age for stability
+    base_age_z = as.numeric(scale(base_age))
+  ) %>%
+  filter(participated == 1, !is.na(fi_score_nocancer)) %>%
+  group_by(id) %>%
+  filter(n() >= 2) %>%
+  ungroup() %>%
+  arrange(id, Year_num)
+```
+
+------------------------------------------------------------------------
+
+## 3. Sample Flow & Baseline Descriptives
+
+```{r descriptive_tables}
+# Attrition logic
+n_baseline_covs <- nrow(baseline_covs)
+n_in_target_cycles <- fi_prep %>% distinct(id) %>% nrow()
+n_excluded_baseline_cancer <- length(unique(baseline_cancer_ids))
+n_ids_final <- analysis_long %>% distinct(id) %>% nrow()
+n_obs_final <- nrow(analysis_long)
+
+attrition_data <- data.frame(
+  Step = c(
+    "Participants with complete baseline (1986) covariates",
+    "Participants observed in any target cycles (1988–2020)",
+    "Excluded (baseline cancer at first analytic observation)",
+    "Final eligible participants (>=2 FI observations)",
+    "Total valid observations (rows) used in models"
+  ),
+  N = c(n_baseline_covs, n_in_target_cycles, n_excluded_baseline_cancer, n_ids_final, n_obs_final)
+)
+
+kable(attrition_data, caption = "Table: Study Sample Flow", align = c("l", "r"))
+
+# Baseline Table by Future Cancer Status
+baseline_for_table <- analysis_long %>%
+  distinct(id, everCancer, base_age, base_age_z, base_race, base_marital, base_living, base_pckgr)
+
+baseline_for_table %>%
+  select(everCancer, base_age, base_race, base_marital, base_living, base_pckgr) %>%
+  tbl_summary(
+    by = everCancer,
+    statistic = list(all_continuous() ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)")
+  ) %>%
+  add_p() %>%
+  modify_header(label = "**Baseline characteristic (1986)**") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Ever incident cancer during follow-up**")
+```
+
+------------------------------------------------------------------------
+
+## 4. Main Piecewise Linear Mixed-Effects Models
+
+```{r fit_models}
+# Fully adjusted model
+mod2_full <- lmer(
+  fi_score_nocancer ~ time + postCancer + timeAfterCancer +
+    base_age_z + base_race + base_marital + base_living + base_pckgr +
+    (1 + time | id),
+  data = analysis_long,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(mod2_full)
+```
+
+```{r extract_effects}
+b <- fixef(mod2_full)
+data.frame(
+  quantity = c("Pre-diagnosis slope (per year)", "Immediate jump after diagnosis", "Post-diagnosis slope (per year)"),
+  estimate = c(b["time"], b["postCancer"], b["time"] + b["timeAfterCancer"])
+) %>% 
+  kable(digits = 4, caption = "Derived slopes and jump (point estimates)")
+```
+
+------------------------------------------------------------------------
+
+## 5. Visualization: Predicted Trajectories (Bounded Event-Centered)
+
+We visualize the trajectories based on the data's true follow-up span. To prevent the pre-cancer modeled `time` from becoming negative and generating a flatline, we bound the minimum relative plotting time against `-tDx_median`.
+
+```{r visualization, fig.width=12, fig.height=7}
+# Compute each cancer case's time-from-baseline to diagnosis
+dx_time_by_id <- analysis_long %>%
+  filter(everCancer == 1L) %>%
+  distinct(id, Year_base, Year_Cancer) %>%
+  mutate(tDx = Year_Cancer - Year_base)
+
+tDx_median <- median(dx_time_by_id$tDx, na.rm = TRUE)
+
+# Calculate the TRUE maximum and minimum relative follow-up times
+analysis_long_cases <- analysis_long %>%
+  filter(everCancer == 1L) %>%
+  mutate(tRel = Year_num - Year_Cancer)
+
+emp_min_rel <- floor(min(analysis_long_cases$tRel, na.rm = TRUE))
+emp_max_rel <- ceiling(max(analysis_long_cases$tRel, na.rm = TRUE))
+
+# BOUND min_rel to prevent negative 'time' values in the model
+min_rel <- max(emp_min_rel, -floor(tDx_median))
+max_rel <- emp_max_rel
+
+cat("Plotting follow-up range from", min_rel, "to", max_rel, "years relative to diagnosis.\n")
+
+# 1. Never Cancer Grid
+grid_never <- data.frame(tRel = seq(min_rel, max_rel, by = 0.25)) %>%
+  mutate(
+    scenario = "Never cancer (counterfactual)",
+    time = tDx_median + tRel, 
+    postCancer = 0L,
+    timeAfterCancer = 0
+  )
+
+# 2. Pre-Cancer Grid (Ends exactly at 0, no jump yet)
+grid_cancer_pre <- data.frame(tRel = seq(min_rel, 0, by = 0.25)) %>%
+  mutate(
+    scenario = "Incident cancer at t=0",
+    time = tDx_median + tRel,
+    postCancer = 0L,
+    timeAfterCancer = 0
+  )
+
+# 3. Post-Cancer Grid (Starts exactly at 0, with the jump)
+grid_cancer_post <- data.frame(tRel = seq(0, max_rel, by = 0.25)) %>%
+  mutate(
+    scenario = "Incident cancer at t=0",
+    time = tDx_median + tRel,
+    postCancer = 1L,
+    timeAfterCancer = tRel
+  )
+
+# Combine and apply covariates
+grid_rel <- bind_rows(grid_never, grid_cancer_pre, grid_cancer_post) %>%
+  mutate(
+    base_age_z = 0,
+    base_race = levels(analysis_long$base_race)[1],
+    base_marital = levels(analysis_long$base_marital)[1],
+    base_living = levels(analysis_long$base_living)[1],
+    base_pckgr = levels(analysis_long$base_pckgr)[1]
+  )
+
+# Predict marginal means
+grid_rel$pred_FI <- predict(mod2_full, newdata = grid_rel, re.form = NA)
+
+# Re-split for clean plotting
+grid_never_plot <- grid_rel %>% filter(scenario == "Never cancer (counterfactual)")
+grid_cancer_pre_plot <- grid_rel %>% filter(scenario == "Incident cancer at t=0", postCancer == 0L)
+grid_cancer_post_plot <- grid_rel %>% filter(scenario == "Incident cancer at t=0", postCancer == 1L)
+
+# Get precise y-values for the vertical jump
+y_pre_jump <- grid_cancer_pre_plot$pred_FI[grid_cancer_pre_plot$tRel == 0]
+y_post_jump <- grid_cancer_post_plot$pred_FI[grid_cancer_post_plot$tRel == 0]
+
+ggplot() +
+  # Plot Never Cancer trajectory
+  geom_line(data = grid_never_plot, aes(x = tRel, y = pred_FI), 
+            color = "#E69F00", linetype = "dashed", linewidth = 1.2) +
+  
+  # Plot Pre-Cancer trajectory
+  geom_line(data = grid_cancer_pre_plot, aes(x = tRel, y = pred_FI), 
+            color = "#0072B2", linewidth = 1.2) +
+  
+  # Plot Post-Cancer trajectory
+  geom_line(data = grid_cancer_post_plot, aes(x = tRel, y = pred_FI), 
+            color = "#0072B2", linewidth = 1.2) +
+  
+  # Add the vertical "jump" at Time 0
+  geom_segment(aes(x = 0, xend = 0, 
+                   y = y_pre_jump, 
+                   yend = y_post_jump), 
+               color = "#0072B2", linewidth = 1.2) +
+  
+  geom_vline(xintercept = 0, linetype = "dotted", color = "gray30") +
+  
+  # Adjust x-axis breaks to accommodate long follow-up
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    plot.title = element_text(face = "bold", size = 15),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Predicted FI Trajectories Before/After Incident Cancer",
+    subtitle = paste0("Event-centered display assuming diagnosis at median time-to-diagnosis (", round(tDx_median, 1), " years)."),
+    x = "Years relative to cancer diagnosis (0 = Diagnosis)",
+    y = "Predicted non-cancer FI"
+  )
+```
+
+------------------------------------------------------------------------
+
+## 6. Extended Model: Testing Pre-Diagnosis Differences (Optional)
+
+```{r extended_model}
+mod3_interactions <- lmer(
+  fi_score_nocancer ~ time + everCancer + (time * everCancer) + 
+    postCancer + timeAfterCancer +
+    base_age_z + base_race + base_marital + base_living + base_pckgr +
+    (1 + time | id),
+  data = analysis_long,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(mod3_interactions)
+```
+
+## 7. Visualization: Extended Model (Pre-Diagnosis Differences)
+
+```{r extended_visualization, fig.width=12, fig.height=7}
+# Re-use min_rel and max_rel defined in Section 5
+# Build independent grids, ensuring everCancer indicator is mapped correctly
+
+# 1. Never Cancer Grid
+grid_never_ext <- data.frame(tRel = seq(min_rel, max_rel, by = 0.25)) %>%
+  mutate(
+    scenario = "Never cancer (counterfactual)",
+    time = tDx_median + tRel,
+    everCancer = 0L,
+    postCancer = 0L,
+    timeAfterCancer = 0
+  )
+
+# 2. Pre-Cancer Grid (Ends exactly at 0)
+grid_cancer_pre_ext <- data.frame(tRel = seq(min_rel, 0, by = 0.25)) %>%
+  mutate(
+    scenario = "Incident cancer at t=0",
+    time = tDx_median + tRel,
+    everCancer = 1L,
+    postCancer = 0L,
+    timeAfterCancer = 0
+  )
+
+# 3. Post-Cancer Grid (Starts exactly at 0)
+grid_cancer_post_ext <- data.frame(tRel = seq(0, max_rel, by = 0.25)) %>%
+  mutate(
+    scenario = "Incident cancer at t=0",
+    time = tDx_median + tRel,
+    everCancer = 1L,
+    postCancer = 1L,
+    timeAfterCancer = tRel
+  )
+
+# Combine and map covariates
+grid_ext <- bind_rows(grid_never_ext, grid_cancer_pre_ext, grid_cancer_post_ext) %>%
+  mutate(
+    base_age_z = 0,
+    base_race = levels(analysis_long$base_race)[1],
+    base_marital = levels(analysis_long$base_marital)[1],
+    base_living = levels(analysis_long$base_living)[1],
+    base_pckgr = levels(analysis_long$base_pckgr)[1]
+  )
+
+# Predict marginal means using the EXTENDED model
+grid_ext$pred_FI <- predict(mod3_interactions, newdata = grid_ext, re.form = NA)
+
+# Re-split for clean plotting
+grid_never_plot_ext <- grid_ext %>% filter(scenario == "Never cancer (counterfactual)")
+grid_cancer_pre_plot_ext <- grid_ext %>% filter(scenario == "Incident cancer at t=0", postCancer == 0L)
+grid_cancer_post_plot_ext <- grid_ext %>% filter(scenario == "Incident cancer at t=0", postCancer == 1L)
+
+# Get precise y-values for the vertical jump
+y_pre_jump_ext <- grid_cancer_pre_plot_ext$pred_FI[grid_cancer_pre_plot_ext$tRel == 0]
+y_post_jump_ext <- grid_cancer_post_plot_ext$pred_FI[grid_cancer_post_plot_ext$tRel == 0]
+
+# Generate Plot
+ggplot() +
+  # Plot Never Cancer trajectory (Unique intercept and slope)
+  geom_line(data = grid_never_plot_ext, aes(x = tRel, y = pred_FI), 
+            color = "#E69F00", linetype = "dashed", linewidth = 1.2) +
+  
+  # Plot Pre-Cancer trajectory
+  geom_line(data = grid_cancer_pre_plot_ext, aes(x = tRel, y = pred_FI), 
+            color = "#0072B2", linewidth = 1.2) +
+  
+  # Plot Post-Cancer trajectory
+  geom_line(data = grid_cancer_post_plot_ext, aes(x = tRel, y = pred_FI), 
+            color = "#0072B2", linewidth = 1.2) +
+  
+  # Add the vertical "jump" at Time 0
+  geom_segment(aes(x = 0, xend = 0, 
+                   y = y_pre_jump_ext, 
+                   yend = y_post_jump_ext), 
+               color = "#0072B2", linewidth = 1.2) +
+  
+  geom_vline(xintercept = 0, linetype = "dotted", color = "gray30") +
+  
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    plot.title = element_text(face = "bold", size = 15),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Predicted FI Trajectories: Testing Pre-Diagnosis Differences",
+    subtitle = paste0("Extended model allowing unique baseline frailty and pre-diagnosis slopes (tDx = ", round(tDx_median, 1), ")."),
+    x = "Years relative to cancer diagnosis (0 = Diagnosis)",
+    y = "Predicted non-cancer FI"
+  )
+```

@@ -1,0 +1,265 @@
+---
+title: "Piecewise Non-Linear Frailty Trajectory Before and After Cancer Diagnosis"
+author: "XZ"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 2_model.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Fits piecewise nonlinear frailty trajectory models before and after cancer diagnosis, including spline-based model components and visual output.
+```
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 7)
+
+# Load required libraries
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(lme4)
+library(lmerTest) 
+library(splines)   # For natural cubic splines ns()
+library(ggplot2)
+library(patchwork) # For side-by-side plot layout
+library(knitr)
+library(gtsummary) 
+```
+
+## 1. Study Overview & Sample Eligibility
+
+This analysis models the physiological trajectory of frailty (excluding cancer items) before and after an incident cancer diagnosis using **Piecewise Linear Mixed-Effects Models with Natural Cubic Splines**. 
+
+By interacting the spline with a `Phase` indicator (Pre vs. Post diagnosis), the model captures both the non-linear physiological curves and the acute "jump" in frailty strictly associated with the cancer event at Time = 0.
+
+---
+
+## 2. Data Preparation & Inclusion Criteria
+
+```{r data_prep}
+# Load Imputed Data
+fi_long <- readRDS("/n/home06/xyzhou/Frailty/2_data analysis/before and after cancer/data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
+target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
+
+# 1. Extract Baseline Covariates (Cycle 86)
+baseline_covs <- fi_long %>%
+  filter(cycle == "86") %>%
+  select(
+    id,
+    age_months   = age_enrollment, 
+    base_race    = race,
+    base_marital = marital_status,
+    base_living  = living_arr,
+    base_pckgr   = pckgr
+  ) %>%
+  mutate(base_age = age_months / 12) %>% # Convert baseline age to years
+  select(-age_months) %>%
+  drop_na()
+
+# 2. Standardize Years for Target Cycles
+fi_prep <- fi_long %>%
+  filter(cycle %in% target_cycles) %>%
+  mutate(
+    Year_num = case_when(
+      as.numeric(cycle) > 50 ~ 1900 + as.numeric(cycle),
+      TRUE ~ 2000 + as.numeric(cycle)
+    ),
+    Age = (worked_rtmnyr - dbmy09) / 12 # Calculate precise age at specific cycle
+  )
+
+# 3. Identify and Exclude Baseline Cancer
+baseline_cancer_ids <- fi_prep %>%
+  group_by(id) %>%
+  arrange(Year_num) %>%
+  slice(1) %>%
+  filter(fi_cancer == 1) %>%
+  pull(id)
+
+# 4. Identify Timing of Incident Cancer
+cancer_timing <- fi_prep %>%
+  filter(!id %in% baseline_cancer_ids) %>%
+  filter(fi_cancer == 1) %>%
+  group_by(id) %>%
+  summarise(Year_Cancer = min(Year_num), .groups = "drop") 
+
+incident_cancer_ids <- cancer_timing$id
+
+# 5. Build Final Dataset for Modeling
+final_population <- fi_prep %>%
+  filter(id %in% incident_cancer_ids) %>%
+  inner_join(cancer_timing, by = "id") %>%
+  inner_join(baseline_covs, by = "id") %>%
+  mutate(
+    # Continuous time variable relative to diagnosis
+    Time_to_Cancer = Year_num - Year_Cancer,
+    
+    # Phase indicator to force the piecewise "gap" at Time = 0
+    Phase = if_else(Time_to_Cancer >= 0, "Post-Diagnosis", "Pre-Diagnosis"),
+    Phase = factor(Phase, levels = c("Pre-Diagnosis", "Post-Diagnosis")),
+    
+    # Validity rules
+    fi_score_nocancer = if_else(n_answered_nocancer < 20, NA_real_, fi_score_nocancer),
+    frailty_cat_nocancer = if_else(is.na(fi_score_nocancer), NA_character_, frailty_cat_nocancer),
+    
+    base_race = as.factor(base_race),
+    base_marital = as.factor(base_marital),
+    base_living = as.factor(base_living),
+    base_pckgr = as.factor(base_pckgr)
+  ) %>%
+  filter(participated == 1, !is.na(fi_score_nocancer)) %>%
+  mutate(base_age_z = as.numeric(scale(base_age))) %>% # Standardize age for LMM convergence
+  group_by(id) %>% filter(n() >= 2) %>% ungroup() %>%
+  arrange(id, Time_to_Cancer)
+```
+
+```{r attrition_table}
+attrition_data <- data.frame(
+  Step = c(
+    "Participants with complete 1986 baseline covariates",
+    "Incident Cancer cohort (excluding baseline cancer)",
+    "Final Eligible Participants (>= 2 measures)",
+    "Total valid observations for model"
+  ),
+  N = c(
+    nrow(baseline_covs),
+    length(incident_cancer_ids),
+    length(unique(final_population$id)),
+    nrow(final_population)
+  )
+)
+kable(attrition_data, caption = "Table: Study Sample Flow", align = c("l", "r"))
+```
+
+---
+
+## 3. Spline Complexity Selection (df)
+
+We determine the optimal natural cubic spline degrees of freedom (`df`) by minimizing the Bayesian Information Criterion (BIC).
+
+```{r select_df, fig.width=8, fig.height=4.5}
+df_values <- 2:6
+fit_stats <- list()
+
+for (i in df_values) {
+  form <- as.formula(
+    paste0("fi_score_nocancer ~ ns(Time_to_Cancer, df = ", i, ") * Phase + ",
+           "base_age_z + base_race + base_marital + base_living + base_pckgr + ",
+           "(1 + Time_to_Cancer | id)")
+  )
+  
+  tmp_mod <- lmer(form, data = final_population, 
+                  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5)))
+  
+  fit_stats[[as.character(i)]] <- data.frame(df = i, AIC = AIC(tmp_mod), BIC = BIC(tmp_mod))
+}
+
+df_comparison <- bind_rows(fit_stats)
+optimal_df <- df_comparison$df[which.min(df_comparison$BIC)]
+
+# Print the comparison table and the optimal df
+kable(df_comparison, caption = "Model Fit Statistics by Spline Degrees of Freedom")
+cat("Optimal Spline df (Lowest BIC):", optimal_df, "\n")
+```
+
+---
+
+## 4. Main Models
+
+```{r fit_models}
+# Model 1: Crude Piecewise Spline Trajectory
+mod1_crude <- lmer(
+  fi_score_nocancer ~ ns(Time_to_Cancer, df = optimal_df) * Phase + 
+                      (1 + Time_to_Cancer | id),
+  data = final_population, 
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+# Model 2: Fully Adjusted Piecewise Spline Trajectory
+mod2_full <- lmer(
+  fi_score_nocancer ~ ns(Time_to_Cancer, df = optimal_df) * Phase + 
+                      base_age_z + base_race + base_marital + base_living + base_pckgr + 
+                      (1 + Time_to_Cancer | id),
+  data = final_population, 
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(mod2_full)
+```
+
+---
+
+## 5. Visualization (Separated Models with Piecewise Gap)
+
+```{r visualization, fig.width=14, fig.height=6}
+# 1. Determine dynamic boundaries based on the actual dataset
+min_time <- floor(min(final_population$Time_to_Cancer))
+max_time <- ceiling(max(final_population$Time_to_Cancer))
+
+cat("Plotting data-driven timeframe from", min_time, "to", max_time, "years.\n")
+
+# 2. Create Split Prediction Grids to enforce the gap at Time 0
+grid_pre <- expand.grid(
+  Time_to_Cancer = seq(min_time, 0, by = 0.25),
+  Phase = "Pre-Diagnosis",
+  base_age_z = 0, # Median/Mean age profile
+  base_race = levels(final_population$base_race)[1],
+  base_marital = levels(final_population$base_marital)[1],
+  base_living = levels(final_population$base_living)[1],
+  base_pckgr = levels(final_population$base_pckgr)[1]
+)
+
+grid_post <- expand.grid(
+  Time_to_Cancer = seq(0, max_time, by = 0.25),
+  Phase = "Post-Diagnosis",
+  base_age_z = 0, 
+  base_race = levels(final_population$base_race)[1],
+  base_marital = levels(final_population$base_marital)[1],
+  base_living = levels(final_population$base_living)[1],
+  base_pckgr = levels(final_population$base_pckgr)[1]
+)
+
+# Combine grids and lock factor levels
+grid_all <- bind_rows(grid_pre, grid_post)
+grid_all$Phase <- factor(grid_all$Phase, levels = c("Pre-Diagnosis", "Post-Diagnosis"))
+
+# 3. Predict marginal effects 
+grid_all$fi_crude <- predict(mod1_crude, newdata = grid_all, re.form = NA)
+grid_all$fi_full <- predict(mod2_full, newdata = grid_all, re.form = NA)
+
+# 4. Base Plotting Function
+plot_spline <- function(data, y_var, title, color_val) {
+  ggplot(data, aes(x = Time_to_Cancer, y = .data[[y_var]], group = Phase)) +
+    geom_vline(xintercept = 0, color = "darkgray", linetype = "dashed", linewidth = 1) +
+    geom_line(linewidth = 1.5, color = color_val) +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+    theme_minimal() + 
+    labs(
+      title = title, 
+      x = "Years Relative to Cancer Diagnosis", 
+      y = "Predicted Non-Cancer FI"
+    ) +
+    theme(plot.title = element_text(face = "bold", size = 13))
+}
+
+# 5. Generate and Combine Separate Plots
+p1 <- plot_spline(grid_all, "fi_crude", "Model 1: Crude Trajectory", "#4E79A7")
+p2 <- plot_spline(grid_all, "fi_full", "Model 2: Fully Adjusted Trajectory", "#E15759")
+
+# Use patchwork to display them side-by-side
+p1 + p2 + plot_annotation(
+  title = paste0("Piecewise Non-Linear Frailty Trajectories (Spline df = ", optimal_df, ")"),
+  subtitle = "Time 0 represents the cycle of incident cancer diagnosis. Data-driven timeframe.",
+  theme = theme(plot.title = element_text(size = 17, face = "bold"),
+                plot.subtitle = element_text(size = 12, color = "gray30"))
+)
+```
+```

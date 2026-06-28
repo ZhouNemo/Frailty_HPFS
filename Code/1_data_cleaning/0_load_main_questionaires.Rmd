@@ -1,0 +1,419 @@
+---
+title: "Read_main_questionare"
+output: html_document
+date: "2026-01-24"
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 0_load_main_questionaires.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Documents and runs extraction of HPFS main questionnaire files from raw questionnaire sources, creating cycle-specific data needed for downstream frailty and covariate processing.
+```
+
+```{r setup}
+library(readr)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+```
+
+/n/hpnh/ReadMacros/HPFS/dd/
+
+##Read the datasets and questionaires of the HPFS main questionaires
+```{r}
+library(dplyr)
+library(readr)
+library(stringr)
+
+read_hp_dataset <- function(year_code) {
+  
+  # Determine Base Filenames
+  suffix_years <- c("86", "88", "90", "94", "98")
+  if (year_code %in% suffix_years) {
+    base_name <- paste0("hp", year_code, "a")
+  } else {
+    base_name <- paste0("hp", year_code)
+  }
+  
+  if (year_code == "88") {
+    data_filename <- "hp88.jan2"
+  } else if (year_code == "87") {
+    data_filename <- "hp87.jan2"
+  } else {
+    data_filename <- base_name
+  }
+  
+  # Find the Dictionary
+  possible_dicts <- c(
+    paste0(base_name, ".sas.dd"),
+    paste0(base_name, ".dd"),
+    paste0("hp", year_code, ".sas.dd") 
+  )
+  
+  dd_path <- NULL
+  for (f in possible_dicts) {
+    full_path <- paste0("/n/hpnh/ReadMacros/HPFS/dd/", f)
+    if (file.exists(full_path)) {
+      dd_path <- full_path
+      break
+    }
+  }
+  
+  # Find Data File
+  data_path <- paste0("/n/hpnh/HPFS/Qdata/hp_dat_qqf/", data_filename)
+  
+  if (is.null(dd_path)) {
+    warning(paste("Skipping", year_code, "- No dictionary found."))
+    return(NULL)
+  }
+  if (!file.exists(data_path)) {
+    warning(paste("Skipping", year_code, "- Data file not found:", data_path))
+    return(NULL)
+  }
+  
+  # Parse Dictionary
+  lines <- readLines(dd_path)
+  regex_pattern <- "^\\s*([A-Za-z0-9_\\.]+)\\s+([A-Za-z]+)\\s*(\\d+)(.*)"
+  matches <- str_match(lines, regex_pattern)
+  
+  vars_df <- data.frame(
+    Variable   = matches[, 2],
+    Type       = matches[, 3],
+    Length     = as.numeric(matches[, 4]),
+    RestOfLine = trimws(matches[, 5]),
+    stringsAsFactors = FALSE
+  ) %>% filter(!is.na(Variable))
+  
+  # Intelligently extract Start Positions & Remove Overlays
+  vars_df <- vars_df %>%
+    mutate(
+      first_token = str_extract(RestOfLine, "^\\S+"),
+      # Identify if the token is an overlay pointer (starts with @)
+      is_overlay = grepl("^@", first_token),
+      # It is a start position ONLY if it's numbers/hyphens AND doesn't contain a ")"
+      is_start_pos = grepl("^\\d+(-?\\d+)?$", first_token) & !grepl("\\)", first_token),
+      # Extract the first number if it's a valid position
+      Start = if_else(is_start_pos, as.numeric(sub("-.*", "", first_token)), NA_real_)
+    ) %>%
+    # CRITICAL FIX: Remove the SAS overlay variables so they don't break the sequence
+    filter(!is_overlay)
+  
+  # Sequentially impute missing Start positions (Exactly how SAS does it)
+  current_pointer <- 1
+  for (i in 1:nrow(vars_df)) {
+    if (!is.na(vars_df$Start[i])) {
+      # If explicit start is given, jump the pointer there (e.g., id at 41)
+      current_pointer <- vars_df$Start[i]
+    } else {
+      # If no start is given, start exactly where the last variable ended
+      vars_df$Start[i] <- current_pointer
+    }
+    # Advance the pointer by the length of the current variable
+    current_pointer <- vars_df$Start[i] + vars_df$Length[i]
+  }
+
+  # Finalize Variable DataFrame
+  vars_df <- vars_df %>%
+    mutate(End = Start + Length - 1) %>%
+    distinct(Variable, .keep_all = TRUE) %>%
+    select(Variable, Length, Start, End)
+  
+  # Safety Check: Ensure 'id' is captured correctly
+  if (!any(vars_df$Variable == "id")) {
+    vars_df <- bind_rows(
+      data.frame(Variable = "id", Length = 6, Start = 41, End = 46),
+      vars_df
+    ) %>% arrange(Start) %>% distinct(Variable, .keep_all = TRUE)
+  }
+  
+  # Read Data
+  print(paste("Reading:", year_code, "| Dict:", basename(dd_path), "| Vars:", nrow(vars_df)))
+  
+  tryCatch({
+    read_fwf(
+      file = data_path,
+      col_positions = fwf_positions(
+        start = vars_df$Start,
+        end   = vars_df$End,
+        col_names = vars_df$Variable
+      ),
+      col_types = cols(.default = col_double()), 
+      trim_ws = TRUE,
+      show_col_types = FALSE
+    )
+  }, error = function(e) {
+    warning(paste("Failed to read", base_name, ":", e$message))
+    return(NULL)
+  })
+}
+
+# Execution: Re-read the data lists
+all_years <- c("86", "87", "88", "90", "92", "94", "96", "98", 
+               sprintf("%02d", seq(0, 22, 2)))
+
+hp_data_list <- lapply(all_years, read_hp_dataset)
+names(hp_data_list) <- paste0("hp", all_years)
+
+```
+
+```{r}
+
+################read the dictionaries################
+# 1. Define the Function
+get_hp_dictionary <- function(year_code) {
+  
+  # Determine base names
+  suffix_years <- c("86", "88", "90", "94", "98")
+  if (year_code %in% suffix_years) {
+    base_name <- paste0("hp", year_code, "a")
+  } else {
+    base_name <- paste0("hp", year_code)
+  }
+  
+  # Search for Dictionary (Checking all naming variations)
+  possible_dicts <- c(
+    paste0(base_name, ".sas.dd"), 
+    paste0(base_name, ".dd"),
+    paste0("hp", year_code, ".sas.dd")
+  )
+  
+  dd_path <- NULL
+  for (f in possible_dicts) {
+    full_path <- paste0("/n/hpnh/ReadMacros/HPFS/dd/", f)
+    if (file.exists(full_path)) {
+      dd_path <- full_path
+      break
+    }
+  }
+  
+  if (is.null(dd_path)) {
+    warning(paste("No dictionary found for year:", year_code))
+    return(NULL)
+  }
+  
+  # Parse Text
+  lines <- readLines(dd_path)
+  
+  # Regex handles: Name -> Type -> Length -> Start -> Optional Range -> Optional Label
+  # Matches "id i6 41" AND "id i6 41-46"
+  regex_pattern <- "^\\s*([A-Za-z0-9_\\.]+)\\s+([A-Za-z]+)\\s*(\\d+)\\s+(\\d+)(?:-\\d+)?(?:\\s+(.*))?$"
+  
+  matches <- str_match(lines, regex_pattern)
+  
+  # Create Table
+  dict_df <- data.frame(
+    Variable = matches[, 2],
+    Label    = matches[, 6],
+    Start    = as.numeric(matches[, 5]),
+    Length   = as.numeric(matches[, 4]),
+    Type     = matches[, 3]
+  ) %>%
+    filter(!is.na(Variable)) %>%
+    arrange(Start) %>%
+    select(Variable, Label, Start, Length, Type)
+  
+  return(dict_df)
+}
+
+# 2. Initialize the List (This fixes your error!)
+hp_dicts <- list()
+
+# 3. Load All Years (including 87)
+all_years <- c("86", "87", "88", "90", "92", "94", "96", "98", 
+               sprintf("%02d", seq(0, 22, 2)))
+
+print("Loading all dictionaries...")
+hp_dicts <- lapply(all_years, get_hp_dictionary)
+names(hp_dicts) <- paste0("hp", all_years)
+
+
+```
+
+
+##View them
+```{r}
+# --- 1980s ---
+View(hp_data_list$hp86, title = "Data 1986")
+View(hp_dicts$hp86,     title = "Dict 1986")
+
+View(hp_data_list$hp87, title = "Data 1987")
+View(hp_dicts$hp87,     title = "Dict 1987")
+
+View(hp_data_list$hp88, title = "Data 1988")
+View(hp_dicts$hp88,     title = "Dict 1988")
+
+# --- 1990s ---
+View(hp_data_list$hp90, title = "Data 1990")
+View(hp_dicts$hp90,     title = "Dict 1990")
+
+View(hp_data_list$hp92, title = "Data 1992")
+View(hp_dicts$hp92,     title = "Dict 1992")
+
+View(hp_data_list$hp94, title = "Data 1994")
+View(hp_dicts$hp94,     title = "Dict 1994")
+
+View(hp_data_list$hp96, title = "Data 1996")
+View(hp_dicts$hp96,     title = "Dict 1996")
+
+View(hp_data_list$hp98, title = "Data 1998")
+View(hp_dicts$hp98,     title = "Dict 1998")
+
+# --- 2000s ---
+View(hp_data_list$hp00, title = "Data 2000")
+View(hp_dicts$hp00,     title = "Dict 2000")
+
+View(hp_data_list$hp02, title = "Data 2002")
+View(hp_dicts$hp02,     title = "Dict 2002")
+
+View(hp_data_list$hp04, title = "Data 2004")
+View(hp_dicts$hp04,     title = "Dict 2004")
+
+View(hp_data_list$hp06, title = "Data 2006")
+View(hp_dicts$hp06,     title = "Dict 2006")
+
+View(hp_data_list$hp08, title = "Data 2008")
+View(hp_dicts$hp08,     title = "Dict 2008")
+
+# --- 2010s ---
+View(hp_data_list$hp10, title = "Data 2010")
+View(hp_dicts$hp10,     title = "Dict 2010")
+
+View(hp_data_list$hp12, title = "Data 2012")
+View(hp_dicts$hp12,     title = "Dict 2012")
+
+View(hp_data_list$hp14, title = "Data 2014")
+View(hp_dicts$hp14,     title = "Dict 2014")
+
+View(hp_data_list$hp16, title = "Data 2016")
+View(hp_dicts$hp16,     title = "Dict 2016")
+
+View(hp_data_list$hp18, title = "Data 2018")
+View(hp_dicts$hp18,     title = "Dict 2018")
+
+# --- 2020s ---
+View(hp_data_list$hp20, title = "Data 2020")
+View(hp_dicts$hp20,     title = "Dict 2020")
+
+View(hp_data_list$hp22, title = "Data 2022")
+View(hp_dicts$hp22,     title = "Dict 2022")
+```
+
+
+##Analyze them
+
+#look at the baseline
+```{r}
+# Extract the 2010 dataset into its own object
+df_1886 <- hp_data_list$hp86
+
+# Check the dimensions (Rows x Columns)
+dim(df_1886)
+
+summary(df_1886$yob86)
+summary(df_1886$mob86)
+summary(df_1886$dob86)
+
+unique(df_1886$yob86)
+unique(df_1886$mob86)
+unique(df_1886$dob86)
+
+df_1886 %>%
+  filter(!is.na(yob86)) %>% 
+  ggplot(aes(x = yob86)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", color = "white")
+
+df_1886 %>%
+  filter(mob86 > 12) %>%
+  View()
+
+
+```
+
+```{r}
+# Extract the 2010 dataset into its own object
+df_2010 <- hp_data_list$hp10
+
+# Check the dimensions (Rows x Columns)
+dim(df_2010)
+
+print("Summary Statistics for Weight (lbs) in 2010:")
+summary(df_2010$wt10)
+
+# 3. Create a Histogram
+#    We filter out NAs and likely error codes (e.g. weight > 600 lbs) to keep the chart readable.
+df_2010 %>%
+  filter(!is.na(wt10), wt10 < 600) %>% 
+  ggplot(aes(x = wt10)) +
+  geom_histogram(binwidth = 10, fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Weight (2010)",
+    subtitle = "Variable: wt10 (Current Weight in lbs)",
+    x = "Weight (lbs)",
+    y = "Count of Participants"
+  )
+```
+
+#look at the prevalence of diseases across waves
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+# 1. Create a reference table (Map) of variable names per year
+disease_map <- tibble::tribble(
+  ~Disease_Label,          ~hp88,     ~hp00,     ~hp12,     ~hp20,
+  "Stroke",                "str88",   "strk00",  "strk12",  "strk20",
+  "Carotid Surgery",       NA,        "cart00",  "cart12",  "cart20",
+  "Angina",                "ang88",   "ang00",   "ang12",   "ang20",
+  "Angina Confirmed",      "angc88",  "angc00",  "angc12",  "angc20",
+  "CABG",                  "cabg88",  "cabg00",  "cabg12",  "cabg20",
+  "MI (Heart Attack)",     "mi88",    "mi00",    "mi12",    "mi20",
+  "Claudication",          "clau88",  "clau00",  "clau12",  NA,       # Missing in 2020 col in image
+  "Pulmonary Embolism",    "pe88",    "pe00",    "pe12",    "pulm20", # Name change in 2020
+  "High Blood Pressure",   "hbp88",   "hbp00",   "hbp12",   "hbp20",
+  "Cholesterol",           "chol88",  "chol00",  "chol12",  "chol20",
+  "Diabetes",              "db88",    "db00",    "db12",    "db20",
+  "Gout",                  "gout88",  "gout00",  "gout12",  "gout20",
+  "Hip Fracture",          "hfra88",  "hfra00",  "hipf12",  "hipf20", # Name change in 12/20
+  "Osteoarthritis",        "oa88",    "oa00",    "oa12",    "arth20", # Name change in 2020
+  "Osteoporosis",          "ost88",   "ost00",   "ost12",   "ost20",
+  "Colon Polyps",          "cpol88",  "cpol00",  "cpol12",  "cpol20",
+  "Ulcer",                 "ulc88",   "gdul00",  "gdul12",  "gdul20", # Name change
+  "Parkinsons",            "park88",  "park00",  "park12",  "park20",
+  "Glaucoma",              "glau88",  "glau00",  "glau12",  "glau20",
+  "Macular Degen",         "macu88",  "macu00",  "macu12",  "macu20"
+)
+
+# 2. Function to calculate prevalence for a single variable in a single dataset
+get_prevalence <- function(dataset, var_name) {
+  # If variable doesn't exist or is NA in our map, return NA
+  if (is.na(var_name) || !var_name %in% names(dataset)) {
+    return(NA)
+  }
+  
+  # Calculate % of people marked as "1" (ignoring NAs in the count of 1s)
+  # divided by the TOTAL number of people in the dataset
+  total_people <- nrow(dataset)
+  count_yes <- sum(dataset[[var_name]] == 1, na.rm = TRUE)
+  
+  return(round((count_yes / total_people) * 100, 2))
+}
+
+# 3. Build the comparison table
+results <- disease_map %>%
+  rowwise() %>%
+  mutate(
+    Prev_1988 = get_prevalence(hp_data_list$hp88, hp88),
+    Prev_2000 = get_prevalence(hp_data_list$hp00, hp00),
+    Prev_2012 = get_prevalence(hp_data_list$hp12, hp12),
+    Prev_2020 = get_prevalence(hp_data_list$hp20, hp20)
+  ) %>%
+  select(Disease_Label, Prev_1988, Prev_2000, Prev_2012, Prev_2020)
+
+# 4. View the final comparison
+print(results, n = 30)
+```
+

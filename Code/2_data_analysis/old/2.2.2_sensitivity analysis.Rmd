@@ -1,0 +1,492 @@
+---
+title: "Sensitivity Analyses: Frailty Trajectories Before and After Incident Cancer"
+author: "XZ"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 2.2.2_sensitivity analysis.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Runs sensitivity analyses for frailty trajectories before and after incident cancer, including alternative modeling or analytic restrictions intended to assess robustness.
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 11, fig.height = 6
+)
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(knitr)
+library(broom.mixed)
+```
+
+## 1. Data Preparation
+
+We integrate the time variables you generated (specifically `years_to_death`) to create a `terminal_decline` indicator.
+
+```{r data_prep}
+# Load your pre-processed dataset containing the calculated time variables
+data_path <- "/n/home06/xyzhou/Frailty/2_data analysis/before and after cancer/data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds"
+fi_long <- readRDS(data_path)
+
+# 1. Re-establish Baseline Covariates (Cycle 86)
+baseline_covs <- fi_long %>%
+  filter(cycle == "86") %>%
+  transmute(
+    id,
+    base_race    = as.factor(if_else(is.na(race), "Missing", as.character(race))),
+    base_marital = as.factor(if_else(is.na(marital_status), "Missing", as.character(marital_status))),
+    base_living  = as.factor(if_else(is.na(living_arr), "Missing", as.character(living_arr))),
+    base_pckgr   = as.factor(if_else(is.na(pckgr), "Missing", as.character(pckgr)))
+  )
+
+# 2. Build the Analytic Dataset & Add Terminal Decline Indicator
+analysis_long <- fi_long %>%
+  filter(participated == 1, !is.na(fi_score_nocancer)) %>%
+  left_join(baseline_covs, by = "id") %>%
+  
+  # Ensure we have baseline age Z-score (using age_at_cycle for the first observation)
+  arrange(id, worked_rtmnyr) %>%
+  group_by(id) %>%
+  mutate(base_age = first(age_at_cycle)) %>%
+  ungroup() %>%
+  mutate(base_age_z = as.numeric(scale(base_age))) %>%
+  
+  # Remove Prevalent Cancers (cancer happened before or exactly at their first survey)
+  group_by(id) %>%
+  mutate(is_prevalent = if_else(!is.na(years_to_cancer) & first(years_to_cancer) >= 0, 1, 0)) %>%
+  filter(is_prevalent == 0) %>%
+  
+  # Keep only those with at least 2 observations
+  filter(n() >= 2) %>%
+  ungroup() %>%
+  
+  # Generate Model Variables
+  mutate(
+    # Jump variable
+    Cancer_Status = if_else(!is.na(years_to_cancer) & years_to_cancer >= 0, 1L, 0L),
+    
+    # Post-slope variable
+    Years_Since_Cancer = if_else(Cancer_Status == 1L, years_to_cancer, 0),
+    
+    # NEW: Terminal Decline Indicator (Last year of life)
+    # years_to_death is negative when the survey is taken BEFORE death.
+    # Therefore, >= -1 and <= 0 captures the 12 months immediately preceding death.
+    terminal_decline = if_else(!is.na(years_to_death) & years_to_death >= -1 & years_to_death <= 0, 1L, 0L)
+  )
+
+cat("Total observations:", nrow(analysis_long), "\n")
+cat("Total unique participants:", length(unique(analysis_long$id)), "\n")
+```
+
+------------------------------------------------------------------------
+
+## 2. Updated Main Model (Adjusted for Terminal Decline)
+
+By adding the `terminal_decline` variable, the model "absorbs" the rapid spike in frailty that occurs right before death, preventing it from artificially steepening the `Years_Since_Cancer` slope (reducing survival bias).
+
+```{r main_model}
+mod_main <- lmer(
+  fi_score_nocancer ~ years_since_baseline + Cancer_Status + Years_Since_Cancer + 
+    terminal_decline + base_age_z + base_race + base_marital + base_living + base_pckgr +
+    (1 + years_since_baseline | id),
+  data = analysis_long,
+  REML = TRUE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(mod_main)
+```
+
+------------------------------------------------------------------------
+
+## 3. Sensitivity Analysis 1: Exclude Acute Phase (First 6 Months)
+
+To ensure the "jump" isn't just acute surgical or chemo toxicity, we drop any frailty measurements taken within 0.5 years (6 months) after diagnosis.
+
+```{r sen_acute}
+# Filter out observations that occurred within 6 months post-cancer
+data_sen1 <- analysis_long %>%
+  filter(!(Cancer_Status == 1 & years_to_cancer <= 0.5))
+
+mod_sen1 <- lmer(
+  fi_score_nocancer ~ years_since_baseline + Cancer_Status + Years_Since_Cancer + 
+    terminal_decline + base_age_z + base_race + base_marital + base_living + base_pckgr +
+    (1 + years_since_baseline | id),
+  data = data_sen1,
+  REML = TRUE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(mod_sen1)
+```
+
+------------------------------------------------------------------------
+
+## 4. Sensitivity Analysis 2: Exclude High Baseline Frailty (Ceiling Effect)
+
+We restrict the cohort to participants who were relatively robust/pre-frail (FI \<= 0.25) at their very first measurement to ensure mathematical ceiling effects aren't compressing the cancer jump.
+
+```{r sen_ceiling}
+# Extract baseline FI for each person
+baseline_fi <- analysis_long %>%
+  group_by(id) %>%
+  arrange(years_since_baseline) %>%
+  slice(1) %>%
+  select(id, base_fi = fi_score_nocancer) %>%
+  ungroup()
+
+# Filter dataset to only those with baseline FI <= 0.25
+data_sen2 <- analysis_long %>%
+  left_join(baseline_fi, by = "id") %>%
+  filter(base_fi <= 0.25)
+
+mod_sen2 <- lmer(
+  fi_score_nocancer ~ years_since_baseline + Cancer_Status + Years_Since_Cancer + 
+    terminal_decline + base_age_z + base_race + base_marital + base_living + base_pckgr +
+    (1 + years_since_baseline | id),
+  data = data_sen2,
+  REML = TRUE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(mod_sen2)
+```
+
+------------------------------------------------------------------------
+
+## 5. Sensitivity Analysis 3: Quadratic Time (Non-Linear Normal Aging)
+
+We add a squared term for baseline time to allow the "normal aging" trajectory to curve upward, checking if the cancer jump still remains significant.
+
+```{r sen_quad}
+mod_sen3 <- lmer(
+  fi_score_nocancer ~ years_since_baseline + I(years_since_baseline^2) + 
+    Cancer_Status + Years_Since_Cancer + I(Years_Since_Cancer^2) +
+    terminal_decline + base_age_z + base_race + base_marital + base_living + base_pckgr +
+    (1 + years_since_baseline | id),
+  data = analysis_long,
+  REML = TRUE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(mod_sen3)
+```
+
+------------------------------------------------------------------------
+
+## 6. Sensitivity Analysis 4: Age as the Timescale
+
+We swap `years_since_baseline` out for `age_at_cycle` as the primary biological clock. *Note: `base_age_z` is removed from the fixed effects here, because current age is already accounting for it.*
+
+```{r sen_age}
+mod_sen4 <- lmer(
+  fi_score_nocancer ~ age_at_cycle + Cancer_Status + Years_Since_Cancer + 
+    terminal_decline + base_race + base_marital + base_living + base_pckgr +
+    (1 + age_at_cycle | id),
+  data = analysis_long,
+  REML = TRUE,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(mod_sen4)
+```
+
+------------------------------------------------------------------------
+
+## 7. Results Comparison Summary
+
+We extract the main coefficients of interest (the sudden jump and the aftermath slope) across all models to see if the statistical story holds up.
+
+```{r compare_results}
+extract_coefs <- function(model, model_name, time_var) {
+  res <- tidy(model)
+  
+  jump <- res %>% filter(term == "Cancer_Status") %>% pull(estimate)
+  jump_p <- res %>% filter(term == "Cancer_Status") %>% pull(p.value)
+  
+  slope <- res %>% filter(term == "Years_Since_Cancer") %>% pull(estimate)
+  slope_p <- res %>% filter(term == "Years_Since_Cancer") %>% pull(p.value)
+  
+  term_dec <- res %>% filter(term == "terminal_decline") %>% pull(estimate)
+  
+  data.frame(
+    Model = model_name,
+    `Acute Jump (Estimate)` = round(jump, 4),
+    `Jump p-value` = format.pval(jump_p, digits = 3),
+    `Post-Cancer Slope (Estimate)` = round(slope, 4),
+    `Slope p-value` = format.pval(slope_p, digits = 3),
+    `Terminal Decline Spike` = round(term_dec, 4),
+    check.names = FALSE
+  )
+}
+
+# Compile Table
+results_table <- bind_rows(
+  extract_coefs(mod_main, "Main (w/ Terminal Decline)", "years_since_baseline"),
+  extract_coefs(mod_sen1, "Sen 1: Exclude <=6 months post-dx", "years_since_baseline"),
+  extract_coefs(mod_sen2, "Sen 2: Exclude FI > 0.25", "years_since_baseline"),
+  extract_coefs(mod_sen3, "Sen 3: Quadratic Time", "years_since_baseline"),
+  extract_coefs(mod_sen4, "Sen 4: Age as Timescale", "age_at_cycle")
+)
+
+kable(results_table, caption = "Comparison of Cancer Impact Across Sensitivity Models")
+```
+
+
+
+---
+
+## 8. Visualization: Comparing Sensitivity Models
+
+To visually compare how our modeling assumptions alter the trajectory, we generate event-centered prediction grids. 
+For models using `years_since_baseline`, we anchor "Time Zero" to the median time-to-diagnosis. 
+For the age-based model, we anchor "Time Zero" to the median age-at-diagnosis.
+
+```{r vis_sensitivity, fig.width=14, fig.height=10}
+# Use the model frame to guarantee factor levels match what mod_sen3 expects
+mf <- model.frame(mod_sen3)
+
+ref_level <- function(x) {
+  tab <- table(x)
+  if ("Missing" %in% names(tab)) tab <- tab[names(tab) != "Missing"]
+  names(which.max(tab))
+}
+
+# 1) Anchor diagnosis at the median time-to-diagnosis among cases
+#    Identity: years_since_baseline - years_to_cancer = time from baseline to diagnosis (constant per id)
+dx_time_by_id <- analysis_long %>%
+  filter(!is.na(years_to_cancer)) %>%
+  group_by(id) %>%
+  summarise(
+    everCancer_id = as.integer(any(!is.na(cancer_dateca))),
+    tDx = min(years_since_baseline - years_to_cancer, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(everCancer_id == 1L)
+
+tDx_median <- median(dx_time_by_id$tDx, na.rm = TRUE)
+
+# 2) Event-centered window (paper-style)
+min_rel <- -15
+max_rel <-  25
+
+# Prevent negative years_since_baseline in prediction grid
+if (tDx_median + min_rel < 0) min_rel <- -tDx_median
+
+# 3) Build prediction grids
+grid_never <- tibble(tRel = seq(min_rel, max_rel, by = 0.25)) %>%
+  mutate(
+    scenario = "Never cancer (counterfactual)",
+    years_since_baseline = tDx_median + tRel,
+    Cancer_Status = 0L,
+    Years_Since_Cancer = 0
+  )
+
+grid_cancer_pre <- tibble(tRel = seq(min_rel, 0, by = 0.25)) %>%
+  mutate(
+    scenario = "Incident cancer at t=0",
+    years_since_baseline = tDx_median + tRel,
+    Cancer_Status = 0L,
+    Years_Since_Cancer = 0
+  )
+
+grid_cancer_post <- tibble(tRel = seq(0, max_rel, by = 0.25)) %>%
+  mutate(
+    scenario = "Incident cancer at t=0",
+    years_since_baseline = tDx_median + tRel,
+    Cancer_Status = 1L,
+    Years_Since_Cancer = tRel
+  )
+
+grid_rel <- bind_rows(grid_never, grid_cancer_pre, grid_cancer_post)
+
+# 4) Set all remaining covariates exactly as required by mod_sen3
+grid_rel <- grid_rel %>%
+  mutate(
+    # fixed effects only; set a non-terminal reference trajectory
+    terminal_decline = 0L,
+
+    # set mean age (z-score)
+    base_age_z = 0,
+
+    # set reference categories with factor levels exactly matching the fitted model
+    base_race    = factor(ref_level(mf$base_race),    levels = levels(mf$base_race)),
+    base_marital = factor(ref_level(mf$base_marital), levels = levels(mf$base_marital)),
+    base_living  = factor(ref_level(mf$base_living),  levels = levels(mf$base_living)),
+    base_pckgr   = factor(ref_level(mf$base_pckgr),   levels = levels(mf$base_pckgr)),
+
+    # include an id (even though re.form = NA), using an existing model-frame level
+    id = mf$id[1]
+  )
+
+# 5) Predict population-average (fixed-effect) values
+grid_rel$pred_FI <- predict(mod_sen3, newdata = grid_rel, re.form = NA)
+
+# Split for plotting
+grid_never_plot <- grid_rel %>% filter(scenario == "Never cancer (counterfactual)")
+grid_pre_plot   <- grid_rel %>% filter(scenario == "Incident cancer at t=0", Cancer_Status == 0L)
+grid_post_plot  <- grid_rel %>% filter(scenario == "Incident cancer at t=0", Cancer_Status == 1L)
+
+# Jump at t=0
+y_pre_jump  <- grid_pre_plot  %>% filter(dplyr::near(tRel, 0)) %>% pull(pred_FI)
+y_post_jump <- grid_post_plot %>% filter(dplyr::near(tRel, 0)) %>% pull(pred_FI)
+
+# 6) Plot
+ggplot() +
+  geom_line(data = grid_never_plot, aes(x = tRel, y = pred_FI),
+            color = "#E69F00", linetype = "dashed", linewidth = 1.2) +
+  geom_line(data = grid_pre_plot, aes(x = tRel, y = pred_FI),
+            color = "#0072B2", linewidth = 1.2) +
+  geom_line(data = grid_post_plot, aes(x = tRel, y = pred_FI),
+            color = "#0072B2", linewidth = 1.2) +
+  geom_segment(aes(x = 0, xend = 0, y = y_pre_jump, yend = y_post_jump),
+               color = "#0072B2", linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "gray30") +
+  scale_x_continuous(breaks = seq(ceiling(min_rel), floor(max_rel), by = 1)) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    plot.title = element_text(face = "bold", size = 15),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Predicted FI Trajectories Before/After Incident Cancer (Sensitivity Model: Quadratic Time)",
+    subtitle = paste0(
+      "Event-centered; diagnosis anchored at median time-to-diagnosis = ",
+      round(tDx_median, 1), " years since baseline; terminal_decline fixed at 0."
+    ),
+    x = "Years relative to cancer diagnosis (0 = diagnosis)",
+    y = "Predicted non-cancer FI"
+  )
+```
+
+
+```{r, fig.width=14, fig.height=10}
+# Use model.frame to guarantee factor levels match mod_sen4
+mf <- model.frame(mod_sen4)
+
+ref_level <- function(x) {
+  tab <- table(x)
+  if ("Missing" %in% names(tab)) tab <- tab[names(tab) != "Missing"]
+  names(which.max(tab))
+}
+
+# 1) Choose an age anchor for diagnosis (age at cancer among cases)
+#    Because the model time scale is age_at_cycle, an event-centered plot needs
+#    an "age at diagnosis" anchor: age_at_dx = age_at_cycle - years_to_cancer
+dx_age_by_id <- analysis_long %>%
+  filter(!is.na(years_to_cancer) & !is.na(age_at_cycle)) %>%
+  group_by(id) %>%
+  summarise(
+    everCancer_id = as.integer(any(!is.na(cancer_dateca))),
+    age_at_dx = min(age_at_cycle - years_to_cancer, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(everCancer_id == 1L)
+
+age_dx_median <- median(dx_age_by_id$age_at_dx, na.rm = TRUE)
+
+# 2) Event-centered window (years relative to diagnosis)
+min_rel <- -15
+max_rel <-  25
+
+# Guardrails: keep ages plausible (optional)
+age_min_allowed <- max(0, min(mf$age_at_cycle, na.rm = TRUE))
+age_max_allowed <- max(mf$age_at_cycle, na.rm = TRUE)
+
+# 3) Build prediction grids
+grid_never <- tibble(tRel = seq(min_rel, max_rel, by = 0.25)) %>%
+  mutate(
+    scenario = "Never cancer (counterfactual)",
+    age_at_cycle = age_dx_median + tRel,
+    Cancer_Status = 0L,
+    Years_Since_Cancer = 0
+  )
+
+grid_cancer_pre <- tibble(tRel = seq(min_rel, 0, by = 0.25)) %>%
+  mutate(
+    scenario = "Incident cancer at t=0",
+    age_at_cycle = age_dx_median + tRel,
+    Cancer_Status = 0L,
+    Years_Since_Cancer = 0
+  )
+
+grid_cancer_post <- tibble(tRel = seq(0, max_rel, by = 0.25)) %>%
+  mutate(
+    scenario = "Incident cancer at t=0",
+    age_at_cycle = age_dx_median + tRel,
+    Cancer_Status = 1L,
+    Years_Since_Cancer = tRel
+  )
+
+grid_rel <- bind_rows(grid_never, grid_cancer_pre, grid_cancer_post) %>%
+  # (Optional) clip to observed age range to avoid extrapolation
+  mutate(age_at_cycle = pmin(pmax(age_at_cycle, age_min_allowed), age_max_allowed))
+
+# 4) Set remaining covariates to a reference profile with correct factor levels
+grid_rel <- grid_rel %>%
+  mutate(
+    terminal_decline = 0L,  # set to 0 (change to 1 to visualize last-year-of-life scenario)
+    base_race    = factor(ref_level(mf$base_race),    levels = levels(mf$base_race)),
+    base_marital = factor(ref_level(mf$base_marital), levels = levels(mf$base_marital)),
+    base_living  = factor(ref_level(mf$base_living),  levels = levels(mf$base_living)),
+    base_pckgr   = factor(ref_level(mf$base_pckgr),   levels = levels(mf$base_pckgr)),
+    id = mf$id[1]  # not used when re.form=NA, but harmless if id is in the model frame
+  )
+
+# 5) Predict fixed-effect trajectories (population-average)
+grid_rel$pred_FI <- predict(mod_sen4, newdata = grid_rel, re.form = NA)
+
+# 6) Jump at t=0
+grid_pre  <- grid_rel %>% filter(scenario == "Incident cancer at t=0", Cancer_Status == 0L)
+grid_post <- grid_rel %>% filter(scenario == "Incident cancer at t=0", Cancer_Status == 1L)
+
+y_pre_jump  <- grid_pre  %>% filter(dplyr::near(tRel, 0)) %>% pull(pred_FI)
+y_post_jump <- grid_post %>% filter(dplyr::near(tRel, 0)) %>% pull(pred_FI)
+
+# 7) Plot
+ggplot() +
+  geom_line(data = grid_rel %>% filter(scenario == "Never cancer (counterfactual)"),
+            aes(x = tRel, y = pred_FI),
+            color = "#E69F00", linetype = "dashed", linewidth = 1.2) +
+  geom_line(data = grid_pre,  aes(x = tRel, y = pred_FI),
+            color = "#0072B2", linewidth = 1.2) +
+  geom_line(data = grid_post, aes(x = tRel, y = pred_FI),
+            color = "#0072B2", linewidth = 1.2) +
+  geom_segment(aes(x = 0, xend = 0, y = y_pre_jump, yend = y_post_jump),
+               color = "#0072B2", linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "gray30") +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    plot.title = element_text(face = "bold", size = 15),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Predicted FI Trajectories Before/After Incident Cancer (Age Time Scale)",
+    subtitle = paste0(
+      "Event-centered; diagnosis anchored at median age at diagnosis = ",
+      round(age_dx_median, 1), " years; terminal_decline fixed at 0."
+    ),
+    x = "Years relative to cancer diagnosis (0 = diagnosis)",
+    y = "Predicted non-cancer FI"
+  )
+```

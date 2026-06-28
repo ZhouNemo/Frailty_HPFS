@@ -1,0 +1,399 @@
+---
+title: "Frailty Index Pre/Post Cancer Trajectory Exploratory Data Analysis"
+author: "XZ"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 1.1_EDA.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Performs exploratory data analysis for frailty trajectories before and after cancer, including data preparation, descriptive summaries, and initial visualizations.
+```
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+
+# Required Libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(gtsummary)
+library(lubridate)
+```
+
+# 1. Data Preparation
+
+```{r data_prep}
+# Load the Imputed Data
+fi_long <- readRDS("/n/home06/xyzhou/Frailty/2_data analysis/before and after cancer/data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
+
+target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
+
+# 1. Prepare continuous time variables using exact months since Jan 1900
+fi_prep <- fi_long %>%
+  filter(cycle %in% target_cycles) %>%
+  mutate(
+    # Ensure variables are numeric for math
+    worked_rtmnyr = as.numeric(worked_rtmnyr),
+    cancer_dateca = as.numeric(cancer_dateca),
+    
+    # Calculate exact age at this cycle
+    age_at_cycle = (worked_rtmnyr - as.numeric(dbmy09)) / 12,
+    
+    # Create readable Year for cross-sectional plots
+    Year = case_when(
+      as.numeric(cycle) > 50 ~ as.numeric(paste0("19", cycle)),
+      TRUE ~ as.numeric(paste0("20", cycle))
+    )
+  )
+
+# 2. Identify Baseline vs Incident Cancer 
+# Group by ID to establish the participant's specific entry timeline
+participant_timelines <- fi_prep %>%
+  arrange(id, worked_rtmnyr) %>%
+  group_by(id) %>%
+  summarise(
+    First_Survey_Month = first(worked_rtmnyr),
+    Last_Survey_Month = max(worked_rtmnyr),
+    Cancer_Month = first(cancer_dateca),
+    Has_Cancer = first(cancer_cancer) == 1,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Baseline Cancer: Cancer occurred BEFORE or DURING the month of their first survey
+    Is_Baseline_Cancer = Has_Cancer & (!is.na(Cancer_Month) & Cancer_Month <= First_Survey_Month),
+    
+    # Incident Cancer: Cancer occurred AFTER their first survey
+    Is_Incident_Cancer = Has_Cancer & (!is.na(Cancer_Month) & Cancer_Month > First_Survey_Month),
+    
+    # Plot Group
+    Plot_Group = case_when(
+      Is_Incident_Cancer ~ "Incident Cancer Sub-cohort",
+      !Has_Cancer ~ "Censored/No-Cancer Population",
+      TRUE ~ NA_character_ # Baseline cases will be NA and filtered out
+    )
+  )
+
+# 3. Apply Exclusions and merge cohort assignments back to main data
+fi_clean <- fi_prep %>%
+  inner_join(participant_timelines %>% select(id, Cancer_Month, Last_Survey_Month, Plot_Group), by = "id") %>%
+  filter(!is.na(Plot_Group)) %>% # This safely drops Baseline Cancer cases
+  mutate(
+    # Force FI to NA if they answered fewer than 20 non-cancer items
+    fi_score_nocancer = if_else(n_answered_nocancer < 20, NA_real_, fi_score_nocancer),
+    frailty_cat_nocancer = if_else(is.na(fi_score_nocancer), NA_character_, frailty_cat_nocancer)
+  ) %>%
+  mutate(Plot_Group = factor(Plot_Group, levels = c("Incident Cancer Sub-cohort", "Censored/No-Cancer Population")))
+
+# Filter for valid FI scores only for active plotting
+fi_valid <- fi_clean %>% filter(participated == 1, !is.na(fi_score_nocancer))
+```
+
+------------------------------------------------------------------------
+
+# 2. Baseline Characteristics (Table 1)
+
+```{r baseline_table}
+baseline_data <- fi_valid %>%
+  group_by(id) %>%
+  arrange(worked_rtmnyr) %>%
+  slice(1) %>% 
+  ungroup() %>%
+  select(Plot_Group, frailty_cat_nocancer, fi_score_nocancer, age_at_cycle) 
+
+baseline_data %>%
+  tbl_summary(
+    by = Plot_Group,
+    statistic = list(all_continuous() ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    missing = "no"
+  ) %>%
+  add_p() %>%
+  modify_header(label = "**Baseline Characteristic**") %>%
+  bold_labels()
+```
+
+------------------------------------------------------------------------
+
+# 3. Data Quality & Distribution Over Calendar Year
+
+```{r data_quality}
+attrition_data <- fi_clean %>%
+  filter(participated == 1) %>%
+  group_by(Plot_Group, Year) %>%
+  summarise(
+    N_Total = n(),
+    N_Valid_FI = sum(!is.na(fi_score_nocancer)),
+    .groups = "drop"
+  ) %>%
+  mutate(Percent_Active = (N_Valid_FI / N_Total) * 100,
+         Year = as.factor(Year))
+
+ggplot(attrition_data, aes(x = Year, y = Percent_Active, fill = Plot_Group)) +
+  geom_bar(stat = "identity", position = position_dodge(width=0.8), width = 0.7) +
+  geom_text(aes(label = sprintf("%.1f%%", Percent_Active)), 
+            position = position_dodge(width=0.8), vjust = -0.5, fontface = "bold", size = 3) +
+  scale_y_continuous(limits = c(0, 115), labels = scales::label_percent(scale = 1)) +
+  scale_fill_manual(values = c("Censored/No-Cancer Population" = "#76B7B2", "Incident Cancer Sub-cohort" = "#E15759")) +
+  facet_wrap(~ Plot_Group, ncol = 1) +
+  theme_minimal() +
+  labs(
+    title = "Data Usability Rate per Cycle (Non-Cancer FI)",
+    subtitle = "Percentage of active participants with >= 20 valid items.",
+    x = "Study Year", y = "% Usable Data", fill = "Cohort"
+  ) +
+  theme(axis.text.x = element_text(face = "bold", size = 10),
+        strip.text = element_text(face="bold", size=12),
+        legend.position = "top")
+```
+
+------------------------------------------------------------------------
+
+# 4. Event-Centered Trajectories (Backward Timescale)
+
+```{r setup_event_centered}
+# Calculate Exact Continuous Time (No Binning)
+fi_event_all <- fi_valid %>%
+  mutate(
+    # Continuous Time to Event (Exact Years)
+    Time_to_Event_Exact = case_when(
+      Plot_Group == "Incident Cancer Sub-cohort" ~ (worked_rtmnyr - Cancer_Month) / 12,
+      Plot_Group == "Censored/No-Cancer Population" ~ (worked_rtmnyr - Last_Survey_Month) / 12
+    )
+  )
+
+# Filter for the specific time window you want to visualize (-16 to +12 years)
+fi_plot_data <- fi_event_all %>%
+  filter(Time_to_Event_Exact >= -16 & Time_to_Event_Exact <= 12)
+
+# Extract just one row per participant who got incident cancer
+diagnosis_data <- participant_timelines %>%
+  filter(Is_Incident_Cancer == TRUE) %>%
+  mutate(
+    Year_of_Diagnosis = 1900 + floor((Cancer_Month - 1) / 12)
+  )
+
+total_incident_n <- nrow(diagnosis_data)
+
+ggplot(diagnosis_data, aes(x = Year_of_Diagnosis)) +
+  geom_histogram(binwidth = 1, fill = "#E15759", color = "white", alpha = 0.9) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Incident Cancer Diagnosis Timeline",
+    subtitle = paste0("Total Incident Cancer Sample Size: N = ", total_incident_n),
+    x = "Year of Diagnosis",
+    y = "Number of Participants"
+  ) +
+  theme(axis.text.x = element_text(face = "bold", size = 11))
+```
+
+## Mean Trajectory: Cancer vs. Control
+
+```{r mean_trajectory_comparison}
+ggplot(fi_plot_data, aes(x = Time_to_Event_Exact, y = fi_score_nocancer, 
+                         color = Plot_Group, fill = Plot_Group)) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", linewidth = 1) +
+  
+  # geom_smooth creates a smooth curve and shaded 95% CI area automatically
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), linewidth = 1.2, alpha = 0.2) +
+  
+  scale_x_continuous(breaks = seq(-16, 12, by = 4)) +
+  scale_color_manual(values = c("Incident Cancer Sub-cohort" = "#E15759")) +
+  scale_fill_manual(values = c("Incident Cancer Sub-cohort" = "#E15759")) +
+  theme_minimal() +
+  labs(
+    title = "Continuous Smooth Trajectory: Incident Cancer",
+    subtitle = "Time 0 = Cancer Diagnosis OR Last Follow-up. Shaded areas represent 95% CIs.",
+    x = "Exact Years Relative to Event (Diagnosis)",
+    y = "Estimated Non-Cancer Frailty Index Score",
+    color = "Cohort",
+    fill = "Cohort"
+  ) +
+  theme(axis.text.x = element_text(face = "bold", size = 11), legend.position = "bottom")
+```
+
+------------------------------------------------------------------------
+
+# 5. Cancer Sub-Type Analysis
+
+```{r cancer_subtype}
+# Map exact cancer indicators to a single Primary Site variable
+# Note: Using 'cancer_prosnoa1' (or 'cancer_newag') as the proxy for Prostate since the basic generic 'prostate' col was removed in 2020.
+fi_subtype <- fi_event_all %>%
+  filter(Plot_Group == "Incident Cancer Sub-cohort") %>%
+  mutate(
+    primary_cancer_site = case_when(
+      cancer_prosnoa1 == 1 | cancer_newag == 1 ~ "Prostate",
+      cancer_colorect == 1                     ~ "Colorectal",
+      cancer_mel == 1                          ~ "Melanoma",
+      cancer_lung == 1                         ~ "Lung",
+      TRUE                                     ~ "Other/Mixed"
+    )
+  )
+
+top_cancers <- c("Prostate", "Colorectal", "Melanoma", "Lung")
+
+# Filter data for smooth plotting
+subtype_plot_data <- fi_subtype %>%
+  filter(primary_cancer_site %in% top_cancers) %>%
+  filter(Time_to_Event_Exact >= -16 & Time_to_Event_Exact <= 12)
+
+ggplot(subtype_plot_data, aes(x = Time_to_Event_Exact, y = fi_score_nocancer, 
+                              color = primary_cancer_site, fill = primary_cancer_site)) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  
+  # Smooth lines for subtypes
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), linewidth = 1, alpha = 0.15) +
+  
+  scale_x_continuous(breaks = seq(-16, 12, by = 4)) +
+  facet_wrap(~ primary_cancer_site) +
+  theme_minimal() +
+  labs(
+    title = "Continuous Frailty Trajectory by Incident Cancer Types",
+    subtitle = "Shaded areas represent 95% CIs.",
+    x = "Exact Years Relative to Diagnosis",
+    y = "Estimated Non-Cancer FI"
+  ) +
+  theme(legend.position = "none")
+```
+
+```{r eda_spaghetti_plots, fig.width=12, fig.height=6}
+# 1. Randomly sample 100 IDs from each cohort to prevent overplotting
+set.seed(123) # For reproducibility
+sampled_ids <- fi_event_all %>%
+  group_by(Plot_Group) %>%
+  distinct(id) %>%
+  sample_n(size = 100, replace = FALSE) %>%
+  pull(id)
+
+# Filter the data for only these individuals
+spaghetti_data <- fi_event_all %>%
+  filter(id %in% sampled_ids) %>%
+  filter(Time_to_Event_Exact >= -12 & Time_to_Event_Exact <= 12)
+
+# Plot
+ggplot(spaghetti_data, aes(x = Time_to_Event_Exact, y = fi_score_nocancer, 
+                           color = Plot_Group, group = id)) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", linewidth = 1) +
+  # Draw the individual lines (very transparent)
+  geom_line(alpha = 0.3, linewidth = 0.5) +
+  # Draw the individual data points
+  geom_point(alpha = 0.4, size = 1) +
+  
+  # Overlay a thick LOESS smooth line to show the general trend of the sample
+  geom_smooth(aes(group = Plot_Group), method = "loess", se = FALSE, 
+              linewidth = 2, color = "black") +
+              
+  scale_color_manual(values = c("Censored/No-Cancer Population" = "#76B7B2", 
+                                "Incident Cancer Sub-cohort" = "#E15759")) +
+  facet_wrap(~ Plot_Group) +
+  theme_minimal() +
+  labs(
+    title = "Raw Individual Frailty Trajectories (Sample of N=100 per group)",
+    subtitle = "Black line represents the LOESS smoothed trend for this sample.",
+    x = "Exact Years Relative to Event (Diagnosis / Censor)",
+    y = "Non-Cancer Frailty Index Score",
+    color = "Cohort"
+  ) +
+  theme(legend.position = "none", 
+        strip.text = element_text(face="bold", size=12))
+```
+
+***
+
+### 2. Attrition and Informative Censoring Checks
+If the frailest people die or drop out of the study immediately after getting cancer, your post-cancer trajectory line will artificially flatten out (because only the healthiest survivors remain). This check isolates the frailty score *just before or at* the cancer diagnosis and compares those who stayed in the study to those who dropped out.
+
+```{r eda_attrition_check, fig.height=6, fig.width=8}
+# 1. Identify individuals who have at least one survey AFTER their cancer diagnosis
+retained_ids <- fi_event_all %>%
+  filter(Plot_Group == "Incident Cancer Sub-cohort", Time_to_Event_Exact > 0) %>%
+  distinct(id) %>%
+  pull(id)
+
+# 2. Get the closest frailty score leading up to (or exactly at) diagnosis
+attrition_check <- fi_event_all %>%
+  filter(Plot_Group == "Incident Cancer Sub-cohort") %>%
+  # Look at the 4 years immediately leading up to diagnosis
+  filter(Time_to_Event_Exact >= -4 & Time_to_Event_Exact <= 0) %>%
+  group_by(id) %>%
+  # If they have multiple scores in that window, take the one closest to Time 0
+  arrange(desc(Time_to_Event_Exact)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    FollowUp_Status = if_else(id %in% retained_ids, 
+                              "Survived / Retained in Study", 
+                              "Dropped Out / Deceased")
+  )
+
+# 3. Plot the comparison
+ggplot(attrition_check, aes(x = FollowUp_Status, y = fi_score_nocancer, fill = FollowUp_Status)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  # Add jittered points to see the distribution size
+  geom_jitter(width = 0.2, alpha = 0.2, size = 1) +
+  scale_fill_manual(values = c("Dropped Out / Deceased" = "#d7191c", 
+                               "Survived / Retained in Study" = "#abd9e9")) +
+  theme_minimal() +
+  labs(
+    title = "Survivor Bias Check: Frailty at Time of Diagnosis",
+    subtitle = "Comparing pre-diagnosis frailty based on whether they provided post-diagnosis data.",
+    x = "Status in the Post-Diagnosis Period",
+    y = "Frailty Index Score at (or just before) Diagnosis"
+  ) +
+  theme(legend.position = "none", 
+        axis.text.x = element_text(face = "bold", size = 12))
+
+# Optional: Run a quick T-test to see if the difference is statistically significant
+# t.test(fi_score_nocancer ~ FollowUp_Status, data = attrition_check)
+```
+
+
+***
+
+### 3. Timeline Alignments (Time-to-Event Distributions)
+
+```{r eda_timeline_gap, fig.height=5, fig.width=8}
+# 1. Calculate the time gap to the FIRST post-event survey
+first_post_event_gap <- fi_event_all %>%
+  filter(Plot_Group == "Incident Cancer Sub-cohort") %>%
+  # Only look at post-event surveys
+  filter(Time_to_Event_Exact > 0) %>%
+  group_by(id) %>%
+  # Grab the survey closest to the event
+  arrange(Time_to_Event_Exact) %>%
+  slice(1) %>%
+  ungroup()
+
+# Calculate the median wait time to print on the plot
+median_wait <- median(first_post_event_gap$Time_to_Event_Exact, na.rm = TRUE)
+
+# 2. Plot the distribution
+ggplot(first_post_event_gap, aes(x = Time_to_Event_Exact)) +
+  geom_histogram(binwidth = 0.5, fill = "#2c3e50", color = "white", alpha = 0.9) +
+  geom_vline(xintercept = median_wait, color = "#E15759", linetype = "dashed", linewidth = 1.2) +
+  annotate("text", x = median_wait + 0.2, y = max(table(cut(first_post_event_gap$Time_to_Event_Exact, breaks=seq(0,20,0.5)))), 
+           label = paste("Median:", round(median_wait, 2), "Years"), 
+           color = "#E15759", fontface = "bold", hjust = 0) +
+  theme_minimal() +
+  labs(
+    title = "Time Gap Between Cancer Diagnosis and Next FI Assessment",
+    subtitle = "Visualizing the 'Short-Term' follow-up window.",
+    x = "Years from Cancer Diagnosis to First Post-Event Survey",
+    y = "Number of Participants"
+  ) +
+  scale_x_continuous(breaks = seq(0, 15, by = 2)) +
+  theme(axis.text.x = element_text(face = "bold", size = 11))
+```
+

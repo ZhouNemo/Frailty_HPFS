@@ -1,0 +1,425 @@
+---
+title: "Frailty Trajectories: Smoking-Related vs. Non-Smoking Cancers"
+output: html_document
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 4.5_Smoking Cancers.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Compares frailty trajectories for smoking-related versus non-smoking-related cancers using longitudinal frailty data and mixed-effects models.
+```
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(gtsummary)
+```
+
+## 1. Load Data and Define Target FI Cycles
+
+```{r load-data}
+# Update path if necessary
+fi_long_merged <- readRDS(
+  "~/OneDrive - Harvard University/Research/Frailty Project/Data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds"
+)
+
+target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
+```
+
+## 2. Prepare Time Variables (Age Scale)
+
+*Note: Converting all indicator variables to numeric to prevent coalesce() errors.*
+
+```{r prep-time}
+fi_time_prepped <- fi_long_merged %>%
+  mutate(
+    id                = as.character(id),
+    cycle             = as.character(cycle),
+    cancer_dateca     = as.numeric(as.character(cancer_dateca)),
+    dtdth             = as.numeric(as.character(dtdth)),
+    dbmy09            = as.numeric(as.character(dbmy09)),
+    worked_rtmnyr     = as.numeric(as.character(worked_rtmnyr)),
+    fi_score_nocancer = as.numeric(as.character(fi_score_nocancer)),
+    participated      = as.numeric(as.character(participated)),
+    age_at_death      = (dtdth - dbmy09) / 12,
+    age_at_cancer     = (cancer_dateca - dbmy09) / 12,
+    
+    # Ensure all cancer flags are numeric
+    cancer_lung       = as.numeric(as.character(cancer_lung)),
+    cancer_bladder    = as.numeric(as.character(cancer_bladder)),
+    cancer_kidney     = as.numeric(as.character(cancer_kidney)),
+    cancer_oralc      = as.numeric(as.character(cancer_oralc)),
+    cancer_pharyn     = as.numeric(as.character(cancer_pharyn)),
+    cancer_esoph      = as.numeric(as.character(cancer_esoph)),
+    cancer_cancerdth  = as.numeric(as.character(cancer_cancerdth))
+  )
+```
+
+## 3. Build Longitudinal FI Trajectory Panel
+
+```{r build-trajectory}
+fi_trajectory <- fi_time_prepped %>%
+  filter(
+    participated == 1,
+    cycle %in% target_cycles,
+    !is.na(fi_score_nocancer),
+    !is.na(worked_rtmnyr)
+  ) %>%
+  mutate(
+    age_at_cycle = (worked_rtmnyr - dbmy09) / 12,
+    years_to_death = (worked_rtmnyr - dtdth) / 12,
+    years_to_cancer = (worked_rtmnyr - cancer_dateca) / 12
+  ) %>%
+  arrange(id, age_at_cycle) 
+```
+
+## 4. Extract Baseline Covariates
+
+```{r baseline-covariates}
+baseline_covs <- fi_time_prepped %>%
+  filter(cycle == "86") %>%
+  distinct(id, .keep_all = TRUE) %>%
+  transmute(
+    id,
+    base_race    = factor(if_else(is.na(race), "Missing", as.character(race))),
+    base_marital = factor(if_else(is.na(marital_status), "Missing", as.character(marital_status))),
+    base_living  = factor(if_else(is.na(living_arr), "Missing", as.character(living_arr))),
+    base_pckgr   = factor(if_else(is.na(pckgr), "Missing", as.character(pckgr)))
+  )
+```
+
+## 5. Build Analytic Dataset (Smoking-Related Split)
+
+```{r build-analysis-long}
+analysis_long_age <- fi_trajectory %>%
+  left_join(baseline_covs, by = "id") %>%
+  arrange(id, age_at_cycle) %>%
+  group_by(id) %>%
+  mutate(
+    base_age = first(age_at_cycle),
+    true_age_at_cancer = first(age_at_cancer), 
+    is_prevalent = if_else(!is.na(true_age_at_cancer) & true_age_at_cancer <= base_age, 1L, 0L),
+    
+    n_visits = n_distinct(age_at_cycle, na.rm = TRUE),
+    min_age = min(age_at_cycle, na.rm = TRUE),
+    max_age = max(age_at_cycle, na.rm = TRUE),
+    max_followup_yrs = max_age - min_age, 
+    Ever_Cancer = if_else(!is.na(true_age_at_cancer) & true_age_at_cancer > base_age, 1L, 0L),
+    
+    # Identify Smoking-Associated Cancers
+    is_smoking_cancer = if_else(
+      coalesce(cancer_lung, 0) == 1 | coalesce(cancer_bladder, 0) == 1 |
+      coalesce(cancer_kidney, 0) == 1 | coalesce(cancer_oralc, 0) == 1 |
+      coalesce(cancer_pharyn, 0) == 1 | coalesce(cancer_esoph, 0) == 1,
+      1L, 0L
+    ),
+    
+    # Identify Non-Smoking Cancers
+    is_nonsmoking_cancer = if_else(Ever_Cancer == 1 & is_smoking_cancer == 0, 1L, 0L)
+  ) %>%
+  filter(is_prevalent == 0) %>%
+  filter(n_visits >= 2, max_followup_yrs > 0) %>%
+  ungroup()
+```
+
+## 6. Check Follow-Up Structure
+
+```{r followup-checks}
+cat("Total observations =", nrow(analysis_long_age), "\n")
+```
+
+## 7. Setup for Stochastic Drawing
+
+```{r setup-drawing}
+patient_summary_age <- analysis_long_age %>%
+  group_by(id) %>%
+  summarize(
+    base_age = round(first(base_age), 4),
+    min_age = round(first(min_age), 4),
+    max_age = round(first(max_age), 4),
+    is_case = first(Ever_Cancer),
+    is_smoking = first(is_smoking_cancer),
+    true_age_at_cancer = round(first(true_age_at_cancer), 4),
+    .groups = "drop"
+  ) %>%
+  mutate(age_bin = floor(base_age / 5) * 5)
+
+# Split into target populations
+cases_smoking <- patient_summary_age %>% filter(is_case == 1, is_smoking == 1, true_age_at_cancer > min_age)
+cases_nonsmoking <- patient_summary_age %>% filter(is_case == 1, is_smoking == 0, true_age_at_cancer > min_age)
+controls_pool <- patient_summary_age %>% filter(is_case == 0)
+
+# Functionalized Drawing Strategy
+perform_drawing <- function(cases_df, controls_df) {
+  imputed_ages <- rep(NA_real_, nrow(controls_df))
+  for (i in seq_len(nrow(controls_df))) {
+    current_control <- controls_df[i, ]
+    eligible_cases <- cases_df %>%
+      filter(
+        age_bin == current_control$age_bin,
+        true_age_at_cancer >= current_control$min_age,
+        true_age_at_cancer <= current_control$max_age
+      )
+    if (nrow(eligible_cases) > 0) {
+      imputed_ages[i] <- sample(eligible_cases$true_age_at_cancer, size = 1)
+    }
+  }
+  controls_assigned <- controls_df %>%
+    mutate(assigned_event_age = imputed_ages) %>%
+    filter(!is.na(assigned_event_age)) 
+    
+  cases_assigned <- cases_df %>%
+    select(id, assigned_event_age = true_age_at_cancer)
+  
+  bind_rows(cases_assigned, controls_assigned) %>%
+    select(id, assigned_event_age) %>%
+    distinct(id, .keep_all = TRUE)
+}
+
+prep_model_data <- function(assigned_df, cohort_name, case_label) {
+  analysis_long_age %>%
+    inner_join(assigned_df, by = "id") %>%
+    mutate(
+      Cohort = cohort_name,
+      Group = factor(Ever_Cancer, levels = c(0, 1), labels = c("Control", case_label)),
+      Age_Centered = age_at_cycle - assigned_event_age,
+      Post = if_else(Age_Centered >= 0, 1L, 0L),
+      Age_Post = if_else(Post == 1L, Age_Centered, 0),
+      index_age_z = as.numeric(scale(assigned_event_age))
+    )
+}
+```
+
+## 8. Generate Analysis Datasets (Single Draw)
+
+```{r generate-datasets}
+set.seed(2026) 
+
+# Perform the drawing once for each cohort
+assigned_smoke <- perform_drawing(cases_smoking, controls_pool)
+assigned_nonsmoke <- perform_drawing(cases_nonsmoking, controls_pool)
+
+# Prepare model datasets
+data_smoke <- prep_model_data(assigned_smoke, "Smoking-Related Cancers", "Smoking-Related Case")
+data_nonsmoke <- prep_model_data(assigned_nonsmoke, "Non-Smoking Cancers", "Non-Smoking Case")
+
+# Combine for exploratory data analysis
+data_combined <- bind_rows(data_smoke, data_nonsmoke) %>%
+  mutate(Analysis_Group = paste(Group, "(", Cohort, ")"))
+
+cat("Smoking-Related Cohort - Total Subjects:", n_distinct(data_smoke$id), "\n")
+cat("Non-Smoking Cohort - Total Subjects:", n_distinct(data_nonsmoke$id), "\n")
+```
+
+## 9. Exploratory Analysis & Sanity Checks
+
+```{r descriptive-data}
+baseline_fi <- analysis_long_age %>%
+  arrange(id, age_at_cycle) %>%
+  group_by(id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(id, fi_baseline = fi_score_nocancer)
+
+followup_by_patient_age <- data_combined %>% 
+  group_by(id, Cohort) %>%
+  summarize(
+    Group = first(Group),
+    base_age = first(base_age),
+    base_race = first(base_race),
+    base_marital = first(base_marital),
+    base_living = first(base_living),
+    base_pckgr = first(base_pckgr),
+    assigned_event_age = first(assigned_event_age),
+    .groups = "drop"
+  ) %>%
+  left_join(baseline_fi, by = "id")
+```
+
+### Density Plot of Assigned Index Ages
+
+```{r descriptive-plots, fig.width=10, fig.height=5}
+p_index_density_age <- ggplot(followup_by_patient_age, aes(x = assigned_event_age, fill = Group, color = Group)) +
+  geom_density(alpha = 0.4, linewidth = 1) +
+  facet_wrap(~ Cohort) +
+  scale_fill_manual(values = c("Control" = "#3182bd", "Smoking-Related Case" = "#de2d26", "Non-Smoking Case" = "#fd8d3c")) +
+  scale_color_manual(values = c("Control" = "#3182bd", "Smoking-Related Case" = "#de2d26", "Non-Smoking Case" = "#fd8d3c")) +
+  theme_minimal() +
+  labs(title = "Distribution of Age at Index Event", x = "Assigned Index Age (years)", y = "Density") +
+  theme(legend.position = "bottom", legend.title=element_blank())
+print(p_index_density_age)
+```
+```{r}
+# Bin the baseline ages for conditional visualization
+plot_data_binned <- followup_by_patient_age %>%
+  mutate(
+    age_bin_factor = cut(base_age, 
+                         breaks = c(40, 50, 60, 70, 80, 100), 
+                         labels = c("40-49", "50-59", "60-69", "70-79", "80+"),
+                         right = FALSE)
+  ) %>%
+  group_by(Cohort, age_bin_factor, Group) %>%
+  filter(n() > 10) %>% # Filter out sparse bins for plotting clarity
+  ungroup()
+
+p_index_density_stratified <- ggplot(plot_data_binned, aes(x = assigned_event_age, fill = Group, color = Group)) +
+  geom_density(alpha = 0.4, linewidth = 1) +
+  facet_grid(Cohort ~ age_bin_factor, scales = "free_y") +
+  scale_fill_manual(values = c("Control" = "#3182bd", "Smoking-Related Case" = "#de2d26", "Non-Smoking Case" = "#fd8d3c")) +
+  scale_color_manual(values = c("Control" = "#3182bd", "Smoking-Related Case" = "#de2d26", "Non-Smoking Case" = "#fd8d3c")) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Distribution of Index Age Conditioned on Baseline Age", 
+    subtitle = "Within each baseline age stratum, the control index ages perfectly mirror the case index ages",
+    x = "Assigned Index Age (years)", 
+    y = "Density"
+  ) +
+  theme(
+    legend.position = "bottom", 
+    legend.title=element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "#f4f4f4", color = NA),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p_index_density_stratified)
+```
+```{r boxplot-index-stratified, fig.width=12, fig.height=8}
+# 1. Create the binned dataset (skip if already created for the density plot)
+plot_data_binned <- followup_by_patient_age %>%
+  mutate(
+    age_bin_factor = cut(base_age, 
+                         breaks = c(40, 50, 60, 70, 80, 100), 
+                         labels = c("40-49", "50-59", "60-69", "70-79", "80+"),
+                         right = FALSE)
+  ) %>%
+  group_by(Cohort, age_bin_factor, Group) %>%
+  filter(n() > 10) %>% # Filter out sparse bins for plotting clarity
+  ungroup()
+
+# 2. Generate the stratified box plot with median labels
+p_boxplot_stratified <- ggplot(plot_data_binned, aes(x = Group, y = assigned_event_age, fill = Group)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.5) +
+  
+  # --- NEW: Automatically calculate and plot the median values ---
+  stat_summary(
+    fun = median, 
+    geom = "label", # Using a label instead of text gives it a clean white background
+    aes(label = round(after_stat(y), 1)), 
+    vjust = -0.3,   # Push the label slightly above the median line
+    size = 3.5,     # Font size
+    fill = "white", # White background so the line doesn't strike through the number
+    label.size = NA, # Remove the border around the label
+    alpha = 0.8     # Slight transparency
+  ) +
+  
+  # Create a matrix: Cohort on the rows, Age Bin on the columns
+  facet_grid(Cohort ~ age_bin_factor) + 
+  
+  # Colors from your established palette
+  scale_fill_manual(values = c(
+    "Control" = "#3182bd", 
+    "Smoking-Related Case" = "#de2d26", 
+    "Non-Smoking Case" = "#fd8d3c"
+  )) +
+  
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Box Plot of Index Age Conditioned on Baseline Age",
+    subtitle = "Comparing the median and spread of assigned index ages within each demographic stratum",
+    x = NULL, 
+    y = "Assigned Index Age (Years)"
+  ) +
+  theme(
+    legend.position = "none", 
+    axis.text.x = element_text(face = "bold", angle = 45, hjust = 1), 
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(), 
+    strip.background = element_rect(fill = "#f4f4f4", color = NA),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p_boxplot_stratified)
+```
+
+## 10. Run Independent LME Models
+
+```{r lme-models}
+lme_formula <- fi_score_nocancer ~ Group * Age_Centered + Group * Age_Post + 
+                                   index_age_z + base_race + base_marital + base_pckgr +
+                                   (1 + Age_Centered | id)
+
+model_smoke <- lmer(lme_formula, data = data_smoke, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5)))
+cat("\n### Model Results: Smoking-Related Cancers ###\n")
+summary(model_smoke)
+
+model_nonsmoke <- lmer(lme_formula, data = data_nonsmoke, control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5)))
+cat("\n### Model Results: Non-Smoking Cancers ###\n")
+summary(model_nonsmoke)
+```
+
+## 11. Generate Stratified Predictions
+
+```{r generate-predictions}
+create_pred_grid <- function(model, data_subset) {
+  base_grid <- expand.grid(
+    Age_Centered = seq(-15, 15, by = 0.1),
+    Group = factor(levels(data_subset$Group), levels = levels(data_subset$Group))
+  ) %>%
+    mutate(
+      Cohort = data_subset$Cohort[1],
+      Age_Post = if_else(Age_Centered >= 0, Age_Centered, 0),
+      index_age_z = 0, 
+      base_race = factor(levels(data_subset$base_race)[1], levels = levels(data_subset$base_race)),
+      base_marital = factor(levels(data_subset$base_marital)[1], levels = levels(data_subset$base_marital)),
+      base_pckgr = factor(levels(data_subset$base_pckgr)[1], levels = levels(data_subset$base_pckgr))
+    )
+  
+  base_grid$pred <- predict(model, newdata = base_grid, re.form = NA)
+  return(base_grid)
+}
+
+plot_grid_smoke <- create_pred_grid(model_smoke, data_smoke)
+plot_grid_nonsmoke <- create_pred_grid(model_nonsmoke, data_nonsmoke)
+
+plot_grid_combined <- bind_rows(plot_grid_smoke, plot_grid_nonsmoke) %>%
+  mutate(Line_Type = if_else(grepl("Control", Group), "Drawn Control", as.character(Group)))
+```
+
+## 12. Plot the Trajectories
+
+```{r plot-trajectories, fig.width=10, fig.height=5}
+p_trajectory_faceted <- ggplot(plot_grid_combined, aes(x = Age_Centered, y = pred, color = Line_Type)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", alpha = 0.6) +
+  facet_wrap(~ Cohort) + 
+  scale_color_manual(values = c(
+    "Drawn Control" = "#3182bd", 
+    "Smoking-Related Case" = "#de2d26",
+    "Non-Smoking Case" = "#fd8d3c"
+  )) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 14)
+  ) +
+  labs(
+    title = "Frailty Trajectories: Smoking-Related vs. Non-Smoking Cancers",
+    subtitle = "Assessing pre-clinical frailty differences based on tumor etiology",
+    x = "Years Relative to Index Age",
+    y = "Predicted Frailty Index"
+  ) +
+  scale_x_continuous(breaks = seq(-15, 15, by = 5), expand = expansion(mult = c(0, 0)))
+
+print(p_trajectory_faceted)
+```

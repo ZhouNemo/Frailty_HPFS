@@ -1,0 +1,517 @@
+---
+title: "Frailty Trajectory Analysis With Primary and Risk-Set Sensitivity Models"
+output: html_document
+---
+```{r script-documentation, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
+# Script: 3_baseline_matching.Rmd
+# Author: Nemo Zhou
+# Date started: Unknown (pre-existing script before documentation standard was applied)
+# Date last updated: 2026-06-28
+# Purpose: Fits primary and risk-set sensitivity models for frailty trajectory analysis using baseline matching or baseline-aligned comparison structures.
+```
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(gtsummary)
+```
+
+## 1. Load Data
+
+```{r load-data}
+fi_long_merged <- readRDS(
+  "~/OneDrive - Harvard University/Research/Frailty Project/Data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds"
+)
+
+target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
+```
+
+## 2. Prepare Core Time Variables
+
+```{r prep-time}
+fi_time_prepped <- fi_long_merged %>%
+  mutate(
+    id                = as.character(id),
+    cycle             = as.character(cycle),
+    participated      = as.numeric(as.character(participated)),
+    fi_score_nocancer = as.numeric(as.character(fi_score_nocancer)),
+    worked_rtmnyr     = as.numeric(as.character(worked_rtmnyr)),
+    cancer_dateca     = as.numeric(as.character(cancer_dateca)),
+    dtdth             = as.numeric(as.character(dtdth)),
+    dbmy09            = as.numeric(as.character(dbmy09)),
+    age_at_death      = (dtdth - dbmy09) / 12,
+    age_at_cancer     = (cancer_dateca - dbmy09) / 12
+  )
+```
+
+## 3. Build FI Trajectory Panel Using Only Target Waves
+
+```{r build-fi-trajectory}
+fi_trajectory <- fi_time_prepped %>%
+  filter(
+    participated == 1,
+    cycle %in% target_cycles,
+    !is.na(fi_score_nocancer),
+    !is.na(worked_rtmnyr)
+  ) %>%
+  mutate(
+    age_at_cycle = (worked_rtmnyr - dbmy09) / 12,
+    years_to_death = (worked_rtmnyr - dtdth) / 12,
+    years_to_cancer = (worked_rtmnyr - cancer_dateca) / 12
+  ) %>%
+  arrange(id, worked_rtmnyr) %>%
+  group_by(id) %>%
+  mutate(
+    years_since_baseline = (worked_rtmnyr - first(worked_rtmnyr)) / 12
+  ) %>%
+  ungroup()
+```
+
+## 4. Extract 1986 Baseline Covariates
+
+```{r baseline-covariates}
+baseline_covs <- fi_time_prepped %>%
+  filter(cycle == "86") %>%
+  distinct(id, .keep_all = TRUE) %>%
+  transmute(
+    id,
+    base_race    = factor(if_else(is.na(race), "Missing", as.character(race))),
+    base_marital = factor(if_else(is.na(marital_status), "Missing", as.character(marital_status))),
+    base_living  = factor(if_else(is.na(living_arr), "Missing", as.character(living_arr))),
+    base_pckgr   = factor(if_else(is.na(pckgr), "Missing", as.character(pckgr)))
+  )
+```
+
+## 5. Build Analytic Longitudinal Dataset
+
+```{r build-analysis-long}
+analysis_long <- fi_trajectory %>%
+  left_join(baseline_covs, by = "id") %>%
+  arrange(id, worked_rtmnyr) %>%
+  group_by(id) %>%
+  mutate(
+    baseline_time = first(worked_rtmnyr),
+    base_age = first(age_at_cycle),
+    true_event_time = (first(cancer_dateca) - baseline_time) / 12,
+    is_prevalent = if_else(!is.na(true_event_time) & true_event_time <= 0, 1L, 0L),
+    n_visits = n_distinct(worked_rtmnyr, na.rm = TRUE),
+    max_followup = (max(worked_rtmnyr, na.rm = TRUE) - min(worked_rtmnyr, na.rm = TRUE)) / 12,
+    Ever_Cancer = if_else(!is.na(true_event_time) & true_event_time > 0, 1L, 0L),
+    Cancer_Status_TimeVarying = if_else(
+      Ever_Cancer == 1L & years_since_baseline >= true_event_time,
+      1L,
+      0L
+    )
+  ) %>%
+  filter(is_prevalent == 0) %>%
+  filter(n_visits >= 2, max_followup > 0) %>%
+  ungroup()
+
+base_age_scaling <- analysis_long %>%
+  distinct(id, base_age) %>%
+  mutate(base_age_z = as.numeric(scale(base_age))) %>%
+  select(id, base_age_z)
+
+analysis_long <- analysis_long %>%
+  left_join(base_age_scaling, by = "id") %>%
+  mutate(
+    terminal_decline = if_else(
+      !is.na(years_to_death) & years_to_death >= -1 & years_to_death <= 0,
+      1L,
+      0L
+    ),
+    Group_Label = factor(Ever_Cancer, levels = c(0, 1), labels = c("Control", "Cancer Case"))
+  )
+```
+
+## 6. Check Follow-Up
+
+```{r followup-check}
+zero_fu_check <- analysis_long %>%
+  group_by(id) %>%
+  summarize(
+    num_obs = n(),
+    n_times = n_distinct(worked_rtmnyr, na.rm = TRUE),
+    max_fu = max(years_since_baseline, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(max_fu == 0)
+
+cat("analysis_long_n =", nrow(analysis_long), "\n")
+cat("patients_zero_fu =", nrow(zero_fu_check), "\n")
+```
+## 11. Risk-Set Matching Updated to Include Baseline FI
+
+### 11a. Build Patient-Level Matching File
+
+```{r risk-patient-summary}
+patient_summary_risk <- analysis_long %>%
+  group_by(id) %>%
+  summarize(
+    base_age = first(base_age),
+    max_followup = first(max_followup),
+    is_case = first(Ever_Cancer),
+    true_event_time = first(true_event_time),
+    base_age_z = first(base_age_z),
+    base_race = first(base_race),
+    base_marital = first(base_marital),
+    base_pckgr = first(base_pckgr),
+    .groups = "drop"
+  ) %>%
+  left_join(baseline_fi_by_id, by = "id") %>%
+  mutate(
+    age_bin = floor(base_age / 5) * 5,
+    fi_bin = ntile(baseline_fi, 4)
+  )
+
+patient_summary_risk %>%
+  summarize(
+    n = n(),
+    missing_baseline_fi = sum(is.na(baseline_fi)),
+    missing_fi_bin = sum(is.na(fi_bin))
+  )
+```
+
+### 11b. 1:1 Risk-Set Matching Without Replacement
+
+Controls are matched on: - same 5-year baseline age bin - same baseline FI quartile - still under observation at the case event time
+
+If no control is available in the same FI quartile, the fallback keeps the same age bin and then picks the nearest baseline FI.
+
+```{r risk-matching}
+set.seed(2026)
+
+controls_per_case <- 1
+
+cases_risk <- patient_summary_risk %>%
+  filter(
+    is_case == 1,
+    !is.na(true_event_time),
+    true_event_time > 0,
+    !is.na(baseline_fi),
+    !is.na(fi_bin)
+  ) %>%
+  arrange(desc(true_event_time))
+
+controls_pool <- patient_summary_risk %>%
+  filter(
+    is_case == 0,
+    !is.na(baseline_fi),
+    !is.na(fi_bin)
+  ) %>%
+  mutate(used = FALSE)
+
+matched_sets <- vector("list", nrow(cases_risk))
+
+for (i in seq_len(nrow(cases_risk))) {
+  current_case <- cases_risk[i, ]
+
+  eligible_controls <- controls_pool %>%
+    filter(
+      used == FALSE,
+      age_bin == current_case$age_bin,
+      fi_bin == current_case$fi_bin,
+      max_followup >= current_case$true_event_time
+    ) %>%
+    mutate(
+      fu_distance = abs(max_followup - current_case$max_followup),
+      fi_distance = abs(baseline_fi - current_case$baseline_fi)
+    ) %>%
+    arrange(fu_distance, fi_distance)
+
+  if (nrow(eligible_controls) == 0) {
+    eligible_controls <- controls_pool %>%
+      filter(
+        used == FALSE,
+        age_bin == current_case$age_bin,
+        max_followup >= current_case$true_event_time
+      ) %>%
+      mutate(
+        fu_distance = abs(max_followup - current_case$max_followup),
+        fi_distance = abs(baseline_fi - current_case$baseline_fi)
+      ) %>%
+      arrange(fi_distance, fu_distance)
+  }
+
+  if (nrow(eligible_controls) >= controls_per_case) {
+    selected_controls <- eligible_controls %>%
+      slice_head(n = controls_per_case)
+
+    controls_pool$used[match(selected_controls$id, controls_pool$id)] <- TRUE
+
+    matched_sets[[i]] <- tibble(
+      set_id = i,
+      case_id = current_case$id,
+      control_id = selected_controls$id,
+      assigned_event_time = current_case$true_event_time,
+      case_age_bin = current_case$age_bin,
+      case_fi_bin = current_case$fi_bin,
+      case_baseline_fi = current_case$baseline_fi,
+      control_baseline_fi = selected_controls$baseline_fi,
+      case_max_followup = current_case$max_followup,
+      control_max_followup = selected_controls$max_followup
+    )
+  }
+}
+
+matched_sets_df <- bind_rows(matched_sets)
+
+n_matched_cases <- dplyr::n_distinct(matched_sets_df$case_id)
+n_matched_controls <- dplyr::n_distinct(matched_sets_df$control_id)
+n_unmatched_cases <- nrow(cases_risk) - n_matched_cases
+
+cat("Matched cases =", n_matched_cases, "\n")
+cat("Matched controls =", n_matched_controls, "\n")
+cat("Unmatched cases =", n_unmatched_cases, "\n")
+```
+
+### 11c. Check Matching Balance
+
+```{r risk-balance}
+matched_cases_summary <- matched_sets_df %>%
+  distinct(set_id, case_id, assigned_event_time) %>%
+  transmute(id = case_id, Group_Label = "Cancer Case") %>%
+  left_join(patient_summary_risk, by = "id")
+
+matched_controls_summary <- matched_sets_df %>%
+  distinct(set_id, control_id, assigned_event_time) %>%
+  transmute(id = control_id, Group_Label = "Control") %>%
+  left_join(patient_summary_risk, by = "id")
+
+matched_summary <- bind_rows(matched_cases_summary, matched_controls_summary)
+
+balance_summary <- matched_summary %>%
+  group_by(Group_Label) %>%
+  summarize(
+    N = n(),
+    Mean_Base_Age = round(mean(base_age, na.rm = TRUE), 2),
+    Mean_Baseline_FI = round(mean(baseline_fi, na.rm = TRUE), 4),
+    SD_Baseline_FI = round(sd(baseline_fi, na.rm = TRUE), 4),
+    Mean_Max_FU = round(mean(max_followup, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+print(as.data.frame(balance_summary))
+
+print(t.test(baseline_fi ~ Group_Label, data = matched_summary))
+```
+
+### 11d. Build Matched Person-Level File
+
+```{r risk-person-file}
+matched_cases_df <- matched_sets_df %>%
+  distinct(set_id, case_id, assigned_event_time) %>%
+  transmute(
+    id = case_id,
+    set_id,
+    matched_role = "case",
+    Group = 1L,
+    assigned_event_time
+  )
+
+matched_controls_df <- matched_sets_df %>%
+  transmute(
+    id = control_id,
+    set_id,
+    matched_role = "control",
+    Group = 0L,
+    assigned_event_time
+  )
+
+matched_people <- bind_rows(matched_cases_df, matched_controls_df)
+```
+
+### 11e. Join Back to Longitudinal Data
+
+```{r risk-model-data}
+model_data_risk <- analysis_long %>%
+  inner_join(matched_people, by = "id") %>%
+  mutate(
+    Time = years_since_baseline,
+    TimeRel = Time - assigned_event_time,
+    PreTime = pmin(TimeRel, 0),
+    Post = if_else(TimeRel >= 0, 1L, 0L),
+    PostTime = pmax(TimeRel, 0),
+    Group_Label = factor(Group, levels = c(0, 1), labels = c("Control", "Cancer Case"))
+  )
+```
+
+### 11f. Require At Least One Pre and One Post Observation
+
+```{r risk-eligibility}
+eligible_ids_risk <- model_data_risk %>%
+  group_by(id) %>%
+  summarize(
+    n_pre = sum(TimeRel < 0, na.rm = TRUE),
+    n_post = sum(TimeRel >= 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_pre >= 1, n_post >= 1) %>%
+  pull(id)
+
+model_data_risk <- model_data_risk %>%
+  filter(id %in% eligible_ids_risk)
+
+cat("Eligible matched subjects for LME =", dplyr::n_distinct(model_data_risk$id), "\n")
+```
+
+### 11g. Check Matched Index Times
+
+```{r risk-index-summary}
+risk_index_plot_data <- model_data_risk %>%
+  group_by(id, Group_Label) %>%
+  summarize(
+    assigned_event_time = first(assigned_event_time),
+    max_fu = max(Time, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+risk_index_summary <- risk_index_plot_data %>%
+  group_by(Group_Label) %>%
+  summarize(
+    N = n(),
+    Mean_T0 = round(mean(assigned_event_time, na.rm = TRUE), 2),
+    Median_T0 = round(median(assigned_event_time, na.rm = TRUE), 2),
+    Mean_FollowUp = round(mean(max_fu, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+print(as.data.frame(risk_index_summary))
+```
+
+```{r risk-index-plot, fig.width=8, fig.height=5}
+ggplot(risk_index_plot_data, aes(x = assigned_event_time, fill = Group_Label, color = Group_Label)) +
+  geom_density(alpha = 0.25, linewidth = 1) +
+  scale_fill_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  scale_color_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Assigned Index Time Under Risk-Set Matching",
+    x = "Assigned Index Time Since FI Baseline (years)",
+    y = "Density",
+    fill = "Group",
+    color = "Group"
+  )
+```
+
+### 11h. Fit Risk-Set Matched LME Model
+
+```{r risk-lme}
+fi_model_risk <- lmer(
+  fi_score_nocancer ~
+    Group +
+    PreTime + Group:PreTime +
+    Post + Group:Post +
+    PostTime + Group:PostTime +
+    base_age_z + base_race + base_marital + base_pckgr +
+    (1 + PreTime + PostTime || id) +
+    (1 | set_id),
+  data = model_data_risk,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+summary(fi_model_risk)
+```
+
+### 11i. Plot Risk-Set Matched Model
+
+```{r risk-model-plot, fig.width=8, fig.height=5}
+plot_grid_risk <- expand.grid(
+  TimeRel = seq(-20, 20, by = 0.1),
+  Group = c(0, 1)
+) %>%
+  mutate(
+    PreTime = pmin(TimeRel, 0),
+    Post = if_else(TimeRel >= 0, 1L, 0L),
+    PostTime = pmax(TimeRel, 0),
+    terminal_decline = 0L,
+    base_age_z = 0,
+    base_race = factor(levels(model_data_risk$base_race)[1], levels = levels(model_data_risk$base_race)),
+    base_marital = factor(levels(model_data_risk$base_marital)[1], levels = levels(model_data_risk$base_marital)),
+    base_pckgr = factor(levels(model_data_risk$base_pckgr)[1], levels = levels(model_data_risk$base_pckgr)),
+    set_id = model_data_risk$set_id[1],
+    id = model_data_risk$id[1]
+  )
+
+plot_grid_risk$pred <- predict(fi_model_risk, newdata = plot_grid_risk, re.form = NA)
+plot_grid_risk$Group_Label <- factor(plot_grid_risk$Group, levels = c(0, 1), labels = c("Control", "Cancer Case"))
+
+ggplot(plot_grid_risk, aes(x = TimeRel, y = pred, color = Group_Label)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Risk-Set Matched Model-Implied Frailty Trajectories",
+    x = "Years Relative to Index Time",
+    y = "Predicted Frailty Index",
+    color = "Group"
+  )
+```
+
+## 12. Compare Key Cancer Effects Across Primary and Sensitivity Models
+
+```{r}
+fi_model_risk_casejump <- lmer(
+  fi_score_nocancer ~
+    Group +
+    PreTime + Group:PreTime +
+    Group:Post +
+    PostTime + Group:PostTime +
+    base_age_z + base_race + base_marital + base_pckgr +
+    (1 + PreTime + PostTime || id) +
+    (1 | set_id),
+  data = model_data_risk,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5))
+)
+
+```
+
+```{r}
+plot_grid_casejump <- expand.grid(
+  TimeRel = seq(-20, 20, by = 0.1),
+  Group = c(0, 1)
+) %>%
+  mutate(
+    PreTime = pmin(TimeRel, 0),
+    Post = if_else(TimeRel >= 0, 1L, 0L),
+    PostTime = pmax(TimeRel, 0),
+    terminal_decline = 0L,
+    base_age_z = 0,
+    base_race = factor(levels(model_data_risk$base_race)[1], levels = levels(model_data_risk$base_race)),
+    base_marital = factor(levels(model_data_risk$base_marital)[1], levels = levels(model_data_risk$base_marital)),
+    base_pckgr = factor(levels(model_data_risk$base_pckgr)[1], levels = levels(model_data_risk$base_pckgr)),
+    set_id = model_data_risk$set_id[1],
+    id = model_data_risk$id[1]
+  )
+
+plot_grid_casejump$pred <- predict(
+  fi_model_risk_casejump,
+  newdata = plot_grid_casejump,
+  re.form = NA
+)
+
+plot_grid_casejump$Group_Label <- factor(
+  plot_grid_casejump$Group,
+  levels = c(0, 1),
+  labels = c("Control", "Cancer Case")
+)
+
+ggplot(plot_grid_casejump, aes(x = TimeRel, y = pred, color = Group_Label)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Control" = "#3182bd", "Cancer Case" = "#de2d26")) +
+  theme_minimal() +
+  labs(
+    title = "Risk-Set Matched Trajectories With Cancer-Specific Jump Only",
+    x = "Years Relative to Index Time",
+    y = "Predicted Frailty Index",
+    color = "Group"
+  )
+```

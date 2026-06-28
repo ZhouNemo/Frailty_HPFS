@@ -1,0 +1,12 @@
+# Data, Documents, and Results folders (contain large/sensitive files)
+Data/
+Documents/
+Results/
+
+# R artifacts
+.RData
+.Rhistory
+.Rproj.user/
+
+# macOS system files
+.DS_Store
