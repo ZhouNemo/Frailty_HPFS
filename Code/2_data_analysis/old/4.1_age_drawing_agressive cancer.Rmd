@@ -1,20 +1,18 @@
 ---
-title: "Frailty Trajectories by Cancer Burden: Age Scale & Risk-Set Matching"
-author: "Analyst"
-date: "`r Sys.Date()`"
+title: "Frailty Trajectories by Cancer Burden: Age Scale & Stochastic Drawing"
 output: html_document
 ---
 ```{r script-documentation, include=FALSE}
 # Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
-# Script: 5.1_age_match_aggressive cancer.Rmd
+# Script: 4.1_age_drawing_agressive cancer.Rmd
 # Author: Nemo Zhou
 # Date started: Unknown (pre-existing script before documentation standard was applied)
-# Date last updated: 2026-06-28
-# Purpose: Runs age-scale risk-set matching for aggressive cancer analyses, estimating frailty trajectories for matched cancer and control groups.
+# Date last updated: 2026-06-29 (high-burden flag now read from 7.4_cancer_subtypes.R; cancer_lal no longer referenced)
+# Purpose: Uses age-scale stochastic drawing to compare frailty trajectories by cancer burden, with emphasis on aggressive cancer classifications.
 ```
 
 ```{r setup, message=FALSE, warning=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 
 library(dplyr)
 library(tidyr)
@@ -37,7 +35,7 @@ target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
 ```
 
 ## 2. Prepare Time Variables (Age Scale)
-Ensure that your raw cancer site variables (cancer_lung, cancer_pancreas, etc.) are included in the dataset here so they can be used in Step 5.
+Ensure that your raw cancer site variables are included here so they can be used in Step 5.
 
 ```{r prep-time}
 fi_time_prepped <- fi_long_merged %>%
@@ -109,14 +107,10 @@ analysis_long_age <- fi_trajectory %>%
     
     Ever_Cancer = if_else(!is.na(true_age_at_cancer) & true_age_at_cancer > base_age, 1L, 0L),
     
-    # Define High Burden Systemic/Aggressive Cancers
-    is_high_burden = if_else(
-      coalesce(cancer_lung, 0) == 1 | coalesce(cancer_pancreas, 0) == 1 | 
-      coalesce(cancer_stomach, 0) == 1 | coalesce(cancer_liver, 0) == 1 | 
-      coalesce(cancer_brain, 0) == 1 | coalesce(cancer_lal, 0) == 1 |
-      coalesce(cancer_esoph, 0) == 1 | coalesce(cancer_myeloma, 0) == 1,
-      1L, 0L
-    ),
+    # High-burden flag precomputed in 1_data_cleaning/7.4_cancer_subtypes.R
+    # (SEER 5-yr relative survival <50%: lung, pancreas, liver, esophagus,
+    # stomach, brain); carried here, not re-derived.
+    is_high_burden = coalesce(is_high_burden, 0L),
     
     # Construct the 3-Level Grouping Variable
     Cancer_Burden = case_when(
@@ -151,12 +145,14 @@ cat("Total observations in analysis_long_age =", nrow(analysis_long_age), "\n")
 cat("Patients with zero follow-up years =", nrow(zero_fu_check), "\n")
 ```
 
-## 7. Incidence Density (Risk-Set) Matching (1:2 Ratio)
-Assigns controls an index age based on active risk-set timing, rounding to avoid precision errors.
+## 7. Stochastic Random Drawing of Index Age
+For each control, randomly sample an event age from the pool of cases in their baseline age cohort. 
+The drawn age must fall within the control's observed follow-up window.
 
 ```{r impute-index-age}
 set.seed(2026)
 
+# Round ages to avoid floating point precision boundary errors
 patient_summary_age <- analysis_long_age %>%
   group_by(id) %>%
   summarize(
@@ -177,48 +173,35 @@ cases_summary <- patient_summary_age %>%
 controls_summary <- patient_summary_age %>%
   filter(is_case == 0)
 
-# Target matching ratio
-MATCH_RATIO <- 2 
+imputed_ages <- rep(NA_real_, nrow(controls_summary))
 
-available_controls <- controls_summary$id
-assigned_times_list <- list()
-
-for (i in seq_len(nrow(cases_summary))) {
-  current_case <- cases_summary[i, ]
-  case_age <- current_case$true_age_at_cancer
+for (i in seq_len(nrow(controls_summary))) {
+  current_control <- controls_summary[i, ]
   
-  eligible_controls <- controls_summary %>%
+  # CRITICAL CONSTRAINT: Donor's cancer age must fall within the control's observed age window
+  eligible_cases <- cases_summary %>%
     filter(
-      id %in% available_controls,
-      age_bin == current_case$age_bin,
-      min_age <= case_age,    
-      max_age >= case_age     
+      age_bin == current_control$age_bin,
+      true_age_at_cancer >= current_control$min_age,
+      true_age_at_cancer <= current_control$max_age
     )
   
-  if (nrow(eligible_controls) > 0) {
-    n_to_sample <- min(MATCH_RATIO, nrow(eligible_controls))
-    sampled_controls <- sample(eligible_controls$id, size = n_to_sample, replace = FALSE)
-    
-    assigned_times_list[[i]] <- data.frame(
-      id = sampled_controls,
-      assigned_event_age = case_age,
-      matched_to_case = current_case$id
-    )
-    
-    available_controls <- setdiff(available_controls, sampled_controls)
+  if (nrow(eligible_cases) > 0) {
+    imputed_ages[i] <- sample(eligible_cases$true_age_at_cancer, size = 1)
+  } else {
+    imputed_ages[i] <- NA_real_
   }
 }
 
-controls_assigned <- bind_rows(assigned_times_list)
-cases_assigned <- cases_summary %>% 
-  select(id, assigned_event_age = true_age_at_cancer)
+controls_summary$assigned_event_age <- imputed_ages
+cases_summary$assigned_event_age <- cases_summary$true_age_at_cancer
 
-assigned_ages_df <- bind_rows(cases_assigned, controls_assigned) %>%
+assigned_ages_df <- bind_rows(cases_summary, controls_summary) %>%
+  filter(!is.na(assigned_event_age)) %>%
   select(id, assigned_event_age) %>%
   distinct(id, .keep_all = TRUE)
 
-cat("Total Cases:", nrow(cases_summary), "\n")
-cat("Total Controls Successfully Matched:", nrow(controls_assigned), "\n")
+cat("Controls dropped due to no eligible donor in their age window =", sum(is.na(imputed_ages)), "\n")
 ```
 
 ## 8. Generate Time Scale & Spline Variables
@@ -227,7 +210,7 @@ cat("Total Controls Successfully Matched:", nrow(controls_assigned), "\n")
 model_data_age <- analysis_long_age %>%
   inner_join(assigned_ages_df, by = "id") %>%
   mutate(
-    # Center age around the event age
+    # Center age around the assigned event age
     Age_Centered = age_at_cycle - assigned_event_age,
     
     # Create the post-event knot
@@ -309,6 +292,21 @@ table1_age <- followup_by_patient_age %>%
 table1_age
 ```
 
+### Constraint Sanity Checks (Should be Zero)
+
+```{r sanity-checks}
+# Verify rounding fixed the boundary violations
+control_age_check <- followup_by_patient_age %>%
+  filter(Index_Group == "Control") %>%
+  summarize(
+    n_controls = n(),
+    n_bad_age_early = sum(round(assigned_event_age, 4) < round(min_age, 4), na.rm = TRUE),
+    n_bad_age_late = sum(round(assigned_event_age, 4) > round(max_age, 4), na.rm = TRUE)
+  )
+
+print(as.data.frame(control_age_check))
+```
+
 ### Density Plot of Assigned Index Ages
 
 ```{r descriptive-plots, fig.width=8, fig.height=5}
@@ -338,6 +336,50 @@ p_index_density_age <- ggplot(followup_by_patient_age, aes(x = assigned_event_ag
   )
 
 print(p_index_density_age)
+```
+```{r}
+# Bin the baseline ages for conditional visualization
+plot_data_binned <- followup_by_patient_age %>%
+  mutate(
+    age_bin_factor = cut(base_age, 
+                         breaks = c(40, 50, 60, 70, 80, 100), 
+                         labels = c("40-49", "50-59", "60-69", "70-79", "80+"),
+                         right = FALSE)
+  ) %>%
+  group_by(age_bin_factor, Cancer_Burden) %>%
+  filter(n() > 10) %>% # Filter out sparse bins for plotting clarity
+  ungroup()
+
+p_index_density_stratified <- ggplot(plot_data_binned, aes(x = assigned_event_age, fill = Cancer_Burden, color = Cancer_Burden)) +
+  geom_density(alpha = 0.4, linewidth = 1) +
+  facet_wrap(~ age_bin_factor, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c(
+    "Control" = "#3182bd", 
+    "Low/Moderate Burden" = "#fd8d3c", 
+    "High Burden" = "#de2d26"
+  )) +
+  scale_color_manual(values = c(
+    "Control" = "#3182bd", 
+    "Low/Moderate Burden" = "#fd8d3c", 
+    "High Burden" = "#de2d26"
+  )) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Distribution of Index Age Conditioned on Baseline Age",
+    subtitle = "Within each age stratum, control index ages closely reflect the respective case distributions",
+    x = "Assigned Index Age (years)",
+    y = "Density",
+    fill = "Group",
+    color = "Group"
+  ) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "#f4f4f4", color = NA),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p_index_density_stratified)
 ```
 
 ## 10. Run the Stratified Piecewise LME Model
@@ -408,7 +450,7 @@ p_trajectory_strat <- ggplot(plot_grid_strat, aes(x = Age_Centered, y = pred, co
   ) +
   labs(
     title = "Frailty Trajectories by Cancer Burden",
-    subtitle = "Centered at Age of Cancer Diagnosis (or Matched Index Age)",
+    subtitle = "Centered at Age of Cancer Diagnosis (or Randomly Assigned Index Age)",
     x = "Years Relative to Index Age",
     y = "Predicted Frailty Index"
   ) +

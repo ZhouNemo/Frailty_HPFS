@@ -1,0 +1,231 @@
+---
+# Project: Frailty Trajectories Before and After Incident Cancer in the Health
+#          Professionals Follow-up Study
+# Script:  4.5_GLME_overall_report.Rmd
+# Author:  Nemo Zhou
+# Date started:      2026-07-18
+# Date last updated: 2026-07-20 (removed quadratic model; renumbered spline models)
+# Purpose: Read the saved overall-cancer matching and GLME CSV/RDS artifacts,
+#          display primary estimates and diagnostics, and render a self-contained
+#          HTML report only under Results/cancer/visuals. This report never fits
+#          a model, rebuilds matching, or persists PNG files.
+title: "Overall Incident Cancer Risk-Set Matching and GLME"
+author: "Nemo Zhou"
+date: "2026-07-18"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_float: true
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Results/cancer/visuals") })
+---
+
+```{r setup, include=FALSE}
+project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS"
+results_dir <- file.path(project_dir, "Results", "cancer", "data")
+matching_dir <- file.path(results_dir, "matching_diagnostics")
+sensitivity_dir <- file.path(results_dir, "4.5_sensitivities")
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.path = file.path(tempdir(), "4.5_overall_report_figures", ""),
+  dev = "png",
+  dpi = 120
+)
+
+read_csv_if_present <- function(name, directory = results_dir) {
+  path <- file.path(directory, name)
+  if (!file.exists(path)) return(NULL)
+  utils::read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
+}
+
+show_table <- function(x, caption, digits = 4) {
+  if (is.null(x) || nrow(x) == 0) {
+    cat("*Artifact unavailable or empty at render time.*\n")
+  } else {
+    print(knitr::kable(x, caption = caption, digits = digits))
+  }
+}
+
+primary_files <- list(
+  trajectories = read_csv_if_present("4.5_spline_predicted_trajectories.csv"),
+  difference = read_csv_if_present("4.5_spline_group_difference.csv"),
+  derivative = read_csv_if_present("4.5_spline_derivative.csv"),
+  theta = read_csv_if_present("4.5_spline_theta.csv"),
+  status = read_csv_if_present("4.5_spline_model_status.csv"),
+  omnibus = read_csv_if_present("4.5_spline_omnibus_tests.csv"),
+  support = read_csv_if_present("4.5_support_by_time_bin.csv"),
+  filter_log = read_csv_if_present("4.5_model_filter_log.csv"),
+  convergence = read_csv_if_present("4.5_convergence_attempts.csv"),
+  variance = read_csv_if_present("4.5_spline_variance_components.csv"),
+  residual = read_csv_if_present("4.5_residual_diagnostics.csv"),
+  random_effect = read_csv_if_present("4.5_random_effect_diagnostics.csv"),
+  bounded = read_csv_if_present("4.5_spline_bounded_prediction_checks.csv"),
+  influence = read_csv_if_present("4.5_spline_influence_refits.csv")
+)
+sensitivity_files <- list(
+  status = read_csv_if_present("4.5_sensitivity_status.csv", sensitivity_dir),
+  theta = read_csv_if_present("4.5_sensitivity_theta.csv", sensitivity_dir),
+  convergence = read_csv_if_present("4.5_sensitivity_convergence_attempts.csv", sensitivity_dir),
+  support = read_csv_if_present("4.5_sensitivity_support_by_time_bin.csv", sensitivity_dir),
+  s12_sets = read_csv_if_present("4.5_S12_matched_set_support.csv", sensitivity_dir)
+)
+```
+
+## Run provenance and readiness
+
+This report is a view of saved artifacts. It does not run matching or fit a model. The overall GLME is interpretable only after Gate G4 passes for the corrected overall matched cohort. Previously generated overall IPCW, FDA, and joint-model products are stale after that cohort is rebuilt and are not used here.
+
+```{r artifact-inventory}
+artifact_paths <- c(
+  list.files(results_dir, pattern = "^4\\.5_", full.names = TRUE),
+  if (dir.exists(sensitivity_dir)) list.files(sensitivity_dir, full.names = TRUE) else character(0)
+)
+artifact_inventory <- if (length(artifact_paths) == 0) {
+  data.frame(artifact = character(0), modified = character(0), bytes = numeric(0))
+} else {
+  info <- file.info(artifact_paths)
+  data.frame(
+    artifact = basename(artifact_paths),
+    modified = format(info$mtime, tz = "America/New_York"),
+    bytes = info$size,
+    stringsAsFactors = FALSE
+  )
+}
+show_table(artifact_inventory, "Saved overall matching/GLME artifacts available to this report", digits = 0)
+```
+
+```{r matching-integrity}
+integrity_paths <- if (dir.exists(matching_dir)) {
+  list.files(matching_dir, pattern = "overall.*(set_integrity|caliper_integrity|balance|inactive_cases|scaling).*\\.(csv|rds)$", full.names = TRUE, ignore.case = TRUE)
+} else character(0)
+integrity_inventory <- data.frame(
+  artifact = basename(integrity_paths),
+  modified = if (length(integrity_paths)) format(file.info(integrity_paths)$mtime, tz = "America/New_York") else character(0),
+  stringsAsFactors = FALSE
+)
+show_table(integrity_inventory, "Overall matching integrity and scaling artifacts", digits = 0)
+```
+
+## Model status and primary estimands
+
+```{r status-table}
+show_table(primary_files$status, "Spline model convergence and covariance status")
+```
+
+```{r theta-table}
+show_table(primary_files$theta, "Post-minus-pre cancer-control slope contrast and pre-index slope")
+```
+
+```{r omnibus-table}
+show_table(primary_files$omnibus, "Time-structure interaction omnibus tests")
+```
+
+The numerical and closed-form versions of `theta` must agree within `1e-6`. A model status row using CR0 or model-based covariance is retained but must be interpreted with its reported covariance label. In particular, an acceptably fitted M3 remains informative when robust covariance is unavailable.
+
+## Adjusted trajectories
+
+```{r trajectory-plot, fig.width=8, fig.height=5.5}
+tr <- primary_files$trajectories
+if (is.null(tr) || !all(c("Age_Centered", "Group", "pred") %in% names(tr))) {
+  cat("*Adjusted trajectory artifact is unavailable or does not contain the expected columns.*\n")
+} else {
+  cohort_col <- if ("Cohort" %in% names(tr)) "Cohort" else NULL
+  model_col <- if ("model_id" %in% names(tr)) "model_id" else if ("Model" %in% names(tr)) "Model" else NULL
+  if (!is.null(model_col) && any(tr[[model_col]] == "M1_primary_spline", na.rm = TRUE)) {
+    tr <- tr[tr[[model_col]] == "M1_primary_spline", ]
+  }
+  p <- ggplot2::ggplot(tr, ggplot2::aes(x = Age_Centered, y = pred, color = Group, fill = Group)) +
+    ggplot2::geom_vline(xintercept = 0, linetype = 2, color = "grey45") +
+    ggplot2::geom_line(linewidth = 0.8)
+  if (all(c("lwr", "upr") %in% names(tr))) {
+    p <- p + ggplot2::geom_ribbon(ggplot2::aes(ymin = lwr, ymax = upr), alpha = 0.16, color = NA)
+  }
+  p +
+    ggplot2::coord_cartesian(xlim = c(-20, 20)) +
+    ggplot2::labs(x = "Years relative to cancer diagnosis / assigned index", y = "Adjusted frailty index", color = NULL, fill = NULL) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(legend.position = "bottom")
+}
+```
+
+## Cancer-minus-control difference and derivative
+
+```{r difference-plot, fig.width=8, fig.height=5}
+df <- primary_files$difference
+time_name <- if (!is.null(df) && "Age_Centered" %in% names(df)) "Age_Centered" else if (!is.null(df) && "time" %in% names(df)) "time" else NULL
+estimate_name <- if (!is.null(df) && "estimate" %in% names(df)) "estimate" else if (!is.null(df) && "diff" %in% names(df)) "diff" else NULL
+if (is.null(time_name) || is.null(estimate_name)) {
+  cat("*Cancer-minus-control difference artifact is unavailable or does not contain the expected columns.*\n")
+} else {
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = .data[[time_name]], y = .data[[estimate_name]])) +
+    ggplot2::geom_hline(yintercept = 0, color = "grey55") +
+    ggplot2::geom_vline(xintercept = 0, linetype = 2, color = "grey45") +
+    ggplot2::geom_line(linewidth = 0.8, color = "#8b1a1a")
+  if (all(c("lwr", "upr") %in% names(df))) {
+    p <- p + ggplot2::geom_ribbon(ggplot2::aes(ymin = lwr, ymax = upr), fill = "#8b1a1a", alpha = 0.16)
+  }
+  p + ggplot2::coord_cartesian(xlim = c(-20, 20)) +
+    ggplot2::labs(x = "Years relative to index", y = "Cancer case minus control FI") +
+    ggplot2::theme_minimal(base_size = 12)
+}
+```
+
+```{r derivative-plot, fig.width=8, fig.height=5}
+dv <- primary_files$derivative
+time_name <- if (!is.null(dv) && "Age_Centered" %in% names(dv)) "Age_Centered" else if (!is.null(dv) && "time" %in% names(dv)) "time" else NULL
+estimate_name <- if (!is.null(dv) && "estimate" %in% names(dv)) "estimate" else if (!is.null(dv) && "derivative" %in% names(dv)) "derivative" else NULL
+if (is.null(time_name) || is.null(estimate_name)) {
+  cat("*Derivative artifact is unavailable or does not contain the expected columns.*\n")
+} else {
+  p <- ggplot2::ggplot(dv, ggplot2::aes(x = .data[[time_name]], y = .data[[estimate_name]])) +
+    ggplot2::geom_hline(yintercept = 0, color = "grey55") +
+    ggplot2::geom_vline(xintercept = 0, linetype = 2, color = "grey45") +
+    ggplot2::geom_line(linewidth = 0.8, color = "#1f5a91")
+  if (all(c("lwr", "upr") %in% names(dv))) {
+    p <- p + ggplot2::geom_ribbon(ggplot2::aes(ymin = lwr, ymax = upr), fill = "#1f5a91", alpha = 0.16)
+  }
+  p + ggplot2::coord_cartesian(xlim = c(-20, 20)) +
+    ggplot2::labs(x = "Years relative to index", y = "Derivative of cancer-control difference") +
+    ggplot2::theme_minimal(base_size = 12)
+}
+```
+
+## Diagnostics and sensitivities
+
+```{r diagnostic-tables}
+show_table(primary_files$filter_log, "Complete-case filtering by arm and model")
+show_table(primary_files$convergence, "Strict convergence-ladder attempts")
+show_table(primary_files$variance, "Variance components")
+show_table(primary_files$residual, "Residual diagnostics")
+show_table(primary_files$random_effect, "Random-effect diagnostics")
+show_table(primary_files$bounded, "Bounded-outcome prediction checks")
+show_table(primary_files$influence, "Deterministic matched-set-decile influence refits")
+```
+
+```{r sensitivity-results}
+show_table(sensitivity_files$status, "S1-S12 model status")
+show_table(sensitivity_files$theta, "S1-S12 theta estimates")
+show_table(sensitivity_files$convergence, "S1-S12 strict convergence attempts")
+show_table(sensitivity_files$s12_sets, "S12 retained matched-set integrity")
+```
+
+```{r sensitivity-inventory}
+saved_sensitivity_paths <- if (dir.exists(sensitivity_dir)) list.files(sensitivity_dir, full.names = TRUE) else character(0)
+sensitivity_inventory <- data.frame(
+  artifact = basename(saved_sensitivity_paths),
+  modified = if (length(saved_sensitivity_paths)) format(file.info(saved_sensitivity_paths)$mtime, tz = "America/New_York") else character(0),
+  stringsAsFactors = FALSE
+)
+show_table(sensitivity_inventory, "S1–S12 saved sensitivity artifacts", digits = 0)
+```
+
+## Interpretation constraints
+
+- A flat near-zero pre-index difference derivative supports comparable pre-diagnosis trajectories; a widening pre-index derivative limits a simple acceleration interpretation.
+- `theta` is conditional on survival and observation under the fitted mixed-model assumptions.
+- Predictions and contrasts are shown only over supported ±20 years even though all eligible relative-time observations enter model fitting.
+- Sparse-tail behavior is not interpreted beyond adequate case and control support.
+- IPCW, FDA, and joint-model findings must be regenerated from the corrected overall matched cohort before cross-method comparison.

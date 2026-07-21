@@ -3,7 +3,7 @@
 # Script: 9_time variables generation.R
 # Author: Nemo Zhou
 # Date started: Unknown (pre-existing script before documentation standard was applied)
-# Date last updated: 2026-06-28
+# Date last updated: 2026-07-20 (canonical earliest-cancer index date)
 # Purpose: Generates demographic, questionnaire-cycle, death, and cancer-timing variables used to align frailty measurements before and after cancer diagnosis.
 # ==============================================================================
 
@@ -17,6 +17,10 @@ data_dir <- file.path(project_dir, "Data")
 input_path <- file.path(data_dir, "FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
 fi_long_merged <- readRDS(input_path)
 
+if (!"cancer_index_dateca" %in% names(fi_long_merged)) {
+  stop("Missing cancer_index_dateca; run 7.4_cancer_subtypes.R first.", call. = FALSE)
+}
+
 # ==============================================================================
 # 1. CALCULATE DEMOGRAPHIC & CLINICAL TIMELINES (FULL COHORT)
 # ==============================================================================
@@ -27,7 +31,8 @@ fi_time_prepped <- fi_long_merged %>%
     # 0. FIX DATA TYPES: Convert time variables from Character to Numeric
     # (Note: R might throw a warning about "NAs introduced by coercion" 
     # if it turns blank spaces into NAs. That is exactly what we want!)
-    cancer_dateca = as.numeric(as.character(cancer_dateca)),
+    cancer_dateca_endpoint = as.numeric(as.character(cancer_dateca)),
+    cancer_dateca = as.numeric(as.character(cancer_index_dateca)),
     dtdth         = as.numeric(as.character(dtdth)),
     dbmy09        = as.numeric(as.character(dbmy09)),
     worked_rtmnyr = as.numeric(as.character(worked_rtmnyr)), # Included just in case!

@@ -3,8 +3,15 @@
 # Script: 7.3_cancer records.R
 # Author: Nemo Zhou
 # Date started: Unknown (pre-existing script before documentation standard was applied)
-# Date last updated: 2026-06-28
+# Date last updated: 2026-06-29
 # Purpose: Reads fixed-width HPFS cancer record files, assigns cancer-related variable names and positions, and prepares cancer diagnosis and cancer-type information for linkage to frailty data.
+#   This script only merges the raw per-site cancer flags (cancer_lung, cancer_pancreas, ...). All
+#   derived cancer subgroup classifications (smoking-related, obesity-related, high/low burden,
+#   prostate subgroups) are produced downstream in 7.4_cancer_subtypes.R, which is also where the
+#   original ad hoc HPFS grouping columns (cancer_carcin, cancer_carcinp, cancer_cancerp,
+#   cancer_acan, cancer_lal) are removed. Do not re-derive subgroup classifications here or inline
+#   in analysis scripts; consume the columns written by 7.4 instead. See
+#   Documents/Methods/Cancer_Classification.md for the reference-anchored definitions.
 # ==============================================================================
 
 library(readr)

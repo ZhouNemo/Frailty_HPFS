@@ -6,11 +6,11 @@ output: html_document
 ---
 ```{r script-documentation, include=FALSE}
 # Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
-# Script: 4.1_aggressive cancer_drawing_MI.Rmd
+# Script: 4.3_multiple imputation.Rmd
 # Author: Nemo Zhou
 # Date started: Unknown (pre-existing script before documentation standard was applied)
-# Date last updated: 2026-06-28
-# Purpose: Combines stochastic drawing with multiple imputation for analyses of frailty trajectories by aggressive cancer burden.
+# Date last updated: 2026-06-29 (high-burden flag now read from 7.4_cancer_subtypes.R; cancer_lal no longer referenced)
+# Purpose: Runs multiple-imputation-based frailty trajectory analyses for cancer burden comparisons, including model pooling where applicable.
 ```
 
 ```{r setup, message=FALSE, warning=FALSE}
@@ -31,8 +31,10 @@ library(broom.mixed) # Allows mice to pool lmer models
 ## 1. Load Data and Define Target FI Cycles
 
 ```{r load-data}
-data_path <- "/n/home06/xyzhou/Frailty/2_data analysis/before and after cancer/data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds"
-fi_long_merged <- readRDS(data_path)
+# Update path if necessary
+fi_long_merged <- readRDS(
+  "~/OneDrive - Harvard University/Research/Frailty Project/Data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds"
+)
 
 target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
 ```
@@ -108,13 +110,10 @@ analysis_long_age <- fi_trajectory %>%
     
     Ever_Cancer = if_else(!is.na(true_age_at_cancer) & true_age_at_cancer > base_age, 1L, 0L),
     
-    is_high_burden = if_else(
-      coalesce(cancer_lung, 0) == 1 | coalesce(cancer_pancreas, 0) == 1 | 
-      coalesce(cancer_stomach, 0) == 1 | coalesce(cancer_liver, 0) == 1 | 
-      coalesce(cancer_brain, 0) == 1 | coalesce(cancer_lal, 0) == 1 |
-      coalesce(cancer_esoph, 0) == 1 | coalesce(cancer_myeloma, 0) == 1,
-      1L, 0L
-    )
+    # High-burden flag precomputed in 1_data_cleaning/7.4_cancer_subtypes.R
+    # (SEER 5-yr relative survival <50%: lung, pancreas, liver, esophagus,
+    # stomach, brain); carried here, not re-derived.
+    is_high_burden = coalesce(is_high_burden, 0L)
   ) %>%
   filter(is_prevalent == 0) %>%
   filter(n_visits >= 2, max_followup_yrs > 0) %>%

@@ -1,0 +1,698 @@
+---
+title: "3.1 Descriptive Results for Risk-Set Matched Cohorts"
+author: "Nemo Zhou"
+date: "2026-07-18"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+<!--
+Project: Frailty Trajectories Before and After Incident Cancer in the
+         Health Professionals Follow-up Study
+Script:  3.1_descriptive_riskset_cohorts.Rmd
+Author:  Nemo Zhou
+Date started:      2026-06-29
+Date last updated: 2026-07-18 (added primary pre-GLME QC gate)
+
+Purpose:
+  Matching-cohort descriptive EDA report for the risk-set matched analytic
+  cohort families created by scripts 2.1-2.5:
+    1. High- vs low/moderate-burden cancers
+    2. Smoking-related cancers versus cancer-free controls
+    3. Obesity-related cancers versus cancer-free controls
+    4. Survival <=5 vs >5 years after diagnosis
+    5. Overall incident cancer vs matched controls
+
+  The matched data are long repeated-measures files, so descriptive tables are
+  built at the matched-assignment level: one row per Analysis, Cohort,
+  match_set, participant id, and role. This avoids inflating Table 1 by the
+  number of repeated FI observations. Controls can still appear in multiple
+  assignments because the risk-set design matches with replacement; those
+  assignments are intentionally retained.
+
+  This R Markdown report writes and displays:
+    - cohort/group size and reuse summaries
+    - FI observation support summaries before and after index
+    - Table 1 comparing cancer cases and controls within each Analysis-Cohort
+      in both tidy-long and side-by-side wide CSV formats
+    - mean observed FI by relative-time bin for descriptive plotting
+    - a faceted crude FI trajectory plot
+    - overall matched case/control FI trajectory relative to assigned index time
+    - overall matched case/control index-age overlap plot
+
+Outputs:
+  Results/cancer/visuals/3.1_descriptive_riskset_cohorts.html
+  Results/cancer/data/3.1_riskset_assignment_counts.csv
+  Results/cancer/data/3.1_riskset_reuse_summary.csv
+  Results/cancer/data/3.1_riskset_fi_observation_summary.csv
+  Results/cancer/data/3.1_riskset_table1_cases_vs_controls.csv
+  Results/cancer/data/3.1_riskset_table1_cases_vs_controls_wide.csv
+  Results/cancer/data/3.1_riskset_mean_fi_by_relative_time_bin.csv
+  Results/cancer/data/3.1_overall_matched_fi_relative_to_index.csv
+  Results/cancer/data/3.1_overall_index_age_distribution.csv
+  Results/cancer/data/3.1_overall_pre_glme_qc_gate.csv
+-->
+
+```{r build-results, include=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+
+# -----------------------------------------------------------------------------
+# 1. Paths and inputs
+# -----------------------------------------------------------------------------
+
+project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS"
+data_dir    <- file.path(project_dir, "Data")
+results_dir <- file.path(project_dir, "Results", "cancer", "data")
+raw_path    <- file.path(data_dir, "FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
+overall_matched_path <- file.path(data_dir, "riskset_matched_overall_long.rds")
+
+matched_files <- tibble::tribble(
+  ~Analysis, ~matched_path,
+  "High vs Low/Moderate Burden", file.path(data_dir, "riskset_matched_analysis_long.rds"),
+  "Smoking-Related Cancer",      file.path(data_dir, "riskset_matched_smoking_long.rds"),
+  "Obesity-Related Cancer",      file.path(data_dir, "riskset_matched_obesity_long.rds"),
+  "Survival After Diagnosis",    file.path(data_dir, "riskset_matched_survival_long.rds"),
+  "Overall Incident Cancer",     overall_matched_path
+)
+
+required_matched_cols <- c(
+  "id", "match_set", "index_date", "role", "Cohort", "cycle",
+  "age_at_cycle", "fi_score_nocancer", "base_race", "base_marital",
+  "base_living", "base_pckgr", "index_age", "Age_Centered", "Post", "Group",
+  "post_own_cancer"
+)
+
+if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+
+
+# -----------------------------------------------------------------------------
+# 2. Helpers
+# -----------------------------------------------------------------------------
+
+read_matched <- function(analysis, matched_path) {
+  if (!file.exists(matched_path)) {
+    stop("Matched dataset not found for ", analysis, ": ", matched_path)
+  }
+  dat <- readRDS(matched_path)
+  missing_cols <- setdiff(required_matched_cols, names(dat))
+  if (length(missing_cols) > 0) {
+    stop(
+      "Matched dataset for ", analysis, " is missing required columns: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+
+  dat %>%
+    mutate(
+      Analysis = analysis,
+      id = as.character(id),
+      match_set = as.character(match_set),
+      role = as.character(role),
+      Group = factor(as.character(Group), levels = c("Control", "Cancer Case")),
+      Cohort = as.character(Cohort),
+      cycle = as.character(cycle),
+      fi_score_nocancer = as.numeric(fi_score_nocancer),
+      Age_Centered = as.numeric(Age_Centered),
+      index_age = as.numeric(index_age),
+      post_own_cancer = as.logical(post_own_cancer)
+    )
+}
+
+first_nonmissing <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA else x[1]
+}
+
+last_nonmissing <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA else x[length(x)]
+}
+
+mean_sd <- function(x, digits = 2) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  paste0(round(mean(x), digits), " (", round(stats::sd(x), digits), ")")
+}
+
+median_iqr <- function(x, digits = 2) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  q <- stats::quantile(x, probs = c(0.25, 0.5, 0.75), na.rm = TRUE, names = FALSE)
+  paste0(round(q[2], digits), " [", round(q[1], digits), ", ", round(q[3], digits), "]")
+}
+
+format_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+continuous_p <- function(x, group) {
+  keep <- !is.na(x) & !is.na(group)
+  x <- x[keep]
+  group <- droplevels(factor(group[keep]))
+  if (length(unique(group)) != 2 || length(x) < 3) return(NA_real_)
+  tryCatch(stats::t.test(x ~ group)$p.value, error = function(e) NA_real_)
+}
+
+categorical_p <- function(x, group) {
+  keep <- !is.na(x) & !is.na(group)
+  x <- factor(x[keep])
+  group <- droplevels(factor(group[keep]))
+  if (length(unique(group)) != 2 || nlevels(x) < 2) return(NA_real_)
+  tab <- table(x, group)
+  tryCatch({
+    if (any(tab < 5)) stats::fisher.test(tab)$p.value else stats::chisq.test(tab)$p.value
+  }, error = function(e) NA_real_)
+}
+
+smd_continuous <- function(x, group) {
+  keep <- !is.na(x) & !is.na(group)
+  x <- x[keep]
+  group <- droplevels(factor(group[keep], levels = c("Control", "Cancer Case")))
+  if (length(unique(group)) != 2) return(NA_real_)
+  x0 <- x[group == "Control"]
+  x1 <- x[group == "Cancer Case"]
+  pooled_sd <- sqrt((stats::var(x0) + stats::var(x1)) / 2)
+  if (is.na(pooled_sd) || pooled_sd == 0) return(NA_real_)
+  (mean(x1) - mean(x0)) / pooled_sd
+}
+
+summarize_continuous <- function(dat, var, label) {
+  x <- dat[[var]]
+  p <- continuous_p(x, dat$Group)
+  smd <- smd_continuous(x, dat$Group)
+  dat %>%
+    group_by(Group) %>%
+    summarize(
+      Statistic = mean_sd(.data[[var]]),
+      Median_IQR = median_iqr(.data[[var]]),
+      Missing = sum(is.na(.data[[var]])),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Variable = label,
+      Level = NA_character_,
+      P_Value = format_p(p),
+      SMD = round(smd, 3)
+    )
+}
+
+summarize_categorical <- function(dat, var, label) {
+  p <- categorical_p(dat[[var]], dat$Group)
+  denom <- dat %>%
+    group_by(Group) %>%
+    summarize(Denom = sum(!is.na(.data[[var]])), .groups = "drop")
+
+  dat %>%
+    filter(!is.na(.data[[var]])) %>%
+    count(Group, Level = .data[[var]], name = "n") %>%
+    left_join(denom, by = "Group") %>%
+    mutate(
+      Level = as.character(Level),
+      Statistic = paste0(n, " (", round(100 * n / Denom, 1), "%)"),
+      Median_IQR = NA_character_,
+      Missing = NA_integer_,
+      Variable = label,
+      P_Value = format_p(p),
+      SMD = NA_real_
+    ) %>%
+    select(Group, Statistic, Median_IQR, Missing, Variable, Level, P_Value, SMD)
+}
+
+make_table1_one <- function(dat, continuous_vars, categorical_vars) {
+  cont <- bind_rows(lapply(names(continuous_vars), function(v) {
+    summarize_continuous(dat, v, continuous_vars[[v]])
+  }))
+  catg <- bind_rows(lapply(names(categorical_vars), function(v) {
+    summarize_categorical(dat, v, categorical_vars[[v]])
+  }))
+
+  bind_rows(cont, catg) %>%
+    select(Variable, Level, Group, Statistic, Median_IQR, Missing, P_Value, SMD)
+}
+
+
+# -----------------------------------------------------------------------------
+# 3. Load matched datasets and optional 1986 baseline covariates
+# -----------------------------------------------------------------------------
+
+matched_long_raw <- bind_rows(lapply(seq_len(nrow(matched_files)), function(i) {
+  read_matched(matched_files$Analysis[i], matched_files$matched_path[i])
+}))
+
+overall_pre_glme_qc_gate <- matched_long_raw %>%
+  filter(Analysis == "Overall Incident Cancer", Cohort == "All Cancer Cohort") %>%
+  group_by(Group) %>%
+  summarize(
+    n_assignments_before_censoring = n_distinct(trajectory_id),
+    n_distinct_persons = n_distinct(id),
+    n_rows_before_censoring = n(),
+    n_rows_removed_post_own_cancer = sum(post_own_cancer),
+    n_assignments_with_rows_removed = n_distinct(trajectory_id[post_own_cancer]),
+    n_rows_after_primary_censoring = sum(!post_own_cancer),
+    .groups = "drop"
+  )
+
+overall_yield_path <- file.path(results_dir, "matching_diagnostics",
+                                 "riskset_matched_overall_long_yield.csv")
+if (file.exists(overall_yield_path)) {
+  overall_yield <- read.csv(overall_yield_path, stringsAsFactors = FALSE)
+  if (nrow(overall_yield) == 1) {
+    overall_pre_glme_qc_gate <- overall_pre_glme_qc_gate %>%
+      mutate(cases_with_controls_from_yield = if_else(
+        Group == "Cancer Case", overall_yield$cases_with_controls[[1]], NA_integer_
+      ))
+  }
+}
+
+matched_long <- matched_long_raw %>%
+  filter(!post_own_cancer)
+
+baseline_extra <- NULL
+if (file.exists(raw_path)) {
+  raw <- readRDS(raw_path)
+  available_extra <- intersect(c("bmi", "smoke", "pckyr", "act", "calor", "alco"), names(raw))
+  baseline_extra <- raw %>%
+    mutate(id = as.character(id), cycle = as.character(cycle)) %>%
+    filter(cycle == "86") %>%
+    distinct(id, .keep_all = TRUE) %>%
+    transmute(
+      id,
+      base_bmi = if ("bmi" %in% available_extra) as.numeric(as.character(bmi)) else NA_real_,
+      base_smoke = if ("smoke" %in% available_extra) as.character(smoke) else NA_character_,
+      base_pack_years = if ("pckyr" %in% available_extra) as.numeric(as.character(pckyr)) else NA_real_,
+      base_activity = if ("act" %in% available_extra) as.numeric(as.character(act)) else NA_real_,
+      base_calories = if ("calor" %in% available_extra) as.numeric(as.character(calor)) else NA_real_,
+      base_alcohol = if ("alco" %in% available_extra) as.numeric(as.character(alco)) else NA_real_
+    )
+} else {
+  warning("Raw FI dataset not found; Table 1 will use matched-dataset covariates only.")
+}
+
+
+# -----------------------------------------------------------------------------
+# 4. Assignment-level analytic summaries
+# -----------------------------------------------------------------------------
+
+assignment_summary <- matched_long %>%
+  arrange(Analysis, Cohort, match_set, id, role, Age_Centered) %>%
+  group_by(Analysis, Cohort, match_set, id, role, Group) %>%
+  summarize(
+    index_date = first(index_date),
+    index_age = first(index_age),
+    n_fi_observations = n(),
+    n_pre_index_fi = sum(Age_Centered < 0),
+    n_post_index_fi = sum(Age_Centered >= 0),
+    min_relative_time = min(Age_Centered, na.rm = TRUE),
+    max_relative_time = max(Age_Centered, na.rm = TRUE),
+    fi_first_observed = first_nonmissing(fi_score_nocancer),
+    fi_last_pre_index = last_nonmissing(fi_score_nocancer[Age_Centered < 0]),
+    fi_first_post_index = first_nonmissing(fi_score_nocancer[Age_Centered >= 0]),
+    base_race = first(base_race),
+    base_marital = first(base_marital),
+    base_living = first(base_living),
+    base_pckgr = first(base_pckgr),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    has_pre_index_fi = n_pre_index_fi > 0,
+    has_post_index_fi = n_post_index_fi > 0
+  )
+
+if (!is.null(baseline_extra)) {
+  assignment_summary <- assignment_summary %>%
+    left_join(baseline_extra, by = "id")
+}
+
+
+# -----------------------------------------------------------------------------
+# 5. Cohort sizes, reuse, and FI observation support
+# -----------------------------------------------------------------------------
+
+assignment_counts <- assignment_summary %>%
+  group_by(Analysis, Cohort, Group) %>%
+  summarize(
+    n_assignments = n(),
+    n_distinct_persons = n_distinct(id),
+    n_match_sets = n_distinct(match_set),
+    mean_index_age = mean(index_age, na.rm = TRUE),
+    sd_index_age = stats::sd(index_age, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+reuse_summary <- assignment_summary %>%
+  group_by(Analysis, Cohort, Group, id) %>%
+  summarize(n_assignments_for_person = n(), .groups = "drop") %>%
+  group_by(Analysis, Cohort, Group) %>%
+  summarize(
+    n_persons = n(),
+    mean_assignments_per_person = mean(n_assignments_for_person),
+    max_assignments_per_person = max(n_assignments_for_person),
+    persons_reused_more_than_once = sum(n_assignments_for_person > 1),
+    pct_persons_reused_more_than_once = 100 * mean(n_assignments_for_person > 1),
+    .groups = "drop"
+  )
+
+fi_observation_summary <- assignment_summary %>%
+  group_by(Analysis, Cohort, Group) %>%
+  summarize(
+    mean_fi_observations = mean(n_fi_observations),
+    median_fi_observations = stats::median(n_fi_observations),
+    mean_pre_index_fi = mean(n_pre_index_fi),
+    mean_post_index_fi = mean(n_post_index_fi),
+    pct_with_pre_index_fi = 100 * mean(has_pre_index_fi),
+    pct_with_post_index_fi = 100 * mean(has_post_index_fi),
+    mean_min_relative_time = mean(min_relative_time),
+    mean_max_relative_time = mean(max_relative_time),
+    .groups = "drop"
+  )
+
+
+# -----------------------------------------------------------------------------
+# 6. Table 1 comparing cases and controls within each Analysis-Cohort
+# -----------------------------------------------------------------------------
+
+continuous_vars <- c(
+  index_age = "Index age, years",
+  fi_first_observed = "FI, first observed analytic cycle",
+  fi_last_pre_index = "FI, last pre-index observation",
+  fi_first_post_index = "FI, first post-index observation",
+  n_fi_observations = "Number of observed FI measurements",
+  n_pre_index_fi = "Number of pre-index FI measurements",
+  n_post_index_fi = "Number of post-index FI measurements"
+)
+
+if ("base_bmi" %in% names(assignment_summary)) {
+  continuous_vars <- c(
+    continuous_vars,
+    base_bmi = "Baseline BMI",
+    base_pack_years = "Baseline pack-years",
+    base_activity = "Baseline physical activity",
+    base_calories = "Baseline calories",
+    base_alcohol = "Baseline alcohol"
+  )
+}
+
+categorical_vars <- c(
+  base_race = "Baseline race",
+  base_marital = "Baseline marital status",
+  base_living = "Baseline living arrangement",
+  base_pckgr = "Baseline pack-year group"
+)
+
+if ("base_smoke" %in% names(assignment_summary)) {
+  categorical_vars <- c(categorical_vars, base_smoke = "Baseline smoking status")
+}
+
+table1 <- assignment_summary %>%
+  group_by(Analysis, Cohort) %>%
+  group_modify(~ make_table1_one(.x, continuous_vars, categorical_vars)) %>%
+  ungroup() %>%
+  arrange(Analysis, Cohort, Variable, is.na(Level), Level, Group)
+
+table1_wide <- table1 %>%
+  mutate(
+    Group = as.character(Group),
+    Group = if_else(Group == "Cancer Case", "Cancer_Case", Group)
+  ) %>%
+  pivot_wider(
+    id_cols = c(Analysis, Cohort, Variable, Level, P_Value, SMD),
+    names_from = Group,
+    values_from = c(Statistic, Median_IQR, Missing),
+    names_glue = "{Group}_{.value}"
+  ) %>%
+  arrange(Analysis, Cohort, Variable, is.na(Level), Level)
+
+
+# -----------------------------------------------------------------------------
+# 7. Descriptive observed FI trajectories by relative-time bin
+# -----------------------------------------------------------------------------
+
+fi_by_time_bin <- matched_long %>%
+  mutate(
+    relative_time_bin = cut(
+      Age_Centered,
+      breaks = c(-Inf, seq(-20, 20, by = 2), Inf),
+      labels = c("<= -20", paste(seq(-20, 18, by = 2), seq(-18, 20, by = 2), sep = " to "), "> 20"),
+      right = FALSE
+    ),
+    relative_time_bin_label = as.character(relative_time_bin),
+    relative_time_mid = case_when(
+      relative_time_bin_label == "<= -20" ~ -21,
+      relative_time_bin_label == "> 20" ~ 21,
+      TRUE ~ suppressWarnings(as.numeric(sub(" to .*", "", relative_time_bin_label))) + 1
+    )
+  ) %>%
+  group_by(Analysis, Cohort, Group, relative_time_bin, relative_time_mid) %>%
+  summarize(
+    n_observations = n(),
+    n_assignments = n_distinct(paste(match_set, id, role, sep = "|")),
+    n_persons = n_distinct(id),
+    mean_fi = mean(fi_score_nocancer, na.rm = TRUE),
+    sd_fi = stats::sd(fi_score_nocancer, na.rm = TRUE),
+    se_fi = sd_fi / sqrt(n_observations),
+    .groups = "drop"
+  )
+
+group_cols <- c("Control" = "#3182bd", "Cancer Case" = "#de2d26")
+
+p_fi <- ggplot(fi_by_time_bin, aes(x = relative_time_mid, y = mean_fi, color = Group)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", alpha = 0.6) +
+  facet_grid(Analysis ~ Cohort, scales = "free_y") +
+  scale_color_manual(values = group_cols) +
+  theme_minimal(base_size = 11) +
+  labs(
+    title = "Observed Mean Frailty Index by Relative-Time Bin",
+    x = "Years relative to assigned index time",
+    y = "Mean no-cancer frailty index",
+    color = NULL
+  ) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 8)
+  )
+
+
+# -----------------------------------------------------------------------------
+# 8. Overall matched index-time EDA
+# -----------------------------------------------------------------------------
+
+overall_matched_long <- matched_long %>%
+  filter(Analysis == "Overall Incident Cancer") %>%
+  mutate(
+    rel_year_bin = round(Age_Centered / 2) * 2
+  ) %>%
+  filter(rel_year_bin >= -20, rel_year_bin <= 20)
+
+overall_matched_relative_fi <- overall_matched_long %>%
+  group_by(Group, rel_year_bin) %>%
+  summarize(
+    n = sum(!is.na(fi_score_nocancer)),
+    n_participants = n_distinct(id),
+    n_assignments = n_distinct(paste(match_set, id, role, sep = "__")),
+    mean_fi = mean(fi_score_nocancer, na.rm = TRUE),
+    sd_fi = stats::sd(fi_score_nocancer, na.rm = TRUE),
+    se_fi = sd_fi / sqrt(n),
+    lcl = mean_fi - 1.96 * se_fi,
+    ucl = mean_fi + 1.96 * se_fi,
+    median_fi = stats::median(fi_score_nocancer, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Group, rel_year_bin)
+
+p_overall_matched_relative_fi <- ggplot(
+  overall_matched_relative_fi,
+  aes(x = rel_year_bin, y = mean_fi, color = Group, fill = Group)
+) +
+  geom_ribbon(aes(ymin = lcl, ymax = ucl), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray35") +
+  scale_x_continuous(breaks = seq(-20, 20, by = 4)) +
+  scale_color_manual(values = group_cols) +
+  scale_fill_manual(values = group_cols) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Overall Matched FI Trajectories Relative to Assigned Index Time",
+    x = "Years relative to assigned index time",
+    y = "Mean no-cancer frailty index",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme(legend.position = "bottom")
+
+overall_index_age_distribution <- matched_long %>%
+  filter(Analysis == "Overall Incident Cancer") %>%
+  mutate(
+    assignment_id = paste(match_set, id, role, sep = "__")
+  ) %>%
+  distinct(assignment_id, Group, index_age) %>%
+  filter(!is.na(index_age))
+
+overall_index_age_summary <- overall_index_age_distribution %>%
+  group_by(Group) %>%
+  summarize(
+    n_assignments = n(),
+    mean_index_age = mean(index_age),
+    sd_index_age = stats::sd(index_age),
+    median_index_age = stats::median(index_age),
+    q1_index_age = stats::quantile(index_age, 0.25),
+    q3_index_age = stats::quantile(index_age, 0.75),
+    min_index_age = min(index_age),
+    max_index_age = max(index_age),
+    .groups = "drop"
+  )
+
+p_overall_index_age <- ggplot(
+  overall_index_age_distribution,
+  aes(x = index_age, fill = Group, color = Group)
+) +
+  geom_density(alpha = 0.25, linewidth = 1) +
+  scale_fill_manual(values = group_cols) +
+  scale_color_manual(values = group_cols) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Overall Matched Assigned Index-Age Distribution",
+    x = "Assigned index age, years",
+    y = "Density",
+    fill = NULL,
+    color = NULL
+  ) +
+  theme(legend.position = "bottom")
+
+
+# -----------------------------------------------------------------------------
+# 9. Save outputs
+# -----------------------------------------------------------------------------
+
+write.csv(assignment_counts,
+          file.path(results_dir, "3.1_riskset_assignment_counts.csv"),
+          row.names = FALSE)
+write.csv(reuse_summary,
+          file.path(results_dir, "3.1_riskset_reuse_summary.csv"),
+          row.names = FALSE)
+write.csv(fi_observation_summary,
+          file.path(results_dir, "3.1_riskset_fi_observation_summary.csv"),
+          row.names = FALSE)
+write.csv(table1,
+          file.path(results_dir, "3.1_riskset_table1_cases_vs_controls.csv"),
+          row.names = FALSE)
+write.csv(table1_wide,
+          file.path(results_dir, "3.1_riskset_table1_cases_vs_controls_wide.csv"),
+          row.names = FALSE)
+write.csv(fi_by_time_bin,
+          file.path(results_dir, "3.1_riskset_mean_fi_by_relative_time_bin.csv"),
+          row.names = FALSE)
+write.csv(overall_matched_relative_fi,
+          file.path(results_dir, "3.1_overall_matched_fi_relative_to_index.csv"),
+          row.names = FALSE)
+write.csv(overall_index_age_summary,
+          file.path(results_dir, "3.1_overall_index_age_distribution.csv"),
+          row.names = FALSE)
+write.csv(overall_pre_glme_qc_gate,
+          file.path(results_dir, "3.1_overall_pre_glme_qc_gate.csv"),
+          row.names = FALSE)
+cat("\nDescriptive analysis complete.\n")
+cat("Assignment-level rows:", nrow(assignment_summary), "\n")
+cat("Saved visual-data tables to:", results_dir, "\n")
+```
+
+# Assignment Counts
+
+```{r assignment-counts, echo=FALSE}
+knitr::kable(assignment_counts)
+```
+
+# Control Reuse Summary
+
+```{r reuse-summary, echo=FALSE}
+knitr::kable(reuse_summary)
+```
+
+# FI Observation Support
+
+```{r fi-observation-summary, echo=FALSE}
+knitr::kable(fi_observation_summary)
+```
+
+# Overall Pre-GLME QC Gate
+
+The primary display censors a control's measurements at or after that control's
+own later cancer diagnosis. This does not resolve informative death or loss to
+follow-up; post-index estimates still require IPCW and joint-model sensitivity
+interpretation.
+
+```{r overall-pre-glme-qc, echo=FALSE}
+knitr::kable(overall_pre_glme_qc_gate)
+```
+
+# Table 1: Cases Versus Controls
+
+```{r table1-wide, echo=FALSE}
+knitr::kable(table1_wide)
+```
+
+# Mean FI by Relative-Time Bin
+
+```{r fi-by-time-bin-table, echo=FALSE}
+knitr::kable(fi_by_time_bin)
+```
+
+```{r crude-fi-by-time-bin-plot, echo=FALSE, fig.width=14, fig.height=10}
+p_fi
+```
+
+# Overall Matched FI Relative to Index Time
+
+```{r overall-relative-fi-table, echo=FALSE}
+knitr::kable(overall_matched_relative_fi)
+```
+
+```{r overall-relative-fi-plot, echo=FALSE, fig.width=8.5, fig.height=5.5}
+p_overall_matched_relative_fi
+```
+
+# Overall Assigned Index-Age Distribution
+
+```{r overall-index-age-table, echo=FALSE}
+knitr::kable(overall_index_age_summary)
+```
+
+```{r overall-index-age-plot, echo=FALSE, fig.width=8.5, fig.height=5.5}
+p_overall_index_age
+```
+
+# Output Inventory
+
+```{r output-inventory, echo=FALSE}
+outputs <- c(
+  "3.1_riskset_assignment_counts.csv",
+  "3.1_riskset_reuse_summary.csv",
+  "3.1_riskset_fi_observation_summary.csv",
+  "3.1_riskset_table1_cases_vs_controls.csv",
+  "3.1_riskset_table1_cases_vs_controls_wide.csv",
+  "3.1_riskset_mean_fi_by_relative_time_bin.csv",
+  "3.1_overall_matched_fi_relative_to_index.csv",
+  "3.1_overall_index_age_distribution.csv",
+  "3.1_overall_pre_glme_qc_gate.csv"
+)
+
+knitr::kable(
+  tibble::tibble(
+    output = outputs,
+    path = file.path(results_dir, outputs),
+    exists = file.exists(file.path(results_dir, outputs))
+  )
+)
+```
