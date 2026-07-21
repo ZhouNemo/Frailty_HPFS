@@ -1,0 +1,612 @@
+---
+title: "3.2 Pre-Design and Pre-Model Exploratory Analyses"
+author: "Nemo Zhou"
+date: "2026-07-18"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+<!--
+Project: Frailty Trajectories Before and After Incident Cancer in the
+         Health Professionals Follow-up Study
+Script:  3.2_exploratory_pre_design_model_eda.Rmd
+Author:  Nemo Zhou
+Date started:      2026-07-06
+Date last updated: 2026-07-18 (availability grid and attrition diagnostics added)
+
+Purpose:
+  Produces a pre-design and pre-model exploratory analysis report for the
+  overall incident cancer frailty trajectory question. The report builds a
+  cohort flow table, describes frailty-index availability and missingness by
+  4-year analytic cycle, compares baseline characteristics by eventual incident
+  cancer status, plots crude frailty trajectories by calendar cycle, plots FI
+  distributions by cycle, plots cancer-case frailty trajectories relative to
+  cancer diagnosis, and summarizes death/dropout patterns.
+
+Inputs:
+  Data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds
+    - Canonical longitudinal HPFS frailty-index dataset with cancer excluded
+      from the FI score and with cancer timing/covariate fields.
+
+Outputs:
+  Results/cancer/data/3.2_cohort_flow.csv
+  Results/cancer/data/3.2_fi_availability_by_cycle.csv
+  Results/cancer/data/3.2_fi_availability_by_cycle_and_eventual_cancer.csv
+  Results/cancer/data/3.2_baseline_characteristics_by_eventual_cancer.csv
+  Results/cancer/data/3.2_crude_fi_by_calendar_cycle.csv
+  Results/cancer/data/3.2_case_fi_relative_to_cancer.csv
+  Results/cancer/data/3.2_death_dropout_by_cycle.csv
+  Results/cancer/visuals/3.2_exploratory_pre_design_model_eda.html
+
+Notes:
+  The primary FI trajectory analyses use 4-year analytic cycles because some FI
+  components are measured every 4 years. This exploratory report therefore uses
+  cycles 1992, 1996, 2000, 2004, 2008, 2012, 2016, and 2020. Earlier 1986 and
+  1988 FI observations are excluded from this report, and 1992 is treated as the
+  descriptive baseline/reference cycle.
+-->
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+
+project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS"
+data_dir    <- file.path(project_dir, "Data")
+results_dir <- file.path(project_dir, "Results", "cancer", "data")
+
+raw_path <- file.path(data_dir, "FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
+
+if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+if (!file.exists(raw_path)) stop("Canonical FI dataset not found: ", raw_path)
+
+start_cycle <- "92"
+start_year <- 1992
+four_year_cycles <- c("92", "96", "00", "04", "08", "12", "16", "20")
+cycle_lookup <- tibble(
+  cycle = four_year_cycles,
+  cycle_year = c(1992, 1996, 2000, 2004, 2008, 2012, 2016, 2020)
+)
+
+theme_set(theme_minimal(base_size = 12))
+```
+
+```{r helpers}
+write_csv_base <- function(x, path) {
+  utils::write.csv(x, path, row.names = FALSE, na = "")
+  invisible(x)
+}
+
+first_nonmissing <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA else x[1]
+}
+
+mean_sd <- function(x, digits = 2) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  paste0(round(mean(x), digits), " (", round(stats::sd(x), digits), ")")
+}
+
+median_iqr <- function(x, digits = 2) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  q <- stats::quantile(x, probs = c(0.25, 0.5, 0.75), names = FALSE, na.rm = TRUE)
+  paste0(round(q[2], digits), " [", round(q[1], digits), ", ", round(q[3], digits), "]")
+}
+
+format_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+continuous_p <- function(x, group) {
+  keep <- !is.na(x) & !is.na(group)
+  x <- x[keep]
+  group <- droplevels(factor(group[keep]))
+  if (length(unique(group)) != 2 || length(x) < 3) return(NA_real_)
+  tryCatch(stats::t.test(x ~ group)$p.value, error = function(e) NA_real_)
+}
+
+categorical_p <- function(x, group) {
+  keep <- !is.na(x) & !is.na(group)
+  x <- factor(x[keep])
+  group <- droplevels(factor(group[keep]))
+  if (length(unique(group)) != 2 || nlevels(x) < 2) return(NA_real_)
+  tab <- table(x, group)
+  tryCatch({
+    if (any(tab < 5)) stats::fisher.test(tab)$p.value else stats::chisq.test(tab)$p.value
+  }, error = function(e) NA_real_)
+}
+
+summarize_continuous <- function(dat, var, label) {
+  p <- continuous_p(dat[[var]], dat$eventual_cancer_status)
+  dat %>%
+    group_by(eventual_cancer_status) %>%
+    summarize(
+      Statistic = mean_sd(.data[[var]]),
+      Median_IQR = median_iqr(.data[[var]]),
+      Missing = sum(is.na(.data[[var]])),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Variable = label,
+      Level = NA_character_,
+      P_Value = format_p(p)
+    ) %>%
+    select(Variable, Level, eventual_cancer_status, Statistic, Median_IQR, Missing, P_Value)
+}
+
+summarize_categorical <- function(dat, var, label) {
+  p <- categorical_p(dat[[var]], dat$eventual_cancer_status)
+  denom <- dat %>%
+    group_by(eventual_cancer_status) %>%
+    summarize(Denom = sum(!is.na(.data[[var]])), .groups = "drop")
+
+  dat %>%
+    filter(!is.na(.data[[var]])) %>%
+    count(eventual_cancer_status, Level = .data[[var]], name = "n") %>%
+    left_join(denom, by = "eventual_cancer_status") %>%
+    mutate(
+      Level = as.character(Level),
+      Statistic = paste0(n, " (", round(100 * n / Denom, 1), "%)"),
+      Median_IQR = NA_character_,
+      Missing = NA_integer_,
+      Variable = label,
+      P_Value = format_p(p)
+    ) %>%
+    select(Variable, Level, eventual_cancer_status, Statistic, Median_IQR, Missing, P_Value)
+}
+
+```
+
+# Load and Prepare Data
+
+```{r load-data}
+raw_fi <- readRDS(raw_path)
+
+required_raw_cols <- c(
+  "id", "cycle", "worked_rtmnyr", "rtmnyr86", "dbmy09", "fi_score_nocancer",
+  "frailty_cat_nocancer", "age_at_cycle", "age_at_cancer", "cancer_date",
+  "death_status", "dtdth"
+)
+missing_raw_cols <- setdiff(required_raw_cols, names(raw_fi))
+if (length(missing_raw_cols) > 0) {
+  stop("Canonical FI dataset is missing required columns: ",
+       paste(missing_raw_cols, collapse = ", "))
+}
+
+panel_4yr <- raw_fi %>%
+  mutate(
+    id = as.character(id),
+    cycle = as.character(cycle),
+    worked_rtmnyr = as.numeric(worked_rtmnyr),
+    rtmnyr86 = as.numeric(rtmnyr86),
+    dbmy09 = as.numeric(dbmy09),
+    cancer_date = as.numeric(cancer_date),
+    dtdth = as.numeric(dtdth),
+    fi_score_nocancer = as.numeric(fi_score_nocancer),
+    age_at_cycle = as.numeric(age_at_cycle),
+    age_at_cancer = as.numeric(age_at_cancer)
+  ) %>%
+  filter(cycle %in% four_year_cycles) %>%
+  left_join(cycle_lookup, by = "cycle")
+
+person_level <- panel_4yr %>%
+  group_by(id) %>%
+  summarize(
+    baseline_month = first_nonmissing(worked_rtmnyr[cycle == start_cycle]),
+    birth_month = first_nonmissing(dbmy09),
+    cancer_date = first_nonmissing(cancer_date),
+    age_at_cancer = first_nonmissing(age_at_cancer),
+    death_status = max(as.numeric(death_status), na.rm = TRUE),
+    dtdth = first_nonmissing(dtdth),
+    n_analytic_cycles = n_distinct(cycle),
+    n_fi_observed = sum(!is.na(fi_score_nocancer)),
+    has_baseline_row = any(cycle == start_cycle),
+    has_baseline_fi = any(cycle == start_cycle & !is.na(fi_score_nocancer)),
+    baseline_fi = first_nonmissing(fi_score_nocancer[cycle == start_cycle]),
+    baseline_age = first_nonmissing(age_at_cycle[cycle == start_cycle]),
+    baseline_frailty_cat = first_nonmissing(frailty_cat_nocancer[cycle == start_cycle]),
+    baseline_smoke = first_nonmissing(smoke[cycle == start_cycle]),
+    baseline_pckgr = first_nonmissing(pckgr[cycle == start_cycle]),
+    baseline_bmi = first_nonmissing(bmi[cycle == start_cycle]),
+    baseline_act = first_nonmissing(act[cycle == start_cycle]),
+    baseline_race = first_nonmissing(race),
+    baseline_marital = first_nonmissing(marital_status[cycle == start_cycle]),
+    baseline_living = first_nonmissing(base_living),
+    baseline_calor = first_nonmissing(base_calor),
+    baseline_alco = first_nonmissing(base_alco),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    death_status = if_else(is.infinite(death_status), NA_real_, death_status),
+    incident_cancer_after_baseline = !is.na(cancer_date) & !is.na(baseline_month) &
+      cancer_date > baseline_month,
+    prevalent_cancer_at_baseline = !is.na(cancer_date) & !is.na(baseline_month) &
+      cancer_date <= baseline_month,
+    eventual_cancer_status = if_else(
+      incident_cancer_after_baseline,
+      "Incident Cancer",
+      "No Incident Cancer"
+    ),
+    eventual_cancer_status = factor(
+      eventual_cancer_status,
+      levels = c("No Incident Cancer", "Incident Cancer")
+    ),
+    died = death_status == 1
+  )
+
+eligible_persons <- person_level %>%
+  filter(
+    has_baseline_row,
+    has_baseline_fi,
+    !prevalent_cancer_at_baseline,
+    n_fi_observed >= 2
+  )
+
+eligible_ids <- eligible_persons$id
+panel_eligible <- panel_4yr %>%
+  filter(id %in% eligible_ids) %>%
+  select(-any_of(c("eventual_cancer_status", "incident_cancer_after_baseline",
+                   "prevalent_cancer_at_baseline"))) %>%
+  left_join(
+    eligible_persons %>%
+      select(id, eventual_cancer_status, incident_cancer_after_baseline,
+             prevalent_cancer_at_baseline),
+    by = "id"
+  )
+```
+
+# Cohort Flow Table
+
+```{r cohort-flow}
+cohort_flow <- tibble(
+  Step = c(
+    "Participants in canonical longitudinal FI dataset",
+    "Participants with 1992 baseline row",
+    "Participants with nonmissing 1992 FI excluding cancer",
+    "Participants cancer-free at 1992 baseline",
+    "Participants with at least two observed 4-year-cycle FI scores"
+  ),
+  N = c(
+    n_distinct(person_level$id),
+    sum(person_level$has_baseline_row),
+    sum(person_level$has_baseline_row & person_level$has_baseline_fi),
+    sum(person_level$has_baseline_row & person_level$has_baseline_fi &
+          !person_level$prevalent_cancer_at_baseline),
+    nrow(eligible_persons)
+  )
+) %>%
+  mutate(
+    Removed_From_Previous = c(NA_integer_, -diff(N)),
+    Percent_Of_Initial = round(100 * N / first(N), 1)
+  )
+
+write_csv_base(cohort_flow, file.path(results_dir, "3.2_cohort_flow.csv"))
+kable(cohort_flow)
+```
+
+# FI Availability and Missingness by Cycle
+
+```{r fi-availability}
+availability_grid <- tidyr::expand_grid(
+  id = eligible_ids,
+  cycle_lookup
+) %>%
+  left_join(
+    eligible_persons %>% select(id, eventual_cancer_status),
+    by = "id"
+  ) %>%
+  left_join(
+    panel_eligible %>%
+      select(id, cycle, fi_score_nocancer, n_answered_nocancer),
+    by = c("id", "cycle")
+  )
+
+fi_availability <- availability_grid %>%
+  group_by(cycle, cycle_year) %>%
+  summarize(
+    n_eligible_participants = n_distinct(id),
+    n_source_rows = sum(!is.na(n_answered_nocancer) | !is.na(fi_score_nocancer)),
+    n_fi_observed = sum(!is.na(fi_score_nocancer)),
+    n_fi_not_observed = sum(is.na(fi_score_nocancer)),
+    percent_fi_not_observed = round(100 * n_fi_not_observed / n_eligible_participants, 2),
+    mean_n_answered = round(mean(n_answered_nocancer, na.rm = TRUE), 2),
+    median_n_answered = round(stats::median(n_answered_nocancer, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(cycle_year)
+
+write_csv_base(fi_availability, file.path(results_dir, "3.2_fi_availability_by_cycle.csv"))
+kable(fi_availability)
+
+fi_availability_by_group <- availability_grid %>%
+  group_by(eventual_cancer_status, cycle, cycle_year) %>%
+  summarize(
+    n_eligible_participants = n_distinct(id),
+    n_fi_observed = sum(!is.na(fi_score_nocancer)),
+    n_fi_not_observed = sum(is.na(fi_score_nocancer)),
+    percent_fi_not_observed = round(100 * n_fi_not_observed / n_eligible_participants, 2),
+    .groups = "drop"
+  ) %>%
+  arrange(eventual_cancer_status, cycle_year)
+write_csv_base(
+  fi_availability_by_group,
+  file.path(results_dir, "3.2_fi_availability_by_cycle_and_eventual_cancer.csv")
+)
+kable(fi_availability_by_group)
+
+fi_availability_plot <- ggplot(fi_availability, aes(x = cycle_year)) +
+  geom_col(aes(y = n_fi_observed), fill = "#3B6EA8", alpha = 0.85) +
+  geom_line(aes(y = n_fi_not_observed), color = "#B33A3A", linewidth = 1) +
+  geom_point(aes(y = n_fi_not_observed), color = "#B33A3A", size = 2) +
+  scale_x_continuous(breaks = fi_availability$cycle_year) +
+  labs(
+    x = "Questionnaire cycle",
+    y = "Eligible participants",
+    title = "FI availability and missingness by analytic cycle",
+    subtitle = "Denominator is the 1992-eligible cohort; red line shows FI not observed"
+  )
+
+fi_availability_plot
+
+```
+
+# Baseline Characteristics by Eventual Cancer Status
+
+```{r baseline-characteristics}
+baseline_continuous <- c(
+  baseline_age = "Age at baseline",
+  baseline_fi = "Baseline FI excluding cancer",
+  baseline_bmi = "BMI",
+  baseline_act = "Physical activity",
+  baseline_calor = "Total calories",
+  baseline_alco = "Alcohol intake",
+  age_at_cancer = "Age at cancer diagnosis"
+)
+
+baseline_categorical <- c(
+  baseline_frailty_cat = "Baseline frailty category",
+  baseline_smoke = "Smoking status",
+  baseline_pckgr = "Pack-year category",
+  baseline_race = "Race",
+  baseline_marital = "Marital status",
+  baseline_living = "Living arrangement",
+  died = "Died during follow-up"
+)
+
+baseline_table <- bind_rows(
+  lapply(names(baseline_continuous), function(v) {
+    summarize_continuous(eligible_persons, v, baseline_continuous[[v]])
+  }),
+  lapply(names(baseline_categorical), function(v) {
+    summarize_categorical(eligible_persons, v, baseline_categorical[[v]])
+  })
+)
+
+write_csv_base(
+  baseline_table,
+  file.path(results_dir, "3.2_baseline_characteristics_by_eventual_cancer.csv")
+)
+kable(head(baseline_table, 30))
+```
+
+# Crude FI Trajectories by Calendar Cycle
+
+```{r calendar-trajectories}
+calendar_fi <- panel_eligible %>%
+  group_by(eventual_cancer_status, cycle, cycle_year) %>%
+  summarize(
+    n = sum(!is.na(fi_score_nocancer)),
+    mean_fi = mean(fi_score_nocancer, na.rm = TRUE),
+    sd_fi = stats::sd(fi_score_nocancer, na.rm = TRUE),
+    se_fi = sd_fi / sqrt(n),
+    lcl = mean_fi - 1.96 * se_fi,
+    ucl = mean_fi + 1.96 * se_fi,
+    median_fi = stats::median(fi_score_nocancer, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(eventual_cancer_status, cycle_year)
+
+write_csv_base(calendar_fi, file.path(results_dir, "3.2_crude_fi_by_calendar_cycle.csv"))
+kable(calendar_fi)
+
+calendar_fi_plot <- ggplot(
+  calendar_fi,
+  aes(x = cycle_year, y = mean_fi, color = eventual_cancer_status, fill = eventual_cancer_status)
+) +
+  geom_ribbon(aes(ymin = lcl, ymax = ucl), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = calendar_fi$cycle_year) +
+  scale_color_manual(values = c("No Incident Cancer" = "#2F6F5E", "Incident Cancer" = "#A9483B")) +
+  scale_fill_manual(values = c("No Incident Cancer" = "#2F6F5E", "Incident Cancer" = "#A9483B")) +
+  labs(
+    x = "Questionnaire cycle",
+    y = "Mean FI excluding cancer",
+    color = NULL,
+    fill = NULL,
+    title = "Crude frailty trajectories by calendar cycle",
+    subtitle = "Grouped by eventual incident cancer status among participants cancer-free at baseline"
+  )
+
+calendar_fi_plot
+
+```
+
+# FI Distribution by Calendar Cycle
+
+```{r fi-distribution-boxplots}
+fi_distribution_boxplot <- panel_eligible %>%
+  filter(!is.na(fi_score_nocancer)) %>%
+  mutate(cycle_year = factor(cycle_year, levels = sort(unique(cycle_year)))) %>%
+  ggplot(aes(x = cycle_year, y = fi_score_nocancer, fill = eventual_cancer_status)) +
+  geom_boxplot(
+    outlier.alpha = 0.15,
+    outlier.size = 0.5,
+    width = 0.7,
+    position = position_dodge(width = 0.75)
+  ) +
+  scale_fill_manual(values = c("No Incident Cancer" = "#2F6F5E", "Incident Cancer" = "#A9483B")) +
+  labs(
+    x = "Questionnaire cycle",
+    y = "FI excluding cancer",
+    fill = NULL,
+    title = "FI distribution by 4-year analytic cycle",
+    subtitle = "Cycles begin in 1992; 1986 and 1988 FI observations are excluded"
+  ) +
+  theme(legend.position = "bottom")
+
+fi_distribution_boxplot
+
+```
+
+# FI Trajectories Aligned to Cancer Diagnosis
+
+```{r diagnosis-aligned-trajectories}
+case_relative_fi <- panel_eligible %>%
+  filter(eventual_cancer_status == "Incident Cancer", !is.na(years_to_cancer)) %>%
+  mutate(
+    rel_year_bin = round(years_to_cancer / 2) * 2
+  ) %>%
+  filter(rel_year_bin >= -20, rel_year_bin <= 20) %>%
+  group_by(rel_year_bin) %>%
+  summarize(
+    n = sum(!is.na(fi_score_nocancer)),
+    n_participants = n_distinct(id),
+    mean_fi = mean(fi_score_nocancer, na.rm = TRUE),
+    sd_fi = stats::sd(fi_score_nocancer, na.rm = TRUE),
+    se_fi = sd_fi / sqrt(n),
+    lcl = mean_fi - 1.96 * se_fi,
+    ucl = mean_fi + 1.96 * se_fi,
+    median_fi = stats::median(fi_score_nocancer, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(rel_year_bin)
+
+write_csv_base(case_relative_fi, file.path(results_dir, "3.2_case_fi_relative_to_cancer.csv"))
+kable(case_relative_fi)
+
+case_relative_plot <- ggplot(case_relative_fi, aes(x = rel_year_bin, y = mean_fi)) +
+  geom_ribbon(aes(ymin = lcl, ymax = ucl), fill = "#A9483B", alpha = 0.18) +
+  geom_line(color = "#A9483B", linewidth = 1) +
+  geom_point(color = "#A9483B", size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray35") +
+  scale_x_continuous(breaks = seq(-20, 20, by = 4)) +
+  labs(
+    x = "Years relative to cancer diagnosis",
+    y = "Mean FI excluding cancer",
+    title = "Crude FI trajectory among cancer cases",
+    subtitle = "Cycle observations rounded to nearest 2-year relative-time bin"
+  )
+
+case_relative_plot
+
+```
+
+# Death and Dropout Patterns by Cancer Status
+
+```{r death-dropout}
+last_observed <- panel_eligible %>%
+  group_by(id) %>%
+  summarize(
+    last_cycle_year = max(cycle_year, na.rm = TRUE),
+    last_cycle_month = max(worked_rtmnyr, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+death_dropout_panel <- panel_eligible %>%
+  left_join(last_observed, by = "id") %>%
+  mutate(
+    died_by_cycle = !is.na(dtdth) & !is.na(worked_rtmnyr) & dtdth <= worked_rtmnyr,
+    last_observed_this_cycle = cycle_year == last_cycle_year,
+    last_observed_alive_this_cycle = last_observed_this_cycle &
+      (is.na(dtdth) | dtdth > last_cycle_month),
+    last_observed_dead_this_cycle = last_observed_this_cycle &
+      !is.na(dtdth) & dtdth <= last_cycle_month
+  )
+
+death_dropout_by_cycle <- death_dropout_panel %>%
+  group_by(eventual_cancer_status, cycle, cycle_year) %>%
+  summarize(
+    n_observed = n_distinct(id),
+    n_died_by_cycle = n_distinct(id[died_by_cycle]),
+    percent_died_by_cycle = round(100 * n_died_by_cycle / n_observed, 2),
+    n_last_observed_here = n_distinct(id[last_observed_this_cycle]),
+    n_last_observed_alive_here = n_distinct(id[last_observed_alive_this_cycle]),
+    n_last_observed_dead_here = n_distinct(id[last_observed_dead_this_cycle]),
+    percent_last_observed_alive_here = round(100 * n_last_observed_alive_here / n_observed, 2),
+    .groups = "drop"
+  ) %>%
+  arrange(eventual_cancer_status, cycle_year)
+
+write_csv_base(death_dropout_by_cycle, file.path(results_dir, "3.2_death_dropout_by_cycle.csv"))
+kable(death_dropout_by_cycle)
+
+death_dropout_long <- death_dropout_by_cycle %>%
+  select(
+    eventual_cancer_status,
+    cycle_year,
+    percent_died_by_cycle,
+    percent_last_observed_alive_here
+  ) %>%
+  pivot_longer(
+    cols = starts_with("percent_"),
+    names_to = "metric",
+    values_to = "percent"
+  ) %>%
+  mutate(
+    metric = recode(
+      metric,
+      percent_died_by_cycle = "Died by cycle",
+      percent_last_observed_alive_here = "Last observed here while alive"
+    )
+  )
+
+death_dropout_plot <- ggplot(
+  death_dropout_long,
+  aes(x = cycle_year, y = percent, color = eventual_cancer_status)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_x_continuous(breaks = unique(death_dropout_long$cycle_year)) +
+  scale_color_manual(values = c("No Incident Cancer" = "#2F6F5E", "Incident Cancer" = "#A9483B")) +
+  labs(
+    x = "Questionnaire cycle",
+    y = "Percent",
+    color = NULL,
+    title = "Death and dropout patterns by eventual cancer status",
+    subtitle = "Dropout proxy is final observed FI cycle while alive"
+  )
+
+death_dropout_plot
+
+```
+
+# Output Inventory
+
+```{r output-inventory}
+outputs <- c(
+  "3.2_cohort_flow.csv",
+  "3.2_fi_availability_by_cycle.csv",
+  "3.2_fi_availability_by_cycle_and_eventual_cancer.csv",
+  "3.2_baseline_characteristics_by_eventual_cancer.csv",
+  "3.2_crude_fi_by_calendar_cycle.csv",
+  "3.2_case_fi_relative_to_cancer.csv",
+  "3.2_death_dropout_by_cycle.csv"
+)
+
+tibble(
+  output = outputs,
+  path = file.path(results_dir, outputs),
+  exists = file.exists(file.path(results_dir, outputs))
+) %>%
+  kable()
+```

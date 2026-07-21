@@ -1,0 +1,143 @@
+# =============================================================================
+# Project: Frailty Trajectories Before and After Incident Cancer in the
+#          Health Professionals Follow-up Study
+# Script:  6.0_quadratic_trajectory_functions.R
+# Author:  Nemo Zhou
+# Date started:      2026-06-29
+# Date last updated: 2026-06-29
+#
+# Purpose:
+#   Shared quadratic mixed-effects modeling utility for 6.2-6.5. These scripts
+#   now read prebuilt risk-set matched datasets from 2.1-2.4 and do not create
+#   or overwrite matching cohorts.
+# =============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(lme4)
+
+run_quadratic_trajectory_analysis <- function(matched_path,
+                                              results_dir,
+                                              analysis_title,
+                                              out_fig,
+                                              out_coef,
+                                              out_pred,
+                                              builder_script,
+                                              window_yrs = 20) {
+  needed_cols <- c("Cohort", "Group", "Age_Centered", "index_age_z",
+                   "base_race", "base_marital", "base_pckgr", "id",
+                   "match_set", "fi_score_nocancer")
+
+  if (!file.exists(matched_path)) {
+    stop("Matched dataset not found at ", matched_path, ". Run ", builder_script, " first.")
+  }
+
+  matched_long <- readRDS(matched_path)
+  missing_cols <- setdiff(needed_cols, names(matched_long))
+  if (length(missing_cols) > 0) {
+    stop("Matched dataset is missing required columns: ", paste(missing_cols, collapse = ", "))
+  }
+
+  matched_long <- matched_long %>%
+    mutate(
+      Cohort = droplevels(factor(Cohort)),
+      Group = factor(Group, levels = c("Control", "Cancer Case")),
+      id = factor(id),
+      match_set = factor(match_set),
+      Age_Centered2 = Age_Centered^2
+    )
+
+  cat("\nMatched analytic rows:", nrow(matched_long), "\n")
+  print(table(Cohort = matched_long$Cohort, Group = matched_long$Group))
+
+  fixed_rhs <- ~ Group * Age_Centered + Group * Age_Centered2 +
+    index_age_z + base_race + base_marital + base_pckgr
+
+  cohorts <- levels(matched_long$Cohort)
+  models <- list()
+
+  for (ch in cohorts) {
+    d <- matched_long %>% filter(Cohort == ch) %>% droplevels()
+    cat("\n======== Quadratic model:", ch, "========\n")
+    models[[ch]] <- lme4::lmer(
+      update(fixed_rhs, fi_score_nocancer ~ . + (1 + Age_Centered | id)),
+      data = d,
+      REML = TRUE,
+      control = lmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+    )
+    print(summary(models[[ch]]))
+  }
+
+  coef_tab <- bind_rows(lapply(cohorts, function(ch) {
+    cm <- summary(models[[ch]])$coefficients
+    data.frame(
+      Cohort = ch,
+      Term = rownames(cm),
+      Estimate = cm[, "Estimate"],
+      SE = cm[, "Std. Error"],
+      t_value = cm[, "t value"],
+      row.names = NULL,
+      check.names = FALSE
+    )
+  })) %>%
+    mutate(CI_low = Estimate - 1.96 * SE,
+           CI_high = Estimate + 1.96 * SE) %>%
+    select(Cohort, Term, Estimate, SE, CI_low, CI_high, t_value)
+  print(coef_tab)
+
+  pred_all <- bind_rows(lapply(cohorts, function(ch) {
+    d <- matched_long %>% filter(Cohort == ch) %>% droplevels()
+    m <- models[[ch]]
+    grid <- expand.grid(
+      Age_Centered = seq(-window_yrs, window_yrs, by = 0.1),
+      Group = factor(c("Control", "Cancer Case"), levels = c("Control", "Cancer Case"))
+    ) %>%
+      mutate(
+        Age_Centered2 = Age_Centered^2,
+        index_age_z = 0,
+        base_race = factor(levels(d$base_race)[1], levels = levels(d$base_race)),
+        base_marital = factor(levels(d$base_marital)[1], levels = levels(d$base_marital)),
+        base_pckgr = factor(levels(d$base_pckgr)[1], levels = levels(d$base_pckgr))
+      )
+    X <- model.matrix(fixed_rhs, data = grid)
+    X <- X[, names(fixef(m)), drop = FALSE]
+    V <- as.matrix(vcov(m))
+    pred <- as.vector(X %*% fixef(m))
+    se <- sqrt(rowSums((X %*% V) * X))
+    grid$pred <- pred
+    grid$lwr <- pred - 1.96 * se
+    grid$upr <- pred + 1.96 * se
+    grid$Cohort <- ch
+    grid
+  })) %>%
+    mutate(Cohort = factor(Cohort, levels = cohorts))
+
+  group_cols <- c("Control" = "#3182bd", "Cancer Case" = "#de2d26")
+
+  p_quad <- ggplot(pred_all, aes(x = Age_Centered, y = pred, color = Group, fill = Group)) +
+    geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.18, color = NA) +
+    geom_line(linewidth = 1.2) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black", alpha = 0.6) +
+    facet_wrap(~ Cohort) +
+    scale_color_manual(values = group_cols) +
+    scale_fill_manual(values = group_cols) +
+    theme_minimal(base_size = 14) +
+    labs(
+      title = analysis_title,
+      subtitle = "Quadratic marginal means with 95% CIs; risk-set cohorts generated by 2.x",
+      x = "Years relative to index",
+      y = "Predicted frailty index (no-cancer FI)",
+      color = NULL,
+      fill = NULL
+    ) +
+    theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
+    scale_x_continuous(breaks = seq(-window_yrs, window_yrs, by = 4))
+  print(p_quad)
+
+  ggsave(file.path(results_dir, out_fig), p_quad, width = 10, height = 5, dpi = 300)
+  write.csv(coef_tab, file.path(results_dir, out_coef), row.names = FALSE)
+  write.csv(pred_all[, c("Cohort", "Group", "Age_Centered", "pred", "lwr", "upr")],
+            file.path(results_dir, out_pred), row.names = FALSE)
+
+  invisible(list(models = models, coefficients = coef_tab, predictions = pred_all))
+}
