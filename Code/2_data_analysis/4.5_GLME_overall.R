@@ -4,7 +4,7 @@
 # Script:  4.5_GLME_overall.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-29
-# Date last updated: 2026-07-20 (removed quadratic model; renumbered spline models)
+# Date last updated: 2026-07-22 (removed obsolete overall HTML report rendering)
 #
 # Purpose:
 #   OVERALL primary time-bin GLME event-study analysis with the pre-specified
@@ -102,13 +102,3 @@ run_configuration <- list(
   persistent_png = FALSE
 )
 saveRDS(run_configuration, file.path(results_dir, "4.5_run_configuration.rds"))
-
-report_ok <- render_overall_glme_html_report(
-  results_dir = results_dir,
-  sensitivity_dir = sensitivity_dir,
-  visuals_dir = visuals_dir,
-  report_rmd = file.path(project_dir, "Code", "2_data_analysis", "4.5_GLME_overall_report.Rmd")
-)
-if (!isTRUE(report_ok)) {
-  stop("The required overall GLME HTML report was not rendered successfully.")
-}

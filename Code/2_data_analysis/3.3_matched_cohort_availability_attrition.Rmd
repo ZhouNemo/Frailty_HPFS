@@ -1,0 +1,947 @@
+---
+title: "3.3 Matched Cohort Availability, Frailty Distributions, and Attrition"
+author: "Nemo Zhou"
+date: "2026-07-27"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Results/cancer/visuals") })
+---
+
+<!--
+Project: Frailty Trajectories Before and After Incident Cancer in the
+         Health Professionals Follow-up Study
+Script:  3.3_matched_cohort_availability_attrition.Rmd
+Author:  Nemo Zhou
+Date started:      2026-07-27
+Date last updated: 2026-07-27 (separated death, later own-cancer,
+                   loss-to-follow-up, and administrative censoring)
+
+Purpose:
+  Descriptive report for the four primary risk-set matched cancer cohort
+  families:
+    1. High-burden and Low/Moderate-Burden cancer cohorts
+    2. Smoking-related cancer cohort
+    3. Obesity-related cancer cohort
+    4. Overall incident-cancer cohort
+
+  This report recreates the assignment-count and control-reuse definitions
+  reported by 3.1 from the current matched inputs, then combines them with
+  matched-assignment-level FI availability, FI distributions, and
+  distinct follow-up endpoint summaries. The availability and distribution
+  sections rebuild a complete matched-assignment x 4-year-cycle grid from the
+  canonical FI data, because the long matched RDS files retain observed FI
+  rows and therefore cannot by themselves describe FI non-observation.
+
+  Follow-up endpoints are summarized as mutually exclusive categories:
+  death before the administrative endpoint, later own-cancer censoring among
+  controls, loss to follow-up/nonresponse before 2020, and administrative
+  censoring with an observed 2020 FI. Endpoint timing is displayed relative to
+  assigned index age. Reused controls remain repeated assignments, consistent
+  with the risk-set design.
+
+Inputs:
+  Data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds
+  Data/riskset_matched_analysis_long.rds
+  Data/riskset_matched_smoking_long.rds
+  Data/riskset_matched_obesity_long.rds
+  Data/riskset_matched_overall_long.rds
+  The current matched RDS files are authoritative for the 3.1-style
+  assignment/reuse summaries; older 3.1 CSVs are not read because they may
+  predate a matched-input rebuild.
+
+Outputs:
+  Results/cancer/data/3.3_fi_availability_by_cycle.csv
+  Results/cancer/data/3.3_active_participants_vs_usable_fi.csv
+  Results/cancer/data/3.3_assignment_counts.csv
+  Results/cancer/data/3.3_reuse_summary.csv
+  Results/cancer/data/3.3_fi_distribution_by_cycle.csv
+  Results/cancer/data/3.3_fi_distribution_by_age_group.csv
+  Results/cancer/data/3.3_death_dropout_relative_to_index_age.csv
+  Results/cancer/data/3.3_attrition_event_summary.csv
+  Results/cancer/data/3.3_censoring_category_summary.csv
+  Results/cancer/data/3.3_censoring_category_by_relative_index_age.csv
+  Results/cancer/visuals/3.3_matched_cohort_availability_attrition.html
+
+Interpretation notes:
+  The FI availability and distribution summaries are assignment-level
+  summaries. Thus, a reused control contributes once per matched assignment.
+  Percentages are descriptive properties of the matched assignment design and
+  are not independent-person estimates. Controls' rows at or after a later
+  own-cancer diagnosis are excluded, matching the primary censoring rule used
+  in 3.1 and the downstream trajectory analyses.
+
+  The availability table reports broad FI non-observation among all analytic
+  assignments. The separate pre-matching plot compares all active participants
+  with participants having a valid overall FI score.
+
+  Age groups are <60, 60-69, 70-79, and 80+ years at the analytic FI cycle.
+  Censoring plots use -20 through +20 years relative to assigned index age,
+  matching the main descriptive relative-time support window; values beyond
+  20 years in either direction are not displayed in the cumulative plot.
+  Administrative censoring is not interpreted as loss to follow-up.
+-->
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = file.path(tempdir(), "3.3_matched_cohort_figures", "")
+)
+
+project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS"
+data_dir <- file.path(project_dir, "Data")
+results_dir <- file.path(project_dir, "Results", "cancer", "data")
+
+raw_path <- file.path(data_dir, "FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
+if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+
+matched_specs <- tibble::tribble(
+  ~Analysis, ~matched_path,
+  "High vs Low/Moderate Burden", file.path(data_dir, "riskset_matched_analysis_long.rds"),
+  "Smoking-Related Cancer",      file.path(data_dir, "riskset_matched_smoking_long.rds"),
+  "Obesity-Related Cancer",      file.path(data_dir, "riskset_matched_obesity_long.rds"),
+  "Overall Incident Cancer",     file.path(data_dir, "riskset_matched_overall_long.rds")
+)
+
+analytic_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
+cycle_lookup <- tibble(
+  cycle = analytic_cycles,
+  cycle_year = c(1988, 1992, 1996, 2000, 2004, 2008, 2012, 2016, 2020)
+)
+
+cohort_levels <- c(
+  "High Burden Cohort",
+  "Low/Moderate Burden Cohort",
+  "Smoking-Related Cancer Cohort",
+  "Obesity-Related Cancer Cohort",
+  "All Cancer Cohort"
+)
+
+group_levels <- c("Control", "Cancer Case")
+group_cols <- c("Control" = "#3182bd", "Cancer Case" = "#de2d26")
+censoring_category_levels <- c(
+  "Death before administrative end",
+  "Later own-cancer censoring",
+  "Loss to follow-up/nonresponse before 2020",
+  "Administrative censoring at 2020",
+  "No observed FI"
+)
+censoring_category_cols <- c(
+  "Death before administrative end" = "#7A0177",
+  "Later own-cancer censoring" = "#D95F0E",
+  "Loss to follow-up/nonresponse before 2020" = "#3182BD",
+  "Administrative censoring at 2020" = "#31A354",
+  "No observed FI" = "#969696"
+)
+theme_set(theme_minimal(base_size = 11))
+```
+
+```{r helpers}
+first_nonmissing <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA else x[1]
+}
+
+write_csv_base <- function(x, path) {
+  utils::write.csv(x, path, row.names = FALSE, na = "")
+  invisible(x)
+}
+
+read_matched <- function(analysis, path) {
+  if (!file.exists(path)) stop("Matched dataset not found for ", analysis, ": ", path)
+  dat <- readRDS(path)
+  required_cols <- c(
+    "id", "match_set", "trajectory_id", "role", "Cohort", "Group",
+    "index_date", "index_age", "post_own_cancer"
+  )
+  missing_cols <- setdiff(required_cols, names(dat))
+  if (length(missing_cols) > 0) {
+    stop(
+      "Matched dataset for ", analysis, " is missing required columns: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+
+  dat %>%
+    transmute(
+      Analysis = analysis,
+      id = as.character(id),
+      match_set = as.character(match_set),
+      trajectory_id = as.character(trajectory_id),
+      role = as.character(role),
+      Cohort = as.character(Cohort),
+      Group = as.character(Group),
+      index_date = as.numeric(index_date),
+      index_age = as.numeric(index_age),
+      post_own_cancer = as.logical(post_own_cancer)
+    )
+}
+
+age_group_levels <- c("<60", "60-69", "70-79", "80+")
+```
+
+# 3.1 Assignment Counts and Control Reuse
+
+The following tables reproduce the assignment-level definitions from `3.1_descriptive_riskset_cohorts.Rmd` using the current matched RDS inputs. This avoids mixing a rebuilt matched input with older saved 3.1 CSV summaries. The survival-stratified cohort is intentionally excluded.
+
+```{r load-31-summaries}
+matched_long <- bind_rows(lapply(seq_len(nrow(matched_specs)), function(i) {
+  read_matched(matched_specs$Analysis[i], matched_specs$matched_path[i])
+}))
+
+assignment_summary <- matched_long %>%
+  filter(!post_own_cancer) %>%
+  distinct(Analysis, Cohort, match_set, id, role, Group, index_date, index_age) %>%
+  mutate(
+    assignment_id = paste(Analysis, Cohort, match_set, id, role, sep = "__")
+  )
+
+assignment_counts <- assignment_summary %>%
+  group_by(Analysis, Cohort, Group) %>%
+  summarize(
+    n_assignments = n(),
+    n_distinct_persons = n_distinct(id),
+    n_match_sets = n_distinct(match_set),
+    mean_index_age = mean(index_age, na.rm = TRUE),
+    sd_index_age = stats::sd(index_age, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Analysis = factor(Analysis, levels = matched_specs$Analysis),
+    Cohort = factor(Cohort, levels = cohort_levels),
+    Group = factor(Group, levels = group_levels)
+  ) %>%
+  arrange(Analysis, Cohort, Group)
+
+reuse_summary <- assignment_summary %>%
+  group_by(Analysis, Cohort, Group, id) %>%
+  summarize(n_assignments_for_person = n(), .groups = "drop") %>%
+  group_by(Analysis, Cohort, Group) %>%
+  summarize(
+    n_persons = n(),
+    mean_assignments_per_person = mean(n_assignments_for_person),
+    max_assignments_per_person = max(n_assignments_for_person),
+    persons_reused_more_than_once = sum(n_assignments_for_person > 1),
+    pct_persons_reused_more_than_once = 100 * mean(n_assignments_for_person > 1),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Analysis = factor(Analysis, levels = matched_specs$Analysis),
+    Cohort = factor(Cohort, levels = cohort_levels),
+    Group = factor(Group, levels = group_levels)
+  ) %>%
+  arrange(Analysis, Cohort, Group)
+
+write_csv_base(assignment_counts,
+               file.path(results_dir, "3.3_assignment_counts.csv"))
+write_csv_base(reuse_summary,
+               file.path(results_dir, "3.3_reuse_summary.csv"))
+
+assignment_counts_display <- assignment_counts %>%
+  group_by(Analysis, Cohort) %>%
+  mutate(
+    `Assignments, n (%)` = paste0(
+      n_assignments, " (", round(100 * n_assignments / sum(n_assignments), 1), "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  transmute(
+    Analysis, Cohort, Group,
+    `Assignments, n (%)`,
+    `Distinct persons, n` = n_distinct_persons,
+    `Match sets, n` = n_match_sets,
+    `Mean index age` = round(mean_index_age, 1),
+    `SD index age` = round(sd_index_age, 1)
+  )
+
+knitr::kable(assignment_counts_display, digits = 2)
+```
+
+```{r reuse-table, echo=FALSE}
+reuse_summary_display <- reuse_summary %>%
+  transmute(
+    Analysis, Cohort, Group,
+    `Persons, n` = n_persons,
+    `Mean assignments per person` = round(mean_assignments_per_person, 2),
+    `Maximum assignments per person` = max_assignments_per_person,
+    `Reused >1 assignment, n (%)` = paste0(
+      persons_reused_more_than_once, " (",
+      round(pct_persons_reused_more_than_once, 1), "%)"
+    )
+  )
+
+knitr::kable(reuse_summary_display, digits = 2)
+```
+
+# Construct the Matched Assignment-by-Cycle Panel
+
+The matched RDS files are used only as existing analytic inputs; this report does not rebuild any risk sets. A complete 1988-2020 four-year cycle grid is created by joining each distinct matched assignment to the canonical FI data. This is necessary to count FI non-observation after participants stop contributing observed FI values.
+
+```{r load-and-construct-panel}
+assignment_meta <- matched_long %>%
+  filter(!post_own_cancer) %>%
+  distinct(Analysis, Cohort, match_set, id, role, Group, index_date, index_age) %>%
+  mutate(
+    Cohort = factor(Cohort, levels = cohort_levels),
+    Group = factor(Group, levels = group_levels),
+    assignment_id = paste(Analysis, Cohort, match_set, id, role, sep = "__")
+  )
+
+if (!file.exists(raw_path)) stop("Canonical FI dataset not found: ", raw_path)
+raw_fi <- readRDS(raw_path)
+
+required_raw_cols <- c(
+  "id", "cycle", "participated", "worked_rtmnyr", "dbmy09", "fi_score_nocancer",
+  "n_answered_nocancer", "age_at_cycle", "cancer_index_dateca", "dtdth",
+  "age_at_death", "death_status"
+)
+missing_raw_cols <- setdiff(required_raw_cols, names(raw_fi))
+if (length(missing_raw_cols) > 0) {
+  stop("Canonical FI dataset is missing required columns: ",
+       paste(missing_raw_cols, collapse = ", "))
+}
+
+raw_4yr <- raw_fi %>%
+  mutate(
+    id = as.character(id),
+    cycle = as.character(cycle),
+    participated = as.numeric(participated),
+    worked_rtmnyr = as.numeric(worked_rtmnyr),
+    dbmy09 = as.numeric(dbmy09),
+    fi_score_nocancer = as.numeric(fi_score_nocancer),
+    n_answered_nocancer = as.numeric(n_answered_nocancer),
+    age_at_cycle = as.numeric(age_at_cycle),
+    dtdth = as.numeric(dtdth)
+  ) %>%
+  filter(cycle %in% analytic_cycles) %>%
+  distinct(id, cycle, .keep_all = TRUE) %>%
+  select(
+    id, cycle, participated, worked_rtmnyr, dbmy09, fi_score_nocancer,
+    n_answered_nocancer, age_at_cycle, dtdth
+  )
+
+participant_cancer <- raw_fi %>%
+  transmute(
+    id = as.character(id),
+    own_cancer_month = as.numeric(cancer_index_dateca)
+  ) %>%
+  group_by(id) %>%
+  summarize(
+    own_cancer_month = first_nonmissing(own_cancer_month),
+    .groups = "drop"
+  )
+
+cycle_timing <- raw_fi %>%
+  transmute(
+    cycle = as.character(cycle),
+    participated = as.numeric(participated),
+    worked_rtmnyr = as.numeric(worked_rtmnyr)
+  ) %>%
+  filter(cycle %in% analytic_cycles, participated == 1, !is.na(worked_rtmnyr)) %>%
+  group_by(cycle) %>%
+  summarize(cycle_end_month = max(worked_rtmnyr), .groups = "drop")
+
+cycle_lookup <- cycle_lookup %>%
+  left_join(cycle_timing, by = "cycle")
+
+if (anyNA(cycle_lookup$cycle_end_month)) {
+  stop("At least one analytic cycle lacks a valid administrative end month.")
+}
+administrative_end_year <- max(cycle_lookup$cycle_year)
+administrative_end_month <- max(cycle_lookup$cycle_end_month)
+
+matched_assignment_panel <- assignment_meta %>%
+  tidyr::crossing(cycle_lookup) %>%
+  left_join(raw_4yr, by = c("id", "cycle")) %>%
+  left_join(participant_cancer, by = "id") %>%
+  mutate(
+    cycle_year = as.numeric(cycle_year),
+    Age_Centered = age_at_cycle - index_age,
+    analytic_time_month = coalesce(worked_rtmnyr, cycle_end_month),
+    post_own_cancer = as.character(Group) == "Control" &
+      !is.na(own_cancer_month) & !is.na(index_date) &
+      own_cancer_month > index_date &
+      analytic_time_month >= own_cancer_month,
+    analytic_row = !post_own_cancer,
+    source_row = analytic_row & !is.na(participated) & participated == 1,
+    age_group = cut(
+      age_at_cycle,
+      breaks = c(-Inf, 60, 70, 80, Inf),
+      right = FALSE,
+      labels = age_group_levels
+    )
+  )
+
+if (anyDuplicated(matched_assignment_panel[c("assignment_id", "cycle")])) {
+  stop("The reconstructed panel has duplicate assignment-by-cycle rows.")
+}
+
+censoring_reentry <- matched_assignment_panel %>%
+  filter(as.character(Group) == "Control") %>%
+  arrange(Analysis, Cohort, assignment_id, cycle_year) %>%
+  group_by(Analysis, Cohort, assignment_id) %>%
+  summarize(
+    post_cancer_reentry = any(diff(as.integer(post_own_cancer)) < 0),
+    .groups = "drop"
+  )
+
+if (any(censoring_reentry$post_cancer_reentry)) {
+  stop("Later own-cancer censoring is not absorbing for at least one control assignment.")
+}
+```
+
+# FI Availability and Missingness by Analytic Cycle
+
+The denominator for `FI not observed` is the number of non-censored matched assignments represented at that cycle. It includes assignments with an observed FI score, a missing FI score, or no usable cycle-level source row. Therefore, the percentage measures non-observation among all analytic assignments, not missingness among respondents only. The separate pre-matching plot below compares all participants who participated in the cycle (`participated == 1`) with those having a valid overall FI score. Missing individual FI components do not count as unusable FI when the overall score is still calculable.
+
+```{r fi-availability}
+fi_availability <- matched_assignment_panel %>%
+  group_by(Analysis, Cohort, Group, cycle, cycle_year) %>%
+  summarize(
+    n_assignments_at_cycle = sum(analytic_row),
+    n_distinct_persons_at_cycle = n_distinct(id[analytic_row]),
+    n_no_source_rows = sum(analytic_row & !source_row),
+    n_fi_observed = sum(source_row & !is.na(fi_score_nocancer)),
+    n_fi_not_observed = sum(analytic_row & is.na(fi_score_nocancer)),
+    percent_fi_not_observed = if_else(
+      n_assignments_at_cycle > 0,
+      100 * n_fi_not_observed / n_assignments_at_cycle,
+      NA_real_
+    ),
+    median_n_answered = stats::median(n_answered_nocancer[source_row], na.rm = TRUE),
+    q1_n_answered = stats::quantile(
+      n_answered_nocancer[source_row], 0.25, na.rm = TRUE, names = FALSE
+    ),
+    q3_n_answered = stats::quantile(
+      n_answered_nocancer[source_row], 0.75, na.rm = TRUE, names = FALSE
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    median_n_answered = if_else(is.nan(median_n_answered), NA_real_, median_n_answered),
+    q1_n_answered = if_else(is.nan(q1_n_answered), NA_real_, q1_n_answered),
+    q3_n_answered = if_else(is.nan(q3_n_answered), NA_real_, q3_n_answered)
+  ) %>%
+  arrange(Analysis, Cohort, Group, cycle_year)
+
+write_csv_base(fi_availability,
+               file.path(results_dir, "3.3_fi_availability_by_cycle.csv"))
+
+fi_availability_display <- fi_availability %>%
+  mutate(
+    `No source row, n (%)` = paste0(
+      n_no_source_rows, " (", round(100 * n_no_source_rows / n_assignments_at_cycle, 1), "%)"
+    ),
+    `FI observed, n (%)` = paste0(
+      n_fi_observed, " (", round(100 * n_fi_observed / n_assignments_at_cycle, 1), "%)"
+    ),
+    `FI not observed, n (%)` = paste0(
+      n_fi_not_observed, " (", round(100 * n_fi_not_observed / n_assignments_at_cycle, 1), "%)"
+    ),
+    `Median n FI items reported (IQR)` = paste0(
+      round(median_n_answered, 1), " (", round(q1_n_answered, 1), "-", round(q3_n_answered, 1), ")"
+    )
+  ) %>%
+  select(
+    Analysis, Cohort, Group, cycle_year,
+    `No source row, n (%)`,
+    `FI observed, n (%)`, `FI not observed, n (%)`,
+    `Median n FI items reported (IQR)`
+  )
+
+knitr::kable(fi_availability_display, digits = 2)
+```
+
+```{r active-participants-vs-usable-fi, echo=FALSE, fig.width=9, fig.height=5.5}
+active_participants_vs_usable_fi <- raw_fi %>%
+  mutate(
+    id = as.character(id),
+    cycle = as.character(cycle),
+    participated = as.numeric(participated),
+    fi_score_nocancer = as.numeric(fi_score_nocancer)
+  ) %>%
+  filter(cycle %in% analytic_cycles) %>%
+  distinct(id, cycle, .keep_all = TRUE) %>%
+  left_join(cycle_lookup, by = "cycle") %>%
+  group_by(cycle, cycle_year) %>%
+  summarize(
+    n_total_active_participants = n_distinct(id[participated == 1]),
+    n_valid_fi_score = n_distinct(id[participated == 1 & !is.na(fi_score_nocancer)]),
+    .groups = "drop"
+  ) %>%
+  arrange(cycle_year)
+
+write_csv_base(
+  active_participants_vs_usable_fi,
+  file.path(results_dir, "3.3_active_participants_vs_usable_fi.csv")
+)
+
+active_participants_vs_usable_fi_long <- active_participants_vs_usable_fi %>%
+  tidyr::pivot_longer(
+    cols = c(n_total_active_participants, n_valid_fi_score),
+    names_to = "measure",
+    values_to = "count"
+  ) %>%
+  mutate(
+    measure = recode(
+      measure,
+      n_total_active_participants = "Total Active Participants",
+      n_valid_fi_score = "Valid FI Score"
+    ),
+    measure = factor(
+      measure,
+      levels = c("Total Active Participants", "Valid FI Score")
+    )
+  )
+
+active_participants_vs_usable_fi_labels <- active_participants_vs_usable_fi_long %>%
+  mutate(
+    label_x = cycle_year + if_else(
+      measure == "Total Active Participants", -0.28, 0.28
+    ),
+    label_hjust = if_else(
+      measure == "Total Active Participants", 1, 0
+    )
+  )
+
+active_participants_plot <- ggplot(
+  active_participants_vs_usable_fi_long,
+  aes(x = cycle_year, y = count, fill = measure)
+) +
+  geom_col(position = position_dodge(width = 0.9), width = 0.42) +
+  geom_text(
+    data = active_participants_vs_usable_fi_labels,
+    aes(
+      x = label_x,
+      y = count,
+      label = format(count, big.mark = ",", trim = TRUE),
+      hjust = label_hjust
+    ),
+    inherit.aes = FALSE,
+    vjust = -0.25,
+    size = 2.8,
+    fontface = "bold"
+  ) +
+  scale_x_continuous(breaks = active_participants_vs_usable_fi$cycle_year) +
+  scale_fill_manual(
+    values = c("Total Active Participants" = "#4C78A8", "Valid FI Score" = "#E45756")
+  ) +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Active Participants vs. Usable Frailty Data",
+    subtitle = "Four-year analytic cycles; valid FI score means non-missing overall FI excluding cancer",
+    x = "Study year",
+    y = "Count",
+    fill = NULL
+  ) +
+  theme(legend.position = "top")
+active_participants_plot
+```
+
+# FI Distribution by Four-Year Analytic Cycle
+
+```{r fi-cycle-distribution}
+observed_fi_panel <- matched_assignment_panel %>%
+  filter(analytic_row, !is.na(fi_score_nocancer)) %>%
+  mutate(
+    Cohort = factor(Cohort, levels = cohort_levels),
+    Group = factor(Group, levels = group_levels)
+  )
+
+fi_distribution_by_cycle <- observed_fi_panel %>%
+  group_by(Analysis, Cohort, Group, cycle, cycle_year) %>%
+  summarize(
+    n_observations = n(),
+    n_assignments = n_distinct(assignment_id),
+    n_distinct_persons = n_distinct(id),
+    mean_fi = mean(fi_score_nocancer),
+    sd_fi = stats::sd(fi_score_nocancer),
+    median_fi = stats::median(fi_score_nocancer),
+    q1_fi = stats::quantile(fi_score_nocancer, 0.25, names = FALSE),
+    q3_fi = stats::quantile(fi_score_nocancer, 0.75, names = FALSE),
+    .groups = "drop"
+  ) %>%
+  arrange(Analysis, Cohort, Group, cycle_year)
+
+write_csv_base(fi_distribution_by_cycle,
+               file.path(results_dir, "3.3_fi_distribution_by_cycle.csv"))
+```
+
+```{r fi-cycle-boxplot, echo=FALSE, fig.width=13, fig.height=12}
+fi_cycle_boxplot <- observed_fi_panel %>%
+  mutate(cycle_year_factor = factor(cycle_year, levels = unique(cycle_lookup$cycle_year))) %>%
+  ggplot(aes(x = cycle_year_factor, y = fi_score_nocancer, fill = Group)) +
+  geom_boxplot(outlier.alpha = 0.08, outlier.size = 0.35, width = 0.75,
+               position = position_dodge(width = 0.8)) +
+  facet_wrap(~ Cohort, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = group_cols) +
+  labs(
+    title = "FI distribution by four-year analytic cycle",
+    x = "Analytic cycle year",
+    y = "FI excluding cancer",
+    fill = NULL
+  ) +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+fi_cycle_boxplot
+```
+
+# FI Distribution by Age Group
+
+Age groups are defined using age at the analytic FI cycle, not assigned index age.
+
+```{r fi-age-distribution}
+fi_distribution_by_age_group <- observed_fi_panel %>%
+  filter(!is.na(age_group)) %>%
+  group_by(Analysis, Cohort, Group, age_group) %>%
+  summarize(
+    n_observations = n(),
+    n_assignments = n_distinct(assignment_id),
+    n_distinct_persons = n_distinct(id),
+    mean_fi = mean(fi_score_nocancer),
+    sd_fi = stats::sd(fi_score_nocancer),
+    median_fi = stats::median(fi_score_nocancer),
+    q1_fi = stats::quantile(fi_score_nocancer, 0.25, names = FALSE),
+    q3_fi = stats::quantile(fi_score_nocancer, 0.75, names = FALSE),
+    .groups = "drop"
+  ) %>%
+  arrange(Analysis, Cohort, Group, age_group)
+
+write_csv_base(fi_distribution_by_age_group,
+               file.path(results_dir, "3.3_fi_distribution_by_age_group.csv"))
+```
+
+```{r fi-age-boxplot, echo=FALSE, fig.width=13, fig.height=12}
+fi_age_boxplot <- observed_fi_panel %>%
+  filter(!is.na(age_group)) %>%
+  mutate(age_group = factor(age_group, levels = age_group_levels)) %>%
+  ggplot(aes(x = age_group, y = fi_score_nocancer, fill = Group)) +
+  geom_boxplot(outlier.alpha = 0.08, outlier.size = 0.35, width = 0.75,
+               position = position_dodge(width = 0.8)) +
+  facet_wrap(~ Cohort, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = group_cols) +
+  labs(
+    title = "FI distribution by age group",
+    x = "Age at analytic FI cycle, years",
+    y = "FI excluding cancer",
+    fill = NULL
+  ) +
+  theme(legend.position = "bottom")
+fi_age_boxplot
+```
+
+# Distinct Censoring Categories Relative to Assigned Index Age
+
+Each matched assignment is placed in exactly one follow-up endpoint category.
+Death and a control's later own cancer are ordered by their recorded month, so
+the earlier event determines the category. Among assignments without either
+event before the administrative endpoint, an observed 2020 FI is administrative
+censoring; an earlier final FI is classified as loss to follow-up/nonresponse.
+Administrative censoring is therefore not counted as dropout. These categories
+describe the analytic follow-up endpoint and should not be interpreted as
+causal reasons for questionnaire nonresponse.
+
+```{r censoring-categories}
+participant_death <- raw_fi %>%
+  mutate(
+    id = as.character(id),
+    dbmy09 = as.numeric(dbmy09),
+    dtdth = as.numeric(dtdth),
+    age_at_death = as.numeric(age_at_death),
+    death_status = as.numeric(death_status)
+  ) %>%
+  group_by(id) %>%
+  summarize(
+    birth_month = first_nonmissing(dbmy09),
+    death_month = first_nonmissing(dtdth),
+    age_at_death = first_nonmissing(age_at_death),
+    death_status = max(death_status, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    death_status = if_else(is.infinite(death_status), NA_real_, death_status),
+    death_month = if_else(
+      is.na(death_month) & !is.na(age_at_death) & !is.na(birth_month),
+      birth_month + 12 * age_at_death,
+      death_month
+    ),
+    age_at_death = if_else(
+      is.na(age_at_death) & !is.na(death_month) & !is.na(birth_month),
+      (death_month - birth_month) / 12,
+      age_at_death
+    )
+  )
+
+assignment_history <- matched_assignment_panel %>%
+  filter(analytic_row) %>%
+  group_by(Analysis, Cohort, Group, assignment_id, id, index_date, index_age) %>%
+  summarize(
+    last_observed_age = if (any(!is.na(fi_score_nocancer))) {
+      max(age_at_cycle[!is.na(fi_score_nocancer)], na.rm = TRUE)
+    } else NA_real_,
+    last_observed_month = if (any(!is.na(fi_score_nocancer) &
+                                  !is.na(worked_rtmnyr))) {
+      max(worked_rtmnyr[!is.na(fi_score_nocancer) &
+                         !is.na(worked_rtmnyr)], na.rm = TRUE)
+    } else NA_real_,
+    last_observed_cycle_year = if (any(!is.na(fi_score_nocancer))) {
+      max(cycle_year[!is.na(fi_score_nocancer)], na.rm = TRUE)
+    } else NA_real_,
+    own_cancer_month = first_nonmissing(own_cancer_month),
+    .groups = "drop"
+  ) %>%
+  left_join(participant_death, by = "id") %>%
+  mutate(
+    death_relative_index_age = coalesce(
+      (death_month - index_date) / 12,
+      age_at_death - index_age
+    ),
+    own_cancer_relative_index_age = (own_cancer_month - index_date) / 12,
+    last_observed_relative_index_age = last_observed_age - index_age,
+    later_own_cancer = as.character(Group) == "Control" &
+      !is.na(own_cancer_month) & own_cancer_month > index_date,
+    death_before_administrative_end = !is.na(death_month) &
+      death_month <= administrative_end_month,
+    own_cancer_before_administrative_end = later_own_cancer &
+      own_cancer_month <= administrative_end_month,
+    death_is_first_event = death_before_administrative_end &
+      (!own_cancer_before_administrative_end |
+       death_month <= own_cancer_month),
+    own_cancer_is_first_event = own_cancer_before_administrative_end &
+      (!death_before_administrative_end |
+       own_cancer_month < death_month),
+    censoring_category = case_when(
+      death_is_first_event ~ "Death before administrative end",
+      own_cancer_is_first_event ~ "Later own-cancer censoring",
+      is.na(last_observed_relative_index_age) ~ "No observed FI",
+      last_observed_cycle_year >= administrative_end_year ~
+        "Administrative censoring at 2020",
+      TRUE ~ "Loss to follow-up/nonresponse before 2020"
+    ),
+    censoring_category = factor(
+      censoring_category,
+      levels = censoring_category_levels
+    ),
+    censoring_relative_index_age = case_when(
+      death_is_first_event ~ death_relative_index_age,
+      own_cancer_is_first_event ~ own_cancer_relative_index_age,
+      TRUE ~ last_observed_relative_index_age
+    )
+  )
+
+if (anyNA(assignment_history$censoring_category)) {
+  stop("At least one assignment lacks a censoring category.")
+}
+if (any(
+  assignment_history$censoring_category == "Administrative censoring at 2020" &
+    assignment_history$last_observed_cycle_year != administrative_end_year
+)) {
+  stop("Administrative censoring was assigned without an observed 2020 FI.")
+}
+
+censoring_category_summary <- assignment_history %>%
+  count(Analysis, Cohort, Group, censoring_category, name = "n_assignments") %>%
+  group_by(Analysis, Cohort, Group) %>%
+  mutate(
+    n_total_assignments = sum(n_assignments),
+    percent_assignments = 100 * n_assignments / n_total_assignments,
+    administrative_end_year = administrative_end_year,
+    administrative_end_month = administrative_end_month
+  ) %>%
+  ungroup() %>%
+  arrange(Analysis, Cohort, Group, censoring_category)
+
+category_reconciliation <- censoring_category_summary %>%
+  group_by(Analysis, Cohort, Group) %>%
+  summarize(
+    n_categories_total = sum(n_assignments),
+    n_expected = first(n_total_assignments),
+    .groups = "drop"
+  )
+if (any(category_reconciliation$n_categories_total !=
+        category_reconciliation$n_expected)) {
+  stop("Censoring categories do not reconcile to the assignment denominator.")
+}
+
+relative_age_grid <- tibble(relative_index_age = seq(-20, 20, by = 2))
+
+censoring_category_relative <- tidyr::crossing(
+  assignment_history %>%
+    select(
+      Analysis, Cohort, Group, assignment_id, censoring_category,
+      censoring_relative_index_age
+    ),
+  relative_age_grid
+) %>%
+  group_by(Analysis, Cohort, Group, censoring_category, relative_index_age) %>%
+  summarize(
+    n_category_assignments = n(),
+    n_category_endpoints_by_relative_age = sum(
+      !is.na(censoring_relative_index_age) &
+        censoring_relative_index_age <= relative_index_age
+    ),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    censoring_category_summary %>%
+      distinct(Analysis, Cohort, Group, n_total_assignments),
+    by = c("Analysis", "Cohort", "Group")
+  ) %>%
+  mutate(
+    percent_all_assignments_by_relative_age =
+      100 * n_category_endpoints_by_relative_age / n_total_assignments
+  ) %>%
+  arrange(Analysis, Cohort, Group, censoring_category, relative_index_age)
+
+death_dropout_relative <- tidyr::crossing(
+  assignment_history %>%
+    select(
+      Analysis, Cohort, Group, assignment_id, censoring_category,
+      censoring_relative_index_age
+    ),
+  relative_age_grid
+) %>%
+  group_by(Analysis, Cohort, Group, relative_index_age) %>%
+  summarize(
+    n_assignments = n(),
+    n_death_ages_observed = sum(
+      censoring_category == "Death before administrative end" &
+        !is.na(censoring_relative_index_age)
+    ),
+    n_died_by_relative_age = sum(
+      censoring_category == "Death before administrative end" &
+        !is.na(censoring_relative_index_age) &
+        censoring_relative_index_age <= relative_index_age
+    ),
+    n_dropout_ages_observed = sum(
+      censoring_category == "Loss to follow-up/nonresponse before 2020" &
+        !is.na(censoring_relative_index_age)
+    ),
+    n_dropout_by_relative_age = sum(
+      censoring_category == "Loss to follow-up/nonresponse before 2020" &
+        !is.na(censoring_relative_index_age) &
+        censoring_relative_index_age <= relative_index_age
+    ),
+    percent_died_by_relative_age =
+      100 * n_died_by_relative_age / n_assignments,
+    percent_dropout_by_relative_age =
+      100 * n_dropout_by_relative_age / n_assignments,
+    .groups = "drop"
+  )
+
+attrition_event_summary <- censoring_category_summary %>%
+  select(
+    Analysis, Cohort, Group, censoring_category,
+    n_assignments, percent_assignments
+  ) %>%
+  pivot_wider(
+    names_from = censoring_category,
+    values_from = c(n_assignments, percent_assignments),
+    values_fill = 0,
+    names_glue = "{.value}__{censoring_category}"
+  )
+
+write_csv_base(
+  death_dropout_relative,
+  file.path(results_dir, "3.3_death_dropout_relative_to_index_age.csv")
+)
+write_csv_base(
+  attrition_event_summary,
+  file.path(results_dir, "3.3_attrition_event_summary.csv")
+)
+write_csv_base(
+  censoring_category_summary,
+  file.path(results_dir, "3.3_censoring_category_summary.csv")
+)
+write_csv_base(
+  censoring_category_relative,
+  file.path(results_dir, "3.3_censoring_category_by_relative_index_age.csv")
+)
+
+censoring_category_summary_display <- censoring_category_summary %>%
+  transmute(
+    Analysis, Cohort, Group, `Endpoint category` = censoring_category,
+    `Assignments, n (%)` = paste0(
+      n_assignments, " (", round(percent_assignments, 1), "%)"
+    )
+  )
+
+knitr::kable(censoring_category_summary_display, digits = 2)
+```
+
+```{r censoring-category-distribution-plot, echo=FALSE, fig.width=13, fig.height=10}
+censoring_category_distribution_plot <- ggplot(
+  censoring_category_summary,
+  aes(x = Group, y = percent_assignments, fill = censoring_category)
+) +
+  geom_col(width = 0.72) +
+  geom_text(
+    aes(label = if_else(percent_assignments >= 4,
+                        paste0(round(percent_assignments, 1), "%"), "")),
+    position = position_stack(vjust = 0.5),
+    size = 2.7,
+    color = "white",
+    fontface = "bold"
+  ) +
+  facet_wrap(~ Cohort, ncol = 2) +
+  scale_fill_manual(values = censoring_category_cols, drop = TRUE) +
+  scale_y_continuous(
+    breaks = seq(0, 100, by = 20),
+    limits = c(0, 100),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(
+    title = "Mutually exclusive follow-up endpoint categories",
+    subtitle = "Administrative censoring at 2020 is separated from loss to follow-up/nonresponse",
+    x = NULL,
+    y = "Assignments (%)",
+    fill = "Endpoint category"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 9),
+    axis.text.x = element_text(angle = 20, hjust = 1)
+  )
+censoring_category_distribution_plot
+```
+
+```{r censoring-category-relative-time-plot, echo=FALSE, fig.width=14, fig.height=14}
+censoring_category_relative_plot <- censoring_category_relative %>%
+  filter(censoring_category != "No observed FI") %>%
+  ggplot(
+    aes(
+      x = relative_index_age,
+      y = percent_all_assignments_by_relative_age,
+      color = Group
+    )
+  ) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey45") +
+  facet_grid(censoring_category ~ Cohort, scales = "free_y") +
+  scale_x_continuous(breaks = seq(-20, 20, by = 4)) +
+  scale_color_manual(values = group_cols) +
+  labs(
+    title = "Timing of follow-up endpoints relative to assigned index age",
+    subtitle = "Curves are cumulative percentages of all matched assignments within each cohort and group",
+    x = "Years relative to assigned index age",
+    y = "Assignments with endpoint by time (%)",
+    color = NULL
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 7.5)
+  )
+censoring_category_relative_plot
+```

@@ -1,0 +1,538 @@
+---
+title: "Risk-Set Matched Cancer Cohort Summary and GLME Results"
+author: "Nemo Zhou"
+date: "2026-07-21"
+output:
+  html_document:
+    self_contained: true
+    theme: readable
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Results/cancer/visuals") })
+---
+
+<!--
+Project: Frailty Trajectories Before and After Incident Cancer in the
+         Health Professionals Follow-up Study
+Script:  4.6_GLME_summary_report.Rmd
+Author:  Nemo Zhou
+Date started:      2026-07-21
+Date last updated: 2026-07-27 (temporarily hid Joint Wald tests from rendered HTML while retaining the source blocks)
+
+Purpose:
+  Read-only summary report for the active non-survival risk-set matched cancer
+  cohorts. The report displays:
+    1. An assignment-level Table One of model and descriptive covariates by
+       cancer-case and cancer-control status, in paired cohort columns.
+    2. Saved event-study and natural-spline joint Wald tests retained in the
+       source but temporarily hidden from rendered HTML.
+    3. Trajectory plots with one row per cancer cohort and four model columns:
+       M0, M1, M2, and M3.
+    4. A separate M2-only trajectory plot with one cancer cohort per row.
+
+  The report reads saved RDS/CSV artifacts only. It does not rebuild matching,
+  fit GLME models, run survival-stratified analyses, or save persistent PNG
+  files. Reused controls are retained as separate matched assignments, while
+  repeated FI observations are collapsed to one row per assignment for Table
+  One so the table is not inflated by the longitudinal measurement count.
+
+Inputs:
+  Data/riskset_matched_analysis_long.rds
+  Data/riskset_matched_smoking_long.rds
+  Data/riskset_matched_obesity_long.rds
+  Data/riskset_matched_overall_long.rds
+  Data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds
+  Results/cancer/data/4.1_*, 4.2_*, 4.3_*, and 4.5_* saved artifacts
+
+Output:
+  Results/cancer/visuals/4.6_GLME_summary_report.html
+-->
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(tidyr)
+
+project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS"
+data_dir <- file.path(project_dir, "Data")
+results_dir <- file.path(project_dir, "Results", "cancer", "data")
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.path = file.path(tempdir(), "4.6_GLME_summary_report_figures", ""),
+  dev = "png",
+  fig.retina = 1
+)
+options(knitr.kable.NA = "—")
+
+cohort_inputs <- tibble::tribble(
+  ~prefix, ~matched_file,
+  "4.1", "riskset_matched_analysis_long.rds",
+  "4.2", "riskset_matched_smoking_long.rds",
+  "4.3", "riskset_matched_obesity_long.rds",
+  "4.5", "riskset_matched_overall_long.rds"
+)
+
+cohort_order <- c(
+  "Low/Moderate Burden Cohort",
+  "High Burden Cohort",
+  "Smoking-Related Cancer Cohort",
+  "Obesity-Related Cancer Cohort",
+  "All Cancer Cohort"
+)
+
+cohort_labels <- c(
+  "Low/Moderate Burden Cohort" = "Low/moderate burden cancer status",
+  "High Burden Cohort" = "High burden cancer status",
+  "Smoking-Related Cancer Cohort" = "Smoking-related cancer status",
+  "Obesity-Related Cancer Cohort" = "Obesity-related cancer status",
+  "All Cancer Cohort" = "All cancer status"
+)
+
+group_order <- c("Cancer Case", "Control")
+group_labels <- c("Cancer Case" = "Cancer case", "Control" = "Control")
+
+required_matched_columns <- c(
+  "id", "match_set", "role", "Cohort", "Group", "index_age",
+  "Age_Centered", "fi_score_nocancer", "base_race", "base_marital",
+  "base_living", "base_pckgr", "base_calor", "base_sat",
+  "base_diet_chol", "base_alco", "post_own_cancer"
+)
+
+as_numeric_safely <- function(x) {
+  suppressWarnings(as.numeric(as.character(x)))
+}
+
+first_nonmissing <- function(x) {
+  keep <- !is.na(x)
+  if (!any(keep)) return(x[NA_integer_][1])
+  x[which(keep)[1]]
+}
+
+last_nonmissing <- function(x) {
+  keep <- !is.na(x)
+  if (!any(keep)) return(x[NA_integer_][1])
+  x[tail(which(keep), 1)]
+}
+
+mean_sd <- function(x, digits = 2) {
+  x <- as_numeric_safely(x)
+  x <- x[is.finite(x)]
+  if (!length(x)) return(NA_character_)
+  paste0(formatC(mean(x), format = "f", digits = digits),
+         " (", formatC(stats::sd(x), format = "f", digits = digits), ")")
+}
+
+format_p <- function(x) {
+  if (is.na(x)) return(NA_character_)
+  if (x < 0.001) return("&lt;0.001")
+  formatC(x, format = "f", digits = 3)
+}
+
+read_matched <- function(prefix, file_name) {
+  path <- file.path(data_dir, file_name)
+  if (!file.exists(path)) stop("Matched dataset not found: ", path, call. = FALSE)
+  dat <- readRDS(path)
+  missing_columns <- setdiff(required_matched_columns, names(dat))
+  if (length(missing_columns)) {
+    stop("Matched dataset is missing required columns: ",
+         paste(missing_columns, collapse = ", "), call. = FALSE)
+  }
+  dat %>%
+    mutate(
+      Analysis_Prefix = prefix,
+      id = as.character(id),
+      match_set = as.character(match_set),
+      role = as.character(role),
+      Cohort = as.character(Cohort),
+      Group = factor(as.character(Group), levels = group_order),
+      index_age = as_numeric_safely(index_age),
+      Age_Centered = as_numeric_safely(Age_Centered),
+      fi_score_nocancer = as_numeric_safely(fi_score_nocancer),
+      post_own_cancer = as.logical(post_own_cancer)
+    ) %>%
+    filter(!post_own_cancer)
+}
+
+matched_long <- bind_rows(lapply(seq_len(nrow(cohort_inputs)), function(i) {
+  read_matched(cohort_inputs$prefix[[i]], cohort_inputs$matched_file[[i]])
+}))
+
+raw_path <- file.path(data_dir, "FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
+baseline_extra <- NULL
+if (file.exists(raw_path)) {
+  raw <- readRDS(raw_path)
+  raw_names <- names(raw)
+  baseline_extra <- raw %>%
+    mutate(id = as.character(id), cycle = as.character(cycle)) %>%
+    filter(cycle == "86") %>%
+    distinct(id, .keep_all = TRUE) %>%
+    transmute(
+      id,
+      base_bmi = if ("bmi" %in% raw_names) as_numeric_safely(bmi) else NA_real_,
+      base_activity = if ("act" %in% raw_names) as_numeric_safely(act) else NA_real_
+    )
+}
+
+assignment_summary <- matched_long %>%
+  arrange(Analysis_Prefix, Cohort, match_set, id, role, Age_Centered) %>%
+  group_by(Analysis_Prefix, Cohort, match_set, id, role, Group) %>%
+  summarize(
+    index_age = first_nonmissing(index_age),
+    fi_first_observed = first_nonmissing(fi_score_nocancer),
+    fi_last_pre_index = last_nonmissing(fi_score_nocancer[Age_Centered < 0]),
+    n_fi_observations = sum(!is.na(fi_score_nocancer)),
+    n_pre_index_fi = sum(!is.na(fi_score_nocancer) & Age_Centered < 0),
+    n_post_index_fi = sum(!is.na(fi_score_nocancer) & Age_Centered >= 0),
+    base_race = first_nonmissing(base_race),
+    base_marital = first_nonmissing(base_marital),
+    base_living = first_nonmissing(base_living),
+    base_pckgr = first_nonmissing(base_pckgr),
+    base_calor = first_nonmissing(base_calor),
+    base_sat = first_nonmissing(base_sat),
+    base_diet_chol = first_nonmissing(base_diet_chol),
+    base_alco = first_nonmissing(base_alco),
+    .groups = "drop"
+  )
+
+if (!is.null(baseline_extra)) {
+  assignment_summary <- assignment_summary %>% left_join(baseline_extra, by = "id")
+}
+
+assignment_summary <- assignment_summary %>%
+  mutate(
+    Cohort = factor(Cohort, levels = cohort_order),
+    Group = factor(Group, levels = group_order)
+  )
+
+continuous_vars <- c(
+  index_age = "Age at diagnosis/index, years",
+  fi_first_observed = "Frailty index, first observed analytic cycle",
+  fi_last_pre_index = "Frailty index, last pre-index observation",
+  base_calor = "Calories",
+  base_sat = "Saturated fat",
+  base_diet_chol = "Dietary cholesterol",
+  base_alco = "Alcohol"
+)
+
+optional_continuous_vars <- c(
+  base_bmi = "BMI",
+  base_activity = "Physical activity"
+)
+if (any(names(optional_continuous_vars) %in% names(assignment_summary))) {
+  continuous_vars <- c(
+    continuous_vars,
+    optional_continuous_vars[names(optional_continuous_vars) %in% names(assignment_summary)]
+  )
+}
+
+categorical_vars <- c(
+  base_race = "Race",
+  base_marital = "Marital status",
+  base_living = "Living arrangement",
+  base_pckgr = "Pack-year group"
+)
+
+continuous_vars <- continuous_vars[vapply(
+  names(continuous_vars),
+  function(v) any(!is.na(assignment_summary[[v]])),
+  logical(1)
+)]
+categorical_vars <- categorical_vars[vapply(
+  names(categorical_vars),
+  function(v) any(!is.na(assignment_summary[[v]])),
+  logical(1)
+)]
+
+summarize_continuous <- function(dat, var, label) {
+  dat %>%
+    group_by(Group) %>%
+    summarize(Statistic = mean_sd(.data[[var]]), .groups = "drop") %>%
+    mutate(Variable = label, Level = NA_character_, Level_order = 0L)
+}
+
+summarize_categorical <- function(dat, var, label) {
+  pack_year_levels <- c(
+    "<10 pack-years", "10-24 pack-years", "25-44 pack-years",
+    "45-64 pack-years", "65+ pack-years", "Missing", "Never"
+  )
+
+  level_summary <- dat %>%
+    filter(!is.na(.data[[var]])) %>%
+    count(Group, Level = as.character(.data[[var]]), name = "n") %>%
+    mutate(
+      Level_order = if (var == "base_pckgr") {
+        match(Level, pack_year_levels)
+      } else {
+        match(Level, sort(unique(Level)))
+      }
+    ) %>%
+    group_by(Group) %>%
+    mutate(Statistic = paste0(formatC(100 * n / sum(n), format = "f", digits = 1), "%")) %>%
+    ungroup() %>%
+    transmute(
+      Group, Statistic, Variable = label,
+      Level = htmltools::htmlEscape(Level, attribute = FALSE), Level_order
+    )
+
+  variable_row <- tibble::tibble(
+    Group = factor(group_order, levels = group_order),
+    Statistic = "",
+    Variable = label,
+    Level = NA_character_,
+    Level_order = 0L
+  )
+
+  bind_rows(variable_row, level_summary)
+}
+
+table1_long <- bind_rows(lapply(seq_len(nrow(cohort_inputs)), function(i) {
+  prefix_data <- assignment_summary %>% filter(Analysis_Prefix == cohort_inputs$prefix[[i]])
+  bind_rows(lapply(unique(as.character(prefix_data$Cohort)), function(cohort_name) {
+    cohort_data <- prefix_data %>% filter(as.character(Cohort) == cohort_name)
+    bind_rows(
+      lapply(names(continuous_vars), function(v) summarize_continuous(cohort_data, v, continuous_vars[[v]])),
+      lapply(names(categorical_vars), function(v) summarize_categorical(cohort_data, v, categorical_vars[[v]]))
+    ) %>% mutate(Cohort = cohort_name)
+  }))
+}))
+
+table1_row_order <- c(unname(continuous_vars), unname(categorical_vars))
+table1_long <- table1_long %>%
+  mutate(
+    Variable = factor(Variable, levels = table1_row_order),
+    Group = factor(Group, levels = group_order),
+    Cohort = factor(Cohort, levels = cohort_order)
+  ) %>%
+  mutate(
+    variable_order = match(as.character(Variable), table1_row_order)
+  )
+
+table1_wide <- table1_long %>%
+  mutate(
+    Characteristic = if_else(is.na(Level), as.character(Variable), paste0("&nbsp;&nbsp;", as.character(Level))),
+    Characteristic_order = variable_order * 1000 + Level_order
+  ) %>%
+  select(Cohort, Group, Characteristic, Characteristic_order, Statistic) %>%
+  tidyr::pivot_wider(
+    id_cols = c(Characteristic, Characteristic_order),
+    names_from = c(Cohort, Group), values_from = Statistic, names_sep = "__"
+  ) %>%
+  arrange(Characteristic_order) %>%
+  select(-Characteristic_order)
+
+table1_columns <- unlist(lapply(cohort_order, function(cohort) paste(cohort, group_order, sep = "__")), use.names = FALSE)
+table1_wide <- table1_wide %>% select(Characteristic, any_of(table1_columns))
+
+table1_counts <- assignment_summary %>%
+  count(Cohort, Group, name = "n") %>%
+  tidyr::complete(Cohort = factor(cohort_order, levels = cohort_order), Group = factor(group_order, levels = group_order), fill = list(n = 0))
+
+read_csv_artifact <- function(prefix, suffix) {
+  path <- file.path(results_dir, paste0(prefix, suffix))
+  if (!file.exists(path)) return(NULL)
+  read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
+}
+
+joint_tests <- bind_rows(lapply(cohort_inputs$prefix, function(prefix) {
+  x <- read_csv_artifact(prefix, "_eventstudy_joint_tests.csv")
+  if (is.null(x) || !nrow(x)) return(NULL)
+  x$Analysis_Prefix <- prefix
+  x
+}))
+
+spline_tests <- bind_rows(lapply(cohort_inputs$prefix, function(prefix) {
+  x <- read_csv_artifact(prefix, "_spline_omnibus_tests.csv")
+  if (is.null(x) || !nrow(x)) return(NULL)
+  x$Analysis_Prefix <- prefix
+  x
+}))
+
+model_order <- c(
+  M0_raw = "M0 raw",
+  M1_primary_spline = "M1 primary spline",
+  M2_full_spline = "M2 full spline",
+  M3_primary_matching_spline = "M3 matching-set spline"
+)
+
+trajectory_predictions <- bind_rows(lapply(cohort_inputs$prefix, function(prefix) {
+  x <- read_csv_artifact(prefix, "_spline_predicted_trajectories.csv")
+  if (is.null(x) || !nrow(x)) return(NULL)
+  required <- c("Cohort", "model_id", "Group", "Age_Centered", "pred", "lwr", "upr")
+  missing <- setdiff(required, names(x))
+  if (length(missing)) stop("Trajectory artifact for ", prefix, " is missing: ", paste(missing, collapse = ", "), call. = FALSE)
+  x
+})) %>%
+  filter(model_id %in% names(model_order)) %>%
+  mutate(
+    Cohort = factor(Cohort, levels = cohort_order),
+    Model = factor(unname(model_order[model_id]), levels = unname(model_order)),
+    Group = factor(Group, levels = c("Control", "Cancer Case"))
+  )
+
+if (!nrow(trajectory_predictions)) stop("No saved 4.1/4.2/4.3/4.5 trajectory predictions were found.", call. = FALSE)
+
+group_cols <- c("Control" = "#3182bd", "Cancer Case" = "#de2d26")
+
+format_wald_table <- function(x) {
+  if (is.null(x) || !nrow(x)) return(NULL)
+  if (!"vcov_type" %in% names(x)) x$vcov_type <- NA_character_
+  if (!"infer_method" %in% names(x)) x$infer_method <- NA_character_
+  x %>%
+    mutate(
+      Cohort = as.character(Cohort),
+      Fstat = formatC(Fstat, format = "f", digits = 3),
+      p_value = vapply(p_value, format_p, character(1)),
+      df_num = formatC(df_num, format = "f", digits = 0),
+      df_denom = ifelse(is.infinite(df_denom), "Inf", formatC(df_denom, format = "f", digits = 0))
+    ) %>%
+    select(Cohort, Test, Fstat, df_num, df_denom, p_value, vcov_type, infer_method)
+}
+```
+
+## Table One: matched case and control assignments
+
+The table is summarized at the matched-assignment level. A control participant
+may therefore contribute to more than one control assignment because the
+risk-set design permits matching with replacement. Repeated FI observations are
+not counted as separate Table One participants. Continuous variables are shown
+as mean (SD), and categorical variables as n (%).
+
+```{r table-one, results='asis'}
+header_top <- c("Characteristic" = 1)
+for (cohort in cohort_order) header_top <- c(header_top, setNames(2, cohort_labels[[cohort]]))
+subheader <- c("Characteristic")
+for (cohort in cohort_order) {
+  for (group in group_order) {
+    n_value <- table1_counts$n[table1_counts$Cohort == cohort & table1_counts$Group == group]
+    subheader <- c(subheader, paste0(group_labels[[group]], "<br>(n = ", n_value, ")"))
+  }
+}
+table1_wide %>%
+  kable(format = "html", escape = FALSE, col.names = subheader,
+        caption = "Table One. Baseline characteristics of active risk-set matched cancer cases and controls",
+        align = c("l", rep("c", ncol(table1_wide) - 1))) %>%
+  add_header_above(header_top, escape = FALSE) %>%
+  kable_styling(full_width = TRUE, bootstrap_options = c("striped", "condensed"), font_size = 9) %>%
+  row_spec(0, bold = TRUE) %>%
+  scroll_box(width = "100%", height = "700px")
+```
+
+The current M1/M3 model covariates are index age, race, marital status, and
+living arrangement; M2 additionally includes pack-year group, calories,
+saturated fat, dietary cholesterol, and alcohol. BMI and physical activity are
+displayed when available from the source data as descriptive covariates and are
+not silently treated as current 4.x model adjustments.
+
+<!--
+The Joint Wald tests are temporarily hidden from rendered HTML. The original
+source and chunk labels are retained so this section can be restored later by
+removing this HTML comment and the `eval=FALSE, include=FALSE` chunk options.
+
+## Joint Wald tests
+
+These are saved results from the active GLME artifacts. The report preserves the
+reported covariance and inference method; it does not relabel model-based
+results as CR2.
+
+### Event-study joint Wald tests
+
+```{r event-study-wald, results='asis', eval=FALSE, include=FALSE}
+event_wald_display <- format_wald_table(joint_tests)
+if (is.null(event_wald_display)) {
+  cat("*Saved event-study joint Wald tests are unavailable.*\n")
+} else {
+  event_wald_display %>%
+    kable(format = "html", escape = FALSE, caption = "Saved event-study joint Wald tests") %>%
+    kable_styling(full_width = TRUE, bootstrap_options = c("striped", "condensed"), font_size = 9)
+}
+```
+
+### Natural-spline trajectory-shape tests
+
+```{r spline-wald, results='asis', eval=FALSE, include=FALSE}
+spline_wald_display <- format_wald_table(spline_tests)
+if (is.null(spline_wald_display)) {
+  cat("*Saved natural-spline joint Wald tests are unavailable.*\n")
+} else {
+  spline_wald_display %>%
+    kable(format = "html", escape = FALSE, caption = "Saved natural-spline trajectory-shape joint Wald tests") %>%
+    kable_styling(full_width = TRUE, bootstrap_options = c("striped", "condensed"), font_size = 9)
+}
+```
+-->
+
+## Trajectory plots
+
+Each row is one active cancer cohort, and each column is one saved model
+specification. Shaded areas are the saved pointwise 95% confidence intervals;
+the vertical dashed line marks the cancer diagnosis or assigned index time.
+
+```{r trajectory-plots, fig.width=16, fig.height=14, out.width='100%'}
+p_trajectory <- ggplot(
+  trajectory_predictions,
+  aes(x = Age_Centered, y = pred, group = Group, color = Group, fill = Group)
+) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.16, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey35") +
+  facet_grid(Cohort ~ Model) +
+  scale_color_manual(values = group_cols) +
+  scale_fill_manual(values = group_cols) +
+  scale_x_continuous(breaks = seq(-20, 20, by = 4)) +
+  labs(
+    title = "Trajectory plots across model specifications",
+    subtitle = "One row per cancer cohort; shaded areas are saved pointwise 95% confidence intervals",
+    x = "Years relative to cancer diagnosis / assigned index",
+    y = "Predicted frailty index",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    strip.text.y = element_text(angle = 0)
+  )
+print(p_trajectory)
+```
+
+### M2 trajectory plots
+
+The following plot displays only the M2 full-covariate spline model, with one
+cancer cohort per row.
+
+```{r m2-trajectory-plots, fig.width=14, fig.height=10, out.width='100%'}
+m2_predictions <- trajectory_predictions %>%
+  filter(model_id == "M2_full_spline")
+
+p_m2_trajectory <- ggplot(
+  m2_predictions,
+  aes(x = Age_Centered, y = pred, group = Group, color = Group, fill = Group)
+) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.16, color = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey35") +
+  facet_wrap(~ Cohort, ncol = 2) +
+  scale_color_manual(values = group_cols) +
+  scale_fill_manual(values = group_cols) +
+  scale_x_continuous(breaks = seq(-20, 20, by = 4)) +
+  labs(
+    title = "M2 trajectory plots",
+    subtitle = "Full-covariate natural-spline model; shaded areas are saved pointwise 95% confidence intervals",
+    x = "Years relative to cancer diagnosis / assigned index",
+    y = "Predicted frailty index",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text.y = element_text(angle = 0, face = "bold")
+  )
+print(p_m2_trajectory)
+```
