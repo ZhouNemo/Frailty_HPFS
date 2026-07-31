@@ -1,10 +1,10 @@
 # =============================================================================
 # Project: Frailty Trajectories Before and After Incident Cancer in the
 #          Health Professionals Follow-up Study
-# Script:  4.1_plot_saved_trajectories.R
+# Script:  4.6.1_plot_saved_trajectories.R
 # Author:  Nemo Zhou
 # Date started:      2026-07-20
-# Date last updated: 2026-07-20
+# Date last updated: 2026-07-22 (renamed from 4.1_plot_saved_trajectories.R)
 #
 # Purpose:
 #   Create trajectory plots from the saved 4.1 prediction CSV without fitting

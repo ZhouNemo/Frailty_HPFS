@@ -4,7 +4,7 @@
 # Script:  7.4_ipcw_glme_spline_subtype_cohorts.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-30
-# Date last updated: 2026-07-17 (subtype cohorts now related cancer vs controls)
+# Date last updated: 2026-07-28 (prediction factors use participant-modal levels)
 #
 # Purpose:
 #   Fits IPCW-weighted natural-spline GLME trajectory models for the active
@@ -88,7 +88,21 @@ get_vcov <- function(model) {
   list(V = V, type = "model-based")
 }
 
+participant_modal_level <- function(d, column) {
+  factor_levels <- levels(d[[column]])
+  participant_values <- d[!duplicated(d[c("id", column)]), c("id", column)][[column]]
+  participant_values <- as.character(participant_values[!is.na(participant_values)])
+  counts <- tabulate(match(participant_values, factor_levels),
+                      nbins = length(factor_levels))
+  if (!any(counts > 0L)) return(factor_levels[[1]])
+  factor_levels[[which.max(counts)]]
+}
+
 make_ref_grid <- function(d, age_values, group_values) {
+  race_ref <- participant_modal_level(d, "base_race")
+  marital_ref <- participant_modal_level(d, "base_marital")
+  pack_year_ref <- participant_modal_level(d, "base_pckgr")
+
   expand.grid(
     Age_Centered = age_values,
     Group = factor(group_values, levels = c("Control", "Cancer Case")),
@@ -96,10 +110,10 @@ make_ref_grid <- function(d, age_values, group_values) {
   ) %>%
     mutate(
       index_age_z = 0,
-      base_race = factor(levels(d$base_race)[1], levels = levels(d$base_race)),
-      base_marital = factor(levels(d$base_marital)[1],
+      base_race = factor(race_ref, levels = levels(d$base_race)),
+      base_marital = factor(marital_ref,
                             levels = levels(d$base_marital)),
-      base_pckgr = factor(levels(d$base_pckgr)[1], levels = levels(d$base_pckgr))
+      base_pckgr = factor(pack_year_ref, levels = levels(d$base_pckgr))
     )
 }
 

@@ -1,0 +1,441 @@
+---
+title: "Legacy IPCW-Weighted versus Unweighted Frailty Trajectories"
+author: "Nemo Zhou"
+date: "2026-07-27"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Results/cancer/visuals") })
+---
+
+<!--
+Project: Frailty Trajectories Before and After Incident Cancer in the
+         Health Professionals Follow-up Study
+Script:  7.6_ipcw_legacy_trajectory_visualization.Rmd
+Author:  Nemo Zhou
+Date started:      2026-07-27
+Date last updated: 2026-07-28
+
+Purpose:
+  Read and visualize saved trajectory artifacts from the legacy 7.x IPCW
+  workflow without rebuilding matching, constructing weights, or fitting any
+  model. The report compares:
+    * the active 4.x M2 full-covariate, df-3 unweighted GLME trajectories, and
+    * the legacy 7.2/7.4 IPCW-weighted, df-4 GLME trajectories.
+
+  It covers the active non-survival cancer cohort families: low/moderate
+  burden, high burden, smoking-related, obesity-related, and overall cancer.
+  The report renders separate weighted and unweighted model plots, with
+  cancer-case and control trajectories overlaid within each cohort, plus an
+  IPCW-weighted Table One. The High Burden Cohort trajectory is shown only
+  through +12 years because later support is not retained for that cohort.
+
+  Critical interpretation boundary:
+    The legacy 7.x weighted models use lmer prior weights and a different df-4
+    specification. They are displayed only as legacy outputs and are NOT the
+    current IPCW estimand. The current IPCW implementation is the paired M2 GEE
+    workflow in 5.0-5.2.
+
+Inputs:
+  Results/cancer/data/4.1_spline_predicted_trajectories.csv
+  Results/cancer/data/4.2_spline_predicted_trajectories.csv
+  Results/cancer/data/4.3_spline_predicted_trajectories.csv
+  Results/cancer/data/4.5_spline_predicted_trajectories.csv
+  Results/cancer/data/7.2_ipcw_glme_spline_predicted_trajectories.csv
+  Results/cancer/data/7.4_ipcw_glme_spline_subtypes_predicted_trajectories.csv
+  Data/riskset_matched_overall_long_ipcw.rds
+  Data/riskset_matched_analysis_long_ipcw.rds
+  Data/riskset_matched_smoking_long_ipcw.rds
+  Data/riskset_matched_obesity_long_ipcw.rds
+
+Output:
+  Results/cancer/visuals/7.6_ipcw_legacy_trajectory_visualization.html
+
+No persistent PNG files are saved. This report does not run matching, GLME,
+GEE, or IPCW weight construction.
+-->
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(readr)
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS"
+results_dir <- file.path(project_dir, "Results", "cancer", "data")
+
+group_levels <- c("Control", "Cancer Case")
+model_levels <- c("4.x M2 unweighted GLME (df-3)", "Legacy 7.x IPCW-weighted GLME (df-4)")
+group_colors <- c("Control" = "#3182bd", "Cancer Case" = "#de2d26")
+
+read_required <- function(path) {
+  if (!file.exists(path)) {
+    stop(
+      "Required saved trajectory artifact is missing: ", path,
+      ". Run the relevant legacy 7.x sequence and current 4.x model first.",
+      call. = FALSE
+    )
+  }
+  readr::read_csv(path, show_col_types = FALSE)
+}
+
+read_m2_unweighted_prediction <- function(path, analysis_label) {
+  read_required(path) %>%
+    filter(model_id == "M2_full_spline") %>%
+    transmute(
+      Analysis = analysis_label,
+      Cohort,
+      Group = factor(Group, levels = group_levels),
+      Age_Centered,
+      pred,
+      se,
+      lwr,
+      upr,
+      Model = model_levels[[1]],
+      vcov_type
+    )
+}
+
+read_ipcw_person_time <- function(path, analysis_label) {
+  if (!file.exists(path)) {
+    stop(
+      "Required IPCW-augmented matched dataset is missing: ", path,
+      ". Run 7.1 (overall) or 7.3 (subtypes) before rendering this report.",
+      call. = FALSE
+    )
+  }
+
+  readRDS(path) %>%
+    filter(
+      Group %in% group_levels,
+      Age_Centered >= 0,
+      Age_Centered <= 16,
+      is.finite(fi_score_nocancer),
+      is.finite(sw_ipcw)
+    ) %>%
+    transmute(
+      Analysis = analysis_label,
+      Cohort,
+      Group = factor(Group, levels = group_levels),
+      trajectory_id,
+      Age_Centered,
+      sw_ipcw,
+      index_age,
+      base_race,
+      base_marital,
+      base_living,
+      base_pckgr,
+      base_calor,
+      base_sat,
+      base_diet_chol,
+      base_alco
+    )
+}
+
+weighted_mean <- function(x, w) {
+  keep <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(keep)) return(NA_real_)
+  sum(x[keep] * w[keep]) / sum(w[keep])
+}
+
+weighted_sd <- function(x, w) {
+  keep <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(keep)) return(NA_real_)
+  mean_x <- weighted_mean(x[keep], w[keep])
+  sqrt(sum(w[keep] * (x[keep] - mean_x)^2) / sum(w[keep]))
+}
+
+format_mean_sd <- function(mean_x, sd_x) {
+  if (is.na(mean_x)) return("Missing")
+  sprintf("%.2f (%.2f)", mean_x, sd_x)
+}
+
+format_percent <- function(prop_x) {
+  if (is.na(prop_x)) return("Missing")
+  sprintf("%.1f%%", 100 * prop_x)
+}
+
+standardized_difference <- function(mean_case, sd_case, mean_control, sd_control) {
+  denominator <- sqrt((sd_case^2 + sd_control^2) / 2)
+  if (is.na(denominator) || denominator == 0) return(NA_real_)
+  (mean_case - mean_control) / denominator
+}
+
+build_ipcw_table_one <- function(data) {
+  continuous <- c(
+    index_age = "Index age, years",
+    base_calor = "Calories, kcal/day",
+    base_sat = "Saturated fat, g/day",
+    base_diet_chol = "Dietary cholesterol, mg/day",
+    base_alco = "Alcohol, g/day"
+  )
+  categorical <- c(
+    base_race = "Race",
+    base_marital = "Marital status",
+    base_living = "Living arrangement",
+    base_pckgr = "Pack-year group"
+  )
+
+  split_data <- split(data, interaction(data$Analysis, data$Cohort, drop = TRUE))
+  result <- list()
+  row_index <- 1L
+
+  for (cohort_data in split_data) {
+    analysis_label <- unique(cohort_data$Analysis)
+    cohort_label <- unique(cohort_data$Cohort)
+    control <- cohort_data[cohort_data$Group == "Control", , drop = FALSE]
+    cancer_case <- cohort_data[cohort_data$Group == "Cancer Case", , drop = FALSE]
+
+    for (variable in names(continuous)) {
+      control_x <- control[[variable]]
+      case_x <- cancer_case[[variable]]
+      control_unweighted_mean <- mean(control_x, na.rm = TRUE)
+      control_unweighted_sd <- sd(control_x, na.rm = TRUE)
+      case_unweighted_mean <- mean(case_x, na.rm = TRUE)
+      case_unweighted_sd <- sd(case_x, na.rm = TRUE)
+      control_weighted_mean <- weighted_mean(control_x, control$sw_ipcw)
+      control_weighted_sd <- weighted_sd(control_x, control$sw_ipcw)
+      case_weighted_mean <- weighted_mean(case_x, cancer_case$sw_ipcw)
+      case_weighted_sd <- weighted_sd(case_x, cancer_case$sw_ipcw)
+
+      result[[row_index]] <- data.frame(
+        Analysis = analysis_label,
+        Cohort = cohort_label,
+        Variable = unname(continuous[[variable]]),
+        Level_or_statistic = "Mean (SD)",
+        Control_unweighted = format_mean_sd(control_unweighted_mean, control_unweighted_sd),
+        Cancer_case_unweighted = format_mean_sd(case_unweighted_mean, case_unweighted_sd),
+        Control_IPCW_weighted = format_mean_sd(control_weighted_mean, control_weighted_sd),
+        Cancer_case_IPCW_weighted = format_mean_sd(case_weighted_mean, case_weighted_sd),
+        SMD_unweighted = standardized_difference(
+          case_unweighted_mean, case_unweighted_sd,
+          control_unweighted_mean, control_unweighted_sd
+        ),
+        SMD_IPCW_weighted = standardized_difference(
+          case_weighted_mean, case_weighted_sd,
+          control_weighted_mean, control_weighted_sd
+        )
+      )
+      row_index <- row_index + 1L
+    }
+
+    for (variable in names(categorical)) {
+      control_x <- as.character(control[[variable]])
+      case_x <- as.character(cancer_case[[variable]])
+      control_x[is.na(control_x)] <- "Missing"
+      case_x[is.na(case_x)] <- "Missing"
+
+      for (level in sort(unique(c(control_x, case_x)))) {
+        control_indicator <- as.numeric(control_x == level)
+        case_indicator <- as.numeric(case_x == level)
+        control_unweighted_prop <- mean(control_indicator)
+        case_unweighted_prop <- mean(case_indicator)
+        control_weighted_prop <- weighted_mean(control_indicator, control$sw_ipcw)
+        case_weighted_prop <- weighted_mean(case_indicator, cancer_case$sw_ipcw)
+
+        result[[row_index]] <- data.frame(
+          Analysis = analysis_label,
+          Cohort = cohort_label,
+          Variable = unname(categorical[[variable]]),
+          Level_or_statistic = level,
+          Control_unweighted = format_percent(control_unweighted_prop),
+          Cancer_case_unweighted = format_percent(case_unweighted_prop),
+          Control_IPCW_weighted = format_percent(control_weighted_prop),
+          Cancer_case_IPCW_weighted = format_percent(case_weighted_prop),
+          SMD_unweighted = standardized_difference(
+            case_unweighted_prop, sqrt(case_unweighted_prop * (1 - case_unweighted_prop)),
+            control_unweighted_prop, sqrt(control_unweighted_prop * (1 - control_unweighted_prop))
+          ),
+          SMD_IPCW_weighted = standardized_difference(
+            case_weighted_prop, sqrt(case_weighted_prop * (1 - case_weighted_prop)),
+            control_weighted_prop, sqrt(control_weighted_prop * (1 - control_weighted_prop))
+          )
+        )
+        row_index <- row_index + 1L
+      }
+    }
+  }
+
+  bind_rows(result) %>%
+    mutate(
+      across(starts_with("SMD"), ~ round(.x, 3))
+    )
+}
+```
+
+# Interpretation boundary
+
+This report plots the weighted and unweighted models separately, with cancer-case and control trajectories overlaid within each plot. The saved prediction profiles use the participant-level modal category (largest number of distinct participants) for factor covariates. The two models use different spline degrees of freedom and fitting approaches, so the report does not compare them directly. The High Burden Cohort is truncated at +12 years. The current IPCW estimand is the paired M2 GEE comparison created by scripts 5.0-5.2.
+
+# IPCW-weighted Table One
+
+This table describes the observed post-index analytic person-time used by the legacy weighted models, restricted to 0 through +16 years relative to index. Each observed visit contributes once; the IPCW-weighted columns weight visits by the saved stabilized `sw_ipcw`. Therefore, it is a descriptive check of how IPCW changes the observed analytic person-time distribution, **not** a treatment-balance table and not evidence that cancer assignment was randomized.
+
+```{r ipcw-table-one}
+ipcw_person_time <- bind_rows(
+  read_ipcw_person_time(
+    file.path(project_dir, "Data", "riskset_matched_overall_long_ipcw.rds"),
+    "Overall Cancer"
+  ),
+  read_ipcw_person_time(
+    file.path(project_dir, "Data", "riskset_matched_analysis_long_ipcw.rds"),
+    "Cancer Burden"
+  ),
+  read_ipcw_person_time(
+    file.path(project_dir, "Data", "riskset_matched_smoking_long_ipcw.rds"),
+    "Smoking-Related Cancer"
+  ),
+  read_ipcw_person_time(
+    file.path(project_dir, "Data", "riskset_matched_obesity_long_ipcw.rds"),
+    "Obesity-Related Cancer"
+  )
+)
+
+ipcw_table_one_counts <- ipcw_person_time %>%
+  group_by(Analysis, Cohort, Group) %>%
+  summarize(
+    observed_person_visits = n(),
+    trajectory_assignments = n_distinct(trajectory_id),
+    sum_IPCW_weights = sum(sw_ipcw),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  ipcw_table_one_counts,
+  digits = 1,
+  caption = "Observed post-index person-time contributing to the IPCW Table One"
+)
+
+ipcw_table_one <- build_ipcw_table_one(ipcw_person_time)
+
+knitr::kable(
+  ipcw_table_one,
+  digits = 3,
+  caption = "IPCW Table One: unweighted and IPCW-weighted observed post-index person-time"
+)
+```
+
+# Load saved trajectories
+
+```{r load-trajectories}
+unweighted_trajectory <- bind_rows(
+  read_m2_unweighted_prediction(file.path(results_dir, "4.1_spline_predicted_trajectories.csv"), "Cancer Burden"),
+  read_m2_unweighted_prediction(file.path(results_dir, "4.2_spline_predicted_trajectories.csv"), "Smoking-Related Cancer"),
+  read_m2_unweighted_prediction(file.path(results_dir, "4.3_spline_predicted_trajectories.csv"), "Obesity-Related Cancer"),
+  read_m2_unweighted_prediction(file.path(results_dir, "4.5_spline_predicted_trajectories.csv"), "Overall Cancer")
+)
+
+weighted_overall_trajectory <- read_required(
+  file.path(results_dir, "7.2_ipcw_glme_spline_predicted_trajectories.csv")
+) %>%
+  transmute(
+    Analysis = "Overall Cancer",
+    Cohort,
+    Group = factor(Group, levels = group_levels),
+    Age_Centered,
+    pred,
+    se,
+    lwr,
+    upr,
+    Model = model_levels[[2]],
+    vcov_type
+  )
+
+weighted_subtype_trajectory <- read_required(
+  file.path(results_dir, "7.4_ipcw_glme_spline_subtypes_predicted_trajectories.csv")
+) %>%
+  transmute(
+    Analysis,
+    Cohort,
+    Group = factor(Group, levels = group_levels),
+    Age_Centered,
+    pred,
+    se,
+    lwr,
+    upr,
+    Model = model_levels[[2]],
+    vcov_type
+  )
+
+trajectory_data <- bind_rows(
+  unweighted_trajectory,
+  weighted_overall_trajectory,
+  weighted_subtype_trajectory
+) %>%
+  filter(
+    Age_Centered >= -16,
+    Age_Centered <= 16,
+    !(Cohort == "High Burden Cohort" & Age_Centered > 12)
+  ) %>%
+  mutate(Model = factor(Model, levels = model_levels))
+
+trajectory_coverage <- trajectory_data %>%
+  group_by(Analysis, Cohort, Group, Model) %>%
+  summarize(
+    n_prediction_rows = n(),
+    min_time = min(Age_Centered),
+    max_time = max(Age_Centered),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  trajectory_coverage,
+  digits = 2,
+  caption = "Saved trajectory-grid coverage used in this report"
+)
+```
+
+# Group-specific trajectories
+
+```{r group-trajectories, fig.width=15, fig.height=10}
+make_trajectory_plot <- function(data, selected_model) {
+  plot_data <- data %>% filter(Model == selected_model)
+
+  ggplot(
+    plot_data,
+    aes(x = Age_Centered, y = pred, color = Group, fill = Group)
+  ) +
+    geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.10, color = NA) +
+    geom_line(linewidth = 0.9) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey35") +
+    facet_wrap(~ Cohort, scales = "free_y") +
+    scale_color_manual(values = group_colors) +
+    scale_fill_manual(values = group_colors) +
+    scale_x_continuous(breaks = seq(-16, 16, by = 4)) +
+    theme_minimal(base_size = 11) +
+    theme(
+      legend.position = "bottom",
+      panel.grid.minor = element_blank(),
+      strip.text.x = element_text(size = 8)
+    ) +
+    labs(
+      title = "Cancer-case and control frailty trajectories",
+      subtitle = paste0("Model: ", selected_model, ". Ribbons are saved pointwise 95% confidence intervals."),
+      x = "Years relative to assigned index",
+      y = "Predicted no-cancer frailty index",
+      color = NULL,
+      fill = NULL
+    )
+}
+
+weighted_trajectory_plot <- make_trajectory_plot(
+  trajectory_data,
+  model_levels[[2]]
+)
+unweighted_trajectory_plot <- make_trajectory_plot(
+  trajectory_data,
+  model_levels[[1]]
+)
+
+weighted_trajectory_plot
+unweighted_trajectory_plot
+```
+
+# Interpretation notes
+
+* Each plot compares cancer cases and controls within one model only; weighted and unweighted models are displayed separately.
+* The weighted plot uses the saved 7.x weighted `lmer` GLME; the current IPCW method is the M2 paired GEE in 5.x.
+* Death is outside the IPCW nonresponse mechanism; this report visualizes existing saved models only and does not alter that estimand.

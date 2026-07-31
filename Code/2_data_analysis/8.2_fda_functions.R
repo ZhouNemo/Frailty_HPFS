@@ -1,13 +1,13 @@
 # =============================================================================
 # Project: Frailty Trajectories Before and After Incident Cancer in the
 #          Health Professionals Follow-up Study
-# Script:  5.0_fda_functions.R
+# Script:  8.2_fda_functions.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-29
-# Date last updated: 2026-07-17 (visual-data outputs moved; PNG writes removed)
+# Date last updated: 2026-07-22 (renamed from 5.0_fda_functions.R)
 #
 # Purpose:
-#   Shared functional data analysis (FDA) utilities used by 5.1+. Converts a
+#   Shared functional data analysis (FDA) utilities used by 8.3+. Converts a
 #   risk-set matched long dataset (from 2.1-2.5) into the SPARSE functional-data
 #   format required by fdapace (the PACE / sparse-FPCA method), and optionally
 #   runs FPCA with a Cancer-vs-Control mean-function comparison.

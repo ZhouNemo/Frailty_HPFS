@@ -4,7 +4,7 @@
 # Script:  7.2_ipcw_glme_spline_overall.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-30
-# Date last updated: 2026-07-17 (visual-data outputs moved; PNG writes removed)
+# Date last updated: 2026-07-28 (prediction factors use participant-modal levels)
 #
 # Purpose:
 #   Fits the IPCW-weighted natural-spline GLME for the OVERALL incident cancer
@@ -86,6 +86,16 @@ analysis_data <- matched_long %>%
     sw_ipcw > 0
   ) %>%
   droplevels()
+
+participant_modal_level <- function(d, column) {
+  factor_levels <- levels(d[[column]])
+  participant_values <- d[!duplicated(d[c("id", column)]), c("id", column)][[column]]
+  participant_values <- as.character(participant_values[!is.na(participant_values)])
+  counts <- tabulate(match(participant_values, factor_levels),
+                      nbins = length(factor_levels))
+  if (!any(counts > 0L)) return(factor_levels[[1]])
+  factor_levels[[which.max(counts)]]
+}
 
 cat("\nIPCW-weighted overall spline GLME analytic rows:", nrow(analysis_data), "\n")
 print(table(Group = analysis_data$Group))
@@ -185,6 +195,10 @@ write.csv(
 )
 
 make_ref_grid <- function(age_values, group_values) {
+  race_ref <- participant_modal_level(analysis_data, "base_race")
+  marital_ref <- participant_modal_level(analysis_data, "base_marital")
+  pack_year_ref <- participant_modal_level(analysis_data, "base_pckgr")
+
   expand.grid(
     Age_Centered = age_values,
     Group = factor(group_values, levels = c("Control", "Cancer Case")),
@@ -192,11 +206,11 @@ make_ref_grid <- function(age_values, group_values) {
   ) %>%
     mutate(
       index_age_z = 0,
-      base_race = factor(levels(analysis_data$base_race)[1],
+      base_race = factor(race_ref,
                          levels = levels(analysis_data$base_race)),
-      base_marital = factor(levels(analysis_data$base_marital)[1],
+      base_marital = factor(marital_ref,
                             levels = levels(analysis_data$base_marital)),
-      base_pckgr = factor(levels(analysis_data$base_pckgr)[1],
+      base_pckgr = factor(pack_year_ref,
                           levels = levels(analysis_data$base_pckgr))
     )
 }

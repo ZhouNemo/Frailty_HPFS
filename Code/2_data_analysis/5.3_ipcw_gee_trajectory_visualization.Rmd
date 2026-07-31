@@ -1,0 +1,369 @@
+---
+title: "IPCW-GEE Frailty Trajectories"
+author: "Nemo Zhou"
+date: "2026-07-28"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Results/cancer/visuals") })
+---
+
+<!--
+Project: Frailty Trajectories Before and After Incident Cancer in the
+         Health Professionals Follow-up Study
+Script:  5.3_ipcw_gee_trajectory_visualization.Rmd
+Author:  Nemo Zhou
+Date started:      2026-07-28
+Date last updated: 2026-07-28
+
+Purpose:
+  Read and visualize saved outputs from the current 5.0-5.2 IPCW-GEE
+  sensitivity workflow without rebuilding matching, constructing weights, or
+  fitting any model. The report displays separate unweighted-GEE and
+  IPCW-weighted-GEE plots, with cancer-case and control trajectories overlaid
+  within each cohort, and an IPCW-weighted Table One.
+
+  The High Burden Cohort is displayed only through +12 years because later
+  support is not retained for that cohort. Death is terminal and is not
+  treated as IPCW censoring by the 5.x engine.
+
+Inputs:
+  Results/cancer/data/5.1_overall_m2_gee_predicted_trajectories.csv
+  Results/cancer/data/5.2_low_moderate_burden_m2_gee_predicted_trajectories.csv
+  Results/cancer/data/5.2_high_burden_m2_gee_predicted_trajectories.csv
+  Results/cancer/data/5.2_smoking_m2_gee_predicted_trajectories.csv
+  Results/cancer/data/5.2_obesity_m2_gee_predicted_trajectories.csv
+  Data/*_long_ipcw_m2_gee.rds
+
+Output:
+  Results/cancer/visuals/5.3_ipcw_gee_trajectory_visualization.html
+
+No persistent PNG files are saved. This report does not run matching, GLME,
+GEE, or IPCW weight construction.
+-->
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(readr)
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS"
+results_dir <- file.path(project_dir, "Results", "cancer", "data")
+data_dir <- file.path(project_dir, "Data")
+
+group_levels <- c("Control", "Cancer Case")
+model_levels <- c("Unweighted GEE", "IPCW-weighted GEE")
+group_colors <- c("Control" = "#3182bd", "Cancer Case" = "#de2d26")
+
+read_required_csv <- function(path) {
+  if (!file.exists(path)) {
+    stop("Required 5.x GEE trajectory artifact is missing: ", path,
+         ". Run 5.1 and 5.2 before rendering this report.", call. = FALSE)
+  }
+  readr::read_csv(path, show_col_types = FALSE)
+}
+
+read_prediction <- function(path, analysis_label, cohort_filter = NULL) {
+  out <- read_required_csv(path)
+  if (!is.null(cohort_filter)) out <- out %>% filter(Cohort == cohort_filter)
+  out %>%
+    transmute(
+      Analysis = analysis_label,
+      Cohort,
+      Group = factor(Group, levels = group_levels),
+      Model = factor(Model, levels = model_levels),
+      Age_Centered,
+      pred,
+      se,
+      lwr,
+      upr,
+      vcov_type
+    )
+}
+
+read_gee_panel <- function(path, analysis_label, cohort_filter = NULL) {
+  if (!file.exists(path)) {
+    stop("Required 5.x IPCW-GEE ledger is missing: ", path,
+         ". Run 5.1 or 5.2 before rendering this report.", call. = FALSE)
+  }
+  out <- readRDS(path)
+  if (!is.null(cohort_filter)) out <- out %>% filter(Cohort == cohort_filter)
+  out %>%
+    filter(
+      retained_gee_row,
+      Age_Centered >= 0,
+      Age_Centered <= 16,
+      Group %in% group_levels,
+      is.finite(fi_score_nocancer),
+      is.finite(sw_ipcw),
+      sw_ipcw > 0
+    ) %>%
+    transmute(
+      Analysis = analysis_label,
+      Cohort,
+      Group = factor(Group, levels = group_levels),
+      trajectory_id,
+      sw_ipcw,
+      index_age,
+      base_race,
+      base_marital,
+      base_living,
+      base_pckgr,
+      base_calor,
+      base_sat,
+      base_diet_chol,
+      base_alco
+    )
+}
+
+weighted_mean <- function(x, w) {
+  keep <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(keep)) return(NA_real_)
+  sum(x[keep] * w[keep]) / sum(w[keep])
+}
+
+weighted_sd <- function(x, w) {
+  keep <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(keep)) return(NA_real_)
+  m <- weighted_mean(x[keep], w[keep])
+  sqrt(sum(w[keep] * (x[keep] - m)^2) / sum(w[keep]))
+}
+
+format_mean_sd <- function(m, s) {
+  if (!is.finite(m)) return("Missing")
+  sprintf("%.2f (%.2f)", m, s)
+}
+
+format_percent <- function(p) {
+  if (!is.finite(p)) return("Missing")
+  sprintf("%.1f%%", 100 * p)
+}
+
+smd <- function(mean_case, sd_case, mean_control, sd_control) {
+  denominator <- sqrt((sd_case^2 + sd_control^2) / 2)
+  if (!is.finite(denominator) || denominator == 0) return(NA_real_)
+  (mean_case - mean_control) / denominator
+}
+
+build_table_one <- function(data) {
+  continuous <- c(
+    index_age = "Index age, years",
+    base_calor = "Calories, kcal/day",
+    base_sat = "Saturated fat, g/day",
+    base_diet_chol = "Dietary cholesterol, mg/day",
+    base_alco = "Alcohol, g/day"
+  )
+  categorical <- c(
+    base_race = "Race",
+    base_marital = "Marital status",
+    base_living = "Living arrangement",
+    base_pckgr = "Pack-year group"
+  )
+
+  pieces <- list()
+  k <- 1L
+  for (d in split(data, interaction(data$Analysis, data$Cohort, drop = TRUE))) {
+    analysis_label <- unique(d$Analysis)
+    cohort_label <- unique(d$Cohort)
+    control <- d[d$Group == "Control", , drop = FALSE]
+    case <- d[d$Group == "Cancer Case", , drop = FALSE]
+
+    for (v in names(continuous)) {
+      cu <- c(mean = mean(control[[v]], na.rm = TRUE), sd = sd(control[[v]], na.rm = TRUE))
+      xu <- c(mean = mean(case[[v]], na.rm = TRUE), sd = sd(case[[v]], na.rm = TRUE))
+      cw <- c(mean = weighted_mean(control[[v]], control$sw_ipcw), sd = weighted_sd(control[[v]], control$sw_ipcw))
+      xw <- c(mean = weighted_mean(case[[v]], case$sw_ipcw), sd = weighted_sd(case[[v]], case$sw_ipcw))
+      pieces[[k]] <- data.frame(
+        Analysis = analysis_label, Cohort = cohort_label,
+        Variable = unname(continuous[[v]]), Level_or_statistic = "Mean (SD)",
+        Control_unweighted = format_mean_sd(cu[["mean"]], cu[["sd"]]),
+        Cancer_case_unweighted = format_mean_sd(xu[["mean"]], xu[["sd"]]),
+        Control_IPCW_weighted = format_mean_sd(cw[["mean"]], cw[["sd"]]),
+        Cancer_case_IPCW_weighted = format_mean_sd(xw[["mean"]], xw[["sd"]]),
+        SMD_unweighted = smd(xu[["mean"]], xu[["sd"]], cu[["mean"]], cu[["sd"]]),
+        SMD_IPCW_weighted = smd(xw[["mean"]], xw[["sd"]], cw[["mean"]], cw[["sd"]])
+      )
+      k <- k + 1L
+    }
+
+    for (v in names(categorical)) {
+      control_x <- as.character(control[[v]])
+      case_x <- as.character(case[[v]])
+      control_x[is.na(control_x)] <- "Missing"
+      case_x[is.na(case_x)] <- "Missing"
+      for (level in sort(unique(c(control_x, case_x)))) {
+        cp <- mean(control_x == level)
+        xp <- mean(case_x == level)
+        cw <- weighted_mean(as.numeric(control_x == level), control$sw_ipcw)
+        xw <- weighted_mean(as.numeric(case_x == level), case$sw_ipcw)
+        pieces[[k]] <- data.frame(
+          Analysis = analysis_label, Cohort = cohort_label,
+          Variable = unname(categorical[[v]]), Level_or_statistic = level,
+          Control_unweighted = format_percent(cp),
+          Cancer_case_unweighted = format_percent(xp),
+          Control_IPCW_weighted = format_percent(cw),
+          Cancer_case_IPCW_weighted = format_percent(xw),
+          SMD_unweighted = smd(xp, sqrt(xp * (1 - xp)), cp, sqrt(cp * (1 - cp))),
+          SMD_IPCW_weighted = smd(xw, sqrt(xw * (1 - xw)), cw, sqrt(cw * (1 - cw)))
+        )
+        k <- k + 1L
+      }
+    }
+  }
+  bind_rows(pieces) %>% mutate(across(starts_with("SMD"), ~ round(.x, 3)))
+}
+```
+
+# Analysis scope
+
+This report uses the current 5.x IPCW-GEE outputs. The observation probabilities were estimated in the complete full-cohort response ledger and transported to the matched assignments before the weighted GEE was fitted. The two trajectory plots are separate: one is the unweighted GEE and one is the IPCW-weighted GEE. Within each plot, cancer cases and controls use the same model and are overlaid directly. No cancer-minus-control difference plot or weighted-minus-unweighted change plot is produced.
+
+# IPCW-weighted Table One
+
+The Table One describes observed retained post-index person-time from 0 through +16 years. The weighted columns use the saved stabilized `sw_ipcw`; this is an observation-process diagnostic, not a treatment-balance table. Death is not converted into a censoring event.
+
+```{r table-one}
+gee_panel <- bind_rows(
+  read_gee_panel(
+    file.path(data_dir, "riskset_matched_overall_long_ipcw_m2_gee.rds"),
+    "Overall Cancer"
+  ),
+  read_gee_panel(
+    file.path(data_dir, "riskset_matched_low_moderate_burden_long_ipcw_m2_gee.rds"),
+    "Cancer Burden", "Low/Moderate Burden Cohort"
+  ),
+  read_gee_panel(
+    file.path(data_dir, "riskset_matched_high_burden_long_ipcw_m2_gee.rds"),
+    "Cancer Burden", "High Burden Cohort"
+  ),
+  read_gee_panel(
+    file.path(data_dir, "riskset_matched_smoking_long_ipcw_m2_gee.rds"),
+    "Smoking-Related Cancer"
+  ),
+  read_gee_panel(
+    file.path(data_dir, "riskset_matched_obesity_long_ipcw_m2_gee.rds"),
+    "Obesity-Related Cancer"
+  )
+)
+
+table_one_counts <- gee_panel %>%
+  group_by(Analysis, Cohort, Group) %>%
+  summarize(
+    observed_person_visits = n(),
+    trajectory_assignments = n_distinct(trajectory_id),
+    sum_IPCW_weights = sum(sw_ipcw),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  table_one_counts,
+  digits = 1,
+  caption = "Observed retained person-time contributing to the IPCW-GEE Table One"
+)
+
+knitr::kable(
+  build_table_one(gee_panel),
+  digits = 3,
+  caption = "IPCW-GEE Table One: unweighted and IPCW-weighted observed post-index person-time"
+)
+```
+
+# Load GEE trajectories
+
+```{r trajectories}
+gee_trajectories <- bind_rows(
+  read_prediction(
+    file.path(results_dir, "5.1_overall_m2_gee_predicted_trajectories.csv"),
+    "Overall Cancer"
+  ),
+  read_prediction(
+    file.path(results_dir, "5.2_low_moderate_burden_m2_gee_predicted_trajectories.csv"),
+    "Cancer Burden", "Low/Moderate Burden Cohort"
+  ),
+  read_prediction(
+    file.path(results_dir, "5.2_high_burden_m2_gee_predicted_trajectories.csv"),
+    "Cancer Burden", "High Burden Cohort"
+  ),
+  read_prediction(
+    file.path(results_dir, "5.2_smoking_m2_gee_predicted_trajectories.csv"),
+    "Smoking-Related Cancer"
+  ),
+  read_prediction(
+    file.path(results_dir, "5.2_obesity_m2_gee_predicted_trajectories.csv"),
+    "Obesity-Related Cancer"
+  )
+) %>%
+  filter(
+    Age_Centered >= -16,
+    Age_Centered <= 16,
+    !(Cohort == "High Burden Cohort" & Age_Centered > 12)
+  )
+
+trajectory_coverage <- gee_trajectories %>%
+  group_by(Analysis, Cohort, Group, Model) %>%
+  summarize(
+    n_prediction_rows = n(),
+    min_time = min(Age_Centered),
+    max_time = max(Age_Centered),
+    vcov_type = paste(unique(vcov_type), collapse = "; "),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  trajectory_coverage,
+  digits = 2,
+  caption = "Saved 5.x GEE trajectory-grid coverage"
+)
+```
+
+# Separate case/control trajectory plots
+
+```{r trajectory-plots, fig.width=15, fig.height=10}
+make_gee_plot <- function(data, selected_model) {
+  ggplot(
+    data %>% filter(Model == selected_model),
+    aes(x = Age_Centered, y = pred, color = Group, fill = Group)
+  ) +
+    geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.10, color = NA) +
+    geom_line(linewidth = 0.9) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey35") +
+    facet_wrap(~ Cohort, scales = "free_y") +
+    scale_color_manual(values = group_colors) +
+    scale_fill_manual(values = group_colors) +
+    scale_x_continuous(breaks = seq(-16, 16, by = 4)) +
+    theme_minimal(base_size = 11) +
+    theme(
+      legend.position = "bottom",
+      panel.grid.minor = element_blank(),
+      strip.text.x = element_text(size = 8)
+    ) +
+    labs(
+      title = "Cancer-case and control frailty trajectories",
+      subtitle = paste0(
+        "Current 5.x model: ", selected_model,
+        ". Ribbons are GEE empirical-sandwich 95% confidence intervals."
+      ),
+      x = "Years relative to assigned index",
+      y = "Predicted frailty index",
+      color = NULL,
+      fill = NULL
+    )
+}
+
+unweighted_gee_plot <- make_gee_plot(gee_trajectories, model_levels[[1]])
+ipcw_weighted_gee_plot <- make_gee_plot(gee_trajectories, model_levels[[2]])
+
+unweighted_gee_plot
+ipcw_weighted_gee_plot
+```
+
+# Interpretation notes
+
+* Each plot compares cancer cases and controls within the same GEE model.
+* The 5.x trajectories use the M2 reference profile from the shared engine: factor covariates are held at the most common observed level and continuous covariates at their observed means, with `index_age_z = 0`.
+* Confidence intervals use the GEE empirical sandwich covariance.
+* This report reads saved outputs only and does not run matching, IPCW, GEE, or GLME models.

@@ -1,10 +1,10 @@
 # =============================================================================
 # Project: Frailty Trajectories Before and After Incident Cancer in the
 #          Health Professionals Follow-up Study
-# Script:  5.1_fda_overall.R
+# Script:  8.3_fda_overall.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-29
-# Date last updated: 2026-07-17 (visual-data outputs moved; PNG writes removed)
+# Date last updated: 2026-07-22 (renamed from 5.1_fda_overall.R)
 #
 # Purpose:
 #   Converts the OVERALL risk-set matched dataset (any incident cancer vs control)
@@ -29,7 +29,7 @@ project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Rese
 data_dir    <- file.path(project_dir, "Data")
 results_dir <- file.path(project_dir, "Results", "cancer", "data")
 
-source(file.path(project_dir, "Code", "2_data_analysis", "5.0_fda_functions.R"))
+source(file.path(project_dir, "Code", "2_data_analysis", "8.2_fda_functions.R"))
 
 # 1) Convert to fdapace Lt/Ly/meta and cache the functional-data object.
 fda_input <- prepare_fda_input(
