@@ -4,7 +4,7 @@
 # Script:  1.1_check_timebin_fda_support.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-29
-# Date last updated: 2026-07-17 (visual-data outputs moved; PNG writes removed)
+# Date last updated: 2026-09-28 (recent-FI eligibility and retired matching designs)
 #
 # Purpose:
 #   Diagnoses whether the current risk-set matched longitudinal frailty data
@@ -90,6 +90,8 @@ if (!file.exists(raw_path)) {
 # 2. Load data and define relative-time bins
 # -----------------------------------------------------------------------------
 
+source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
+validate_matching_provenance(matched_path)
 matched_long <- readRDS(matched_path)
 missing_cols <- setdiff(required_matched_cols, names(matched_long))
 if (length(missing_cols) > 0) {

@@ -15,24 +15,27 @@ Project: Frailty Trajectories Before and After Incident Cancer in the
 Script:  4.6_GLME_summary_report.Rmd
 Author:  Nemo Zhou
 Date started:      2026-07-21
-Date last updated: 2026-07-27 (temporarily hid Joint Wald tests from rendered HTML while retaining the source blocks)
+Date last updated: 2026-09-29 (added a separate 4.7 Table One and M2 trajectories)
 
 Purpose:
   Read-only summary report for the active non-survival risk-set matched cancer
   cohorts. The report displays:
-    1. An assignment-level Table One of model and descriptive covariates by
-       cancer-case and cancer-control status, in paired cohort columns.
-    2. Saved event-study and natural-spline joint Wald tests retained in the
+    1. An assignment-level Table One for the grouped cohorts, with paired
+       cancer-case and cancer-control columns.
+    2. A separate Table One with the same structure for the six 4.7
+       individual cancer-type cohorts.
+    3. Saved natural-spline joint Wald tests retained in the
        source but temporarily hidden from rendered HTML.
-    3. Trajectory plots with one row per cancer cohort and four model columns:
-       M0, M1, M2, and M3.
-    4. A separate M2-only trajectory plot with one cancer cohort per row.
+    4. Trajectory plots with one row per grouped cancer cohort and four model
+       columns: M0, M1, M2, and M3.
+    5. Saved M0--M3 trajectory plots for the six 4.7 individual cancer types.
+    6. Separate M2-only trajectory plots for grouped and individual cohorts.
 
   The report reads saved RDS/CSV artifacts only. It does not rebuild matching,
   fit GLME models, run survival-stratified analyses, or save persistent PNG
   files. Reused controls are retained as separate matched assignments, while
-  repeated FI observations are collapsed to one row per assignment for Table
-  One so the table is not inflated by the longitudinal measurement count.
+  repeated FI observations are collapsed to one row per assignment for each
+  Table One so neither table is inflated by the longitudinal measurement count.
 
 Inputs:
   Data/riskset_matched_analysis_long.rds
@@ -40,7 +43,8 @@ Inputs:
   Data/riskset_matched_obesity_long.rds
   Data/riskset_matched_overall_long.rds
   Data/FI_longitudinal_1986_2020_IMPUTED_Cancer.rds
-  Results/cancer/data/4.1_*, 4.2_*, 4.3_*, and 4.5_* saved artifacts
+  Results/cancer/data/4.1_*, 4.2_*, 4.3_*, 4.5_*, and 4.7_* saved artifacts
+  Data/riskset_matched_site_<site>_long.rds and complete matching ledgers
 
 Output:
   Results/cancer/visuals/4.6_GLME_summary_report.html
@@ -134,6 +138,16 @@ format_p <- function(x) {
 read_matched <- function(prefix, file_name) {
   path <- file.path(data_dir, file_name)
   if (!file.exists(path)) stop("Matched dataset not found: ", path, call. = FALSE)
+  source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
+  provenance <- validate_matching_provenance(path)
+  # Do not combine rebuilt cohorts with pre-rebuild fitted curves.
+  metadata_path <- file.path(results_dir, paste0(prefix, "_spline_metadata.rds"))
+  if (!file.exists(metadata_path)) stop("Rerun the corresponding 4.x GLME before rendering: ", prefix)
+  fit_metadata <- readRDS(metadata_path)
+  if (!length(fit_metadata) || !all(vapply(fit_metadata, function(x)
+      identical(x$input_md5, provenance$input_md5) &&
+      identical(x$assignment_md5, provenance$assignment_md5), logical(1))))
+    stop("Saved ", prefix, " results use an older matched cohort. Rerun its GLME before rendering.")
   dat <- readRDS(path)
   missing_columns <- setdiff(required_matched_columns, names(dat))
   if (length(missing_columns)) {
@@ -176,6 +190,11 @@ if (file.exists(raw_path)) {
     )
 }
 
+matched_assignments <- bind_rows(lapply(seq_len(nrow(cohort_inputs)), function(i) {
+  read_matching_assignments(file.path(data_dir, cohort_inputs$matched_file[i])) %>%
+    mutate(Analysis_Prefix = cohort_inputs$prefix[i])
+}))
+
 assignment_summary <- matched_long %>%
   arrange(Analysis_Prefix, Cohort, match_set, id, role, Age_Centered) %>%
   group_by(Analysis_Prefix, Cohort, match_set, id, role, Group) %>%
@@ -196,6 +215,10 @@ assignment_summary <- matched_long %>%
     base_alco = first_nonmissing(base_alco),
     .groups = "drop"
   )
+
+assignment_summary <- complete_assignment_summary(matched_assignments, assignment_summary,
+  keys = c("Analysis_Prefix", "Cohort", "match_set", "id", "role", "Group"),
+  count_columns = c("n_fi_observations", "n_pre_index_fi", "n_post_index_fi"))
 
 if (!is.null(baseline_extra)) {
   assignment_summary <- assignment_summary %>% left_join(baseline_extra, by = "id")
@@ -336,13 +359,6 @@ read_csv_artifact <- function(prefix, suffix) {
   read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
 }
 
-joint_tests <- bind_rows(lapply(cohort_inputs$prefix, function(prefix) {
-  x <- read_csv_artifact(prefix, "_eventstudy_joint_tests.csv")
-  if (is.null(x) || !nrow(x)) return(NULL)
-  x$Analysis_Prefix <- prefix
-  x
-}))
-
 spline_tests <- bind_rows(lapply(cohort_inputs$prefix, function(prefix) {
   x <- read_csv_artifact(prefix, "_spline_omnibus_tests.csv")
   if (is.null(x) || !nrow(x)) return(NULL)
@@ -356,6 +372,271 @@ model_order <- c(
   M2_full_spline = "M2 full spline",
   M3_primary_matching_spline = "M3 matching-set spline"
 )
+
+individual_type_inputs <- tibble::tribble(
+  ~site, ~cohort_label, ~prefix,
+  "prostate", "Prostate Cancer Cohort", "4.7_prostate",
+  "lung", "Lung/Trachea/Bronchus Cancer Cohort", "4.7_lung",
+  "colorectal", "Colorectal/Anal Cancer Cohort", "4.7_colorectal",
+  "bladder", "Bladder Cancer Cohort", "4.7_bladder",
+  "kidney", "Kidney/Other Urinary Cancer Cohort", "4.7_kidney",
+  "pancreas", "Pancreatic Cancer Cohort", "4.7_pancreas"
+)
+individual_type_labels <- c(
+  "Prostate Cancer Cohort" = "Prostate",
+  "Lung/Trachea/Bronchus Cancer Cohort" = "Lung / trachea / bronchus",
+  "Colorectal/Anal Cancer Cohort" = "Colorectal / anal",
+  "Bladder Cancer Cohort" = "Bladder",
+  "Kidney/Other Urinary Cancer Cohort" = "Kidney / other urinary",
+  "Pancreatic Cancer Cohort" = "Pancreas"
+)
+
+individual_type_run_path <- file.path(results_dir, "4.7_individual_type_run_status.csv")
+if (!file.exists(individual_type_run_path)) {
+  stop("Saved 4.7 run status was not found: ", individual_type_run_path, call. = FALSE)
+}
+individual_type_run_status <- read.csv(
+  individual_type_run_path, stringsAsFactors = FALSE, check.names = FALSE
+)
+required_run_columns <- c(
+  "site", "status", "input_md5", "matched_md5", "builder_md5",
+  "matching_engine_md5", "glme_engine_md5", "m1_status"
+)
+missing_run_columns <- setdiff(required_run_columns, names(individual_type_run_status))
+if (length(missing_run_columns)) {
+  stop("4.7 run-status file is missing: ", paste(missing_run_columns, collapse = ", "), call. = FALSE)
+}
+if (anyDuplicated(individual_type_run_status$site)) {
+  stop("4.7 run-status file has duplicate site rows.", call. = FALSE)
+}
+
+individual_type_source_paths <- c(
+  input = raw_path,
+  builder = file.path(project_dir, "Code", "2_data_analysis", "2.6_create_riskset_individual_types.R"),
+  matching_engine = file.path(project_dir, "Code", "2_data_analysis", "2.0_riskset_matching_functions.R"),
+  glme_engine = file.path(project_dir, "Code", "2_data_analysis", "4.0_GLME_spline_functions.R")
+)
+if (any(!file.exists(individual_type_source_paths))) {
+  stop("A current 4.7 source or input file is missing: ",
+       paste(names(individual_type_source_paths)[!file.exists(individual_type_source_paths)], collapse = ", "),
+       call. = FALSE)
+}
+individual_type_source_hashes <- vapply(
+  individual_type_source_paths, function(path) unname(tools::md5sum(path)), character(1)
+)
+
+read_individual_type_artifacts <- function(site, cohort_label, prefix) {
+  run_row <- individual_type_run_status[
+    individual_type_run_status$site == site, , drop = FALSE
+  ]
+  if (nrow(run_row) != 1L || !identical(as.character(run_row$status[[1]]), "fit") ||
+      !as.character(run_row$m1_status[[1]]) %in% c("fit", "fit_boundary_matching_variance_zero")) {
+    stop("4.7 site ", site, " is not recorded as a successful current fit; inspect ",
+         individual_type_run_path, call. = FALSE)
+  }
+  hash_columns <- c("input_md5", "builder_md5", "matching_engine_md5", "glme_engine_md5")
+  if (!all(vapply(seq_along(hash_columns), function(i) {
+    identical(as.character(run_row[[hash_columns[[i]]]][[1]]), individual_type_source_hashes[[i]])
+  }, logical(1)))) {
+    stop("4.7 site ", site, " was run with different source/input files. Rerun 4.7 before rendering.",
+         call. = FALSE)
+  }
+
+  matched_path <- file.path(data_dir, paste0("riskset_matched_site_", site, "_long.rds"))
+  provenance <- validate_matching_provenance(matched_path)
+  if (!identical(as.character(run_row$matched_md5[[1]]), provenance$input_md5)) {
+    stop("4.7 site ", site, " results do not match the current matched input. Rerun 4.7 before rendering.",
+         call. = FALSE)
+  }
+  metadata_path <- file.path(results_dir, paste0(prefix, "_spline_metadata.rds"))
+  if (!file.exists(metadata_path)) stop("4.7 metadata is missing for site ", site, call. = FALSE)
+  fit_metadata <- readRDS(metadata_path)
+  if (!length(fit_metadata) || !all(vapply(fit_metadata, function(x)
+      identical(x$input_md5, provenance$input_md5) &&
+      identical(x$assignment_md5, provenance$assignment_md5), logical(1)))) {
+    stop("4.7 site ", site, " saved results use older matched data. Rerun 4.7 before rendering.",
+         call. = FALSE)
+  }
+
+  matched_data <- readRDS(matched_path)
+  missing_matched_columns <- setdiff(required_matched_columns, names(matched_data))
+  if (length(missing_matched_columns)) {
+    stop("4.7 matched data for ", site, " is missing: ",
+         paste(missing_matched_columns, collapse = ", "), call. = FALSE)
+  }
+  matched_data <- matched_data %>%
+    mutate(
+      Analysis_Prefix = site,
+      id = as.character(id),
+      match_set = as.character(match_set),
+      role = as.character(role),
+      Cohort = as.character(Cohort),
+      Group = factor(as.character(Group), levels = group_order),
+      index_age = as_numeric_safely(index_age),
+      Age_Centered = as_numeric_safely(Age_Centered),
+      fi_score_nocancer = as_numeric_safely(fi_score_nocancer),
+      post_own_cancer = as.logical(post_own_cancer)
+    ) %>%
+    filter(!post_own_cancer)
+  matched_assignments <- read_matching_assignments(matched_path) %>%
+    mutate(
+      Analysis_Prefix = site,
+      id = as.character(id),
+      match_set = as.character(match_set),
+      role = as.character(role),
+      Cohort = as.character(Cohort),
+      Group = factor(as.character(Group), levels = group_order)
+    )
+
+  model_status <- read_csv_artifact(prefix, "_spline_model_status.csv")
+  predictions <- read_csv_artifact(prefix, "_spline_predicted_trajectories.csv")
+  if (is.null(model_status) || is.null(predictions)) {
+    stop("One or more saved 4.7 model artifacts are missing for site ", site, call. = FALSE)
+  }
+  required_status <- c("Cohort", "model_id", "status", "n_obs", "n_id", "convergence")
+  required_predictions <- c("Cohort", "model_id", "Group", "Age_Centered", "pred", "lwr", "upr")
+  required_artifacts <- list(
+    model_status = required_status,
+    predictions = required_predictions
+  )
+  for (artifact_name in names(required_artifacts)) {
+    artifact <- get(artifact_name, inherits = FALSE)
+    missing <- setdiff(required_artifacts[[artifact_name]], names(artifact))
+    if (length(missing)) {
+      stop("4.7 ", artifact_name, " for ", site, " is missing: ",
+           paste(missing, collapse = ", "), call. = FALSE)
+    }
+  }
+  for (artifact in list(model_status, predictions)) {
+    if (!all(as.character(artifact$Cohort) == cohort_label)) {
+      stop("4.7 cohort label does not match the report configuration for site ", site, call. = FALSE)
+    }
+  }
+  if (anyDuplicated(model_status$model_id)) {
+    stop("4.7 site ", site, " has duplicate model rows.", call. = FALSE)
+  }
+  expected_models <- names(model_order)
+  if (!setequal(model_status$model_id, expected_models)) {
+    stop("4.7 site ", site, " does not contain the complete M0--M3 result set.", call. = FALSE)
+  }
+  m1_status <- model_status[model_status$model_id == "M1_primary_spline", , drop = FALSE]
+  if (nrow(m1_status) != 1L ||
+      !as.character(m1_status$status[[1]]) %in% c("fit", "fit_boundary_matching_variance_zero") ||
+      !isTRUE(as.logical(m1_status$convergence[[1]]))) {
+    stop("4.7 M1 failed its required convergence check for site ", site, call. = FALSE)
+  }
+  list(
+    matched_data = matched_data,
+    matched_assignments = matched_assignments,
+    model_status = model_status,
+    predictions = predictions
+  )
+}
+
+individual_type_artifacts <- lapply(seq_len(nrow(individual_type_inputs)), function(i) {
+  read_individual_type_artifacts(
+    individual_type_inputs$site[[i]], individual_type_inputs$cohort_label[[i]],
+    individual_type_inputs$prefix[[i]]
+  )
+})
+
+individual_type_matched_long <- bind_rows(lapply(individual_type_artifacts, `[[`, "matched_data"))
+individual_type_matched_assignments <- bind_rows(
+  lapply(individual_type_artifacts, `[[`, "matched_assignments")
+)
+
+individual_type_assignment_summary <- individual_type_matched_long %>%
+  arrange(Analysis_Prefix, Cohort, match_set, id, role, Age_Centered) %>%
+  group_by(Analysis_Prefix, Cohort, match_set, id, role, Group) %>%
+  summarize(
+    index_age = first_nonmissing(index_age),
+    fi_first_observed = first_nonmissing(fi_score_nocancer),
+    fi_last_pre_index = last_nonmissing(fi_score_nocancer[Age_Centered < 0]),
+    n_fi_observations = sum(!is.na(fi_score_nocancer)),
+    n_pre_index_fi = sum(!is.na(fi_score_nocancer) & Age_Centered < 0),
+    n_post_index_fi = sum(!is.na(fi_score_nocancer) & Age_Centered >= 0),
+    base_race = first_nonmissing(base_race),
+    base_marital = first_nonmissing(base_marital),
+    base_living = first_nonmissing(base_living),
+    base_pckgr = first_nonmissing(base_pckgr),
+    base_calor = first_nonmissing(base_calor),
+    base_sat = first_nonmissing(base_sat),
+    base_diet_chol = first_nonmissing(base_diet_chol),
+    base_alco = first_nonmissing(base_alco),
+    .groups = "drop"
+  )
+
+individual_type_assignment_summary <- complete_assignment_summary(
+  individual_type_matched_assignments,
+  individual_type_assignment_summary,
+  keys = c("Analysis_Prefix", "Cohort", "match_set", "id", "role", "Group"),
+  count_columns = c("n_fi_observations", "n_pre_index_fi", "n_post_index_fi")
+)
+if (!is.null(baseline_extra)) {
+  individual_type_assignment_summary <- individual_type_assignment_summary %>%
+    left_join(baseline_extra, by = "id")
+}
+individual_type_assignment_summary <- individual_type_assignment_summary %>%
+  mutate(
+    Cohort = factor(Cohort, levels = individual_type_inputs$cohort_label),
+    Group = factor(Group, levels = group_order)
+  )
+
+individual_type_table1_long <- bind_rows(lapply(seq_len(nrow(individual_type_inputs)), function(i) {
+  site_data <- individual_type_assignment_summary %>%
+    filter(Analysis_Prefix == individual_type_inputs$site[[i]])
+  bind_rows(lapply(unique(as.character(site_data$Cohort)), function(cohort_name) {
+    cohort_data <- site_data %>% filter(as.character(Cohort) == cohort_name)
+    bind_rows(
+      lapply(names(continuous_vars), function(v) summarize_continuous(cohort_data, v, continuous_vars[[v]])),
+      lapply(names(categorical_vars), function(v) summarize_categorical(cohort_data, v, categorical_vars[[v]]))
+    ) %>% mutate(Cohort = cohort_name)
+  }))
+})) %>%
+  mutate(
+    Variable = factor(Variable, levels = table1_row_order),
+    Group = factor(Group, levels = group_order),
+    Cohort = factor(Cohort, levels = individual_type_inputs$cohort_label),
+    variable_order = match(as.character(Variable), table1_row_order)
+  )
+
+individual_type_table1_wide <- individual_type_table1_long %>%
+  mutate(
+    Characteristic = if_else(is.na(Level), as.character(Variable), paste0("&nbsp;&nbsp;", as.character(Level))),
+    Characteristic_order = variable_order * 1000 + Level_order
+  ) %>%
+  select(Cohort, Group, Characteristic, Characteristic_order, Statistic) %>%
+  tidyr::pivot_wider(
+    id_cols = c(Characteristic, Characteristic_order),
+    names_from = c(Cohort, Group), values_from = Statistic, names_sep = "__"
+  ) %>%
+  arrange(Characteristic_order) %>%
+  select(-Characteristic_order)
+individual_type_table1_columns <- unlist(lapply(
+  individual_type_inputs$cohort_label,
+  function(cohort) paste(cohort, group_order, sep = "__")
+), use.names = FALSE)
+individual_type_table1_wide <- individual_type_table1_wide %>%
+  select(Characteristic, any_of(individual_type_table1_columns))
+individual_type_table1_counts <- individual_type_assignment_summary %>%
+  count(Cohort, Group, name = "n") %>%
+  tidyr::complete(
+    Cohort = factor(individual_type_inputs$cohort_label,
+                    levels = individual_type_inputs$cohort_label),
+    Group = factor(group_order, levels = group_order),
+    fill = list(n = 0)
+  )
+
+individual_type_predictions <- bind_rows(lapply(individual_type_artifacts, `[[`, "predictions")) %>%
+  filter(model_id %in% names(model_order)) %>%
+  mutate(
+    Cohort = factor(Cohort, levels = individual_type_inputs$cohort_label),
+    Model = factor(unname(model_order[model_id]), levels = unname(model_order)),
+    Group = factor(as.character(Group), levels = c("Control", "Cancer Case"))
+  )
+if (!nrow(individual_type_predictions)) {
+  stop("No saved 4.7 individual-type trajectory predictions were found.", call. = FALSE)
+}
 
 trajectory_predictions <- bind_rows(lapply(cohort_inputs$prefix, function(prefix) {
   x <- read_csv_artifact(prefix, "_spline_predicted_trajectories.csv")
@@ -394,7 +675,7 @@ format_wald_table <- function(x) {
 
 ## Table One: matched case and control assignments
 
-The table is summarized at the matched-assignment level. A control participant
+The table includes all assignments in the complete matched ledger, including participants with no FI observations. FI statistics use available observations after own-cancer censoring; fitted models further apply their covariate-completeness requirements. A control participant
 may therefore contribute to more than one control assignment because the
 risk-set design permits matching with replacement. Repeated FI observations are
 not counted as separate Table One participants. Continuous variables are shown
@@ -426,6 +707,47 @@ saturated fat, dietary cholesterol, and alcohol. BMI and physical activity are
 displayed when available from the source data as descriptive covariates and are
 not silently treated as current 4.x model adjustments.
 
+## Table One (4.7): matched individual cancer-type assignments
+
+This separate table uses the same assignment-level summaries and paired
+cancer-case/control columns as the grouped-cohort Table One. It is kept separate
+to make the six site-specific cohorts easier to read. Reused controls remain
+separate assignments, and assignments without FI observations remain in the
+denominators.
+
+```{r individual-type-table-one, results='asis'}
+individual_type_header_top <- c("Characteristic" = 1)
+for (cohort in individual_type_inputs$cohort_label) {
+  individual_type_header_top <- c(
+    individual_type_header_top,
+    setNames(2, individual_type_labels[[cohort]])
+  )
+}
+individual_type_subheader <- c("Characteristic")
+for (cohort in individual_type_inputs$cohort_label) {
+  for (group in group_order) {
+    n_value <- individual_type_table1_counts$n[
+      individual_type_table1_counts$Cohort == cohort &
+        individual_type_table1_counts$Group == group
+    ]
+    individual_type_subheader <- c(
+      individual_type_subheader,
+      paste0(group_labels[[group]], "<br>(n = ", n_value, ")")
+    )
+  }
+}
+individual_type_table1_wide %>%
+  kable(
+    format = "html", escape = FALSE, col.names = individual_type_subheader,
+    caption = "Table One (4.7). Baseline characteristics of matched individual cancer-type cases and controls",
+    align = c("l", rep("c", ncol(individual_type_table1_wide) - 1))
+  ) %>%
+  add_header_above(individual_type_header_top, escape = FALSE) %>%
+  kable_styling(full_width = TRUE, bootstrap_options = c("striped", "condensed"), font_size = 9) %>%
+  row_spec(0, bold = TRUE) %>%
+  scroll_box(width = "100%", height = "700px")
+```
+
 <!--
 The Joint Wald tests are temporarily hidden from rendered HTML. The original
 source and chunk labels are retained so this section can be restored later by
@@ -436,19 +758,6 @@ removing this HTML comment and the `eval=FALSE, include=FALSE` chunk options.
 These are saved results from the active GLME artifacts. The report preserves the
 reported covariance and inference method; it does not relabel model-based
 results as CR2.
-
-### Event-study joint Wald tests
-
-```{r event-study-wald, results='asis', eval=FALSE, include=FALSE}
-event_wald_display <- format_wald_table(joint_tests)
-if (is.null(event_wald_display)) {
-  cat("*Saved event-study joint Wald tests are unavailable.*\n")
-} else {
-  event_wald_display %>%
-    kable(format = "html", escape = FALSE, caption = "Saved event-study joint Wald tests") %>%
-    kable_styling(full_width = TRUE, bootstrap_options = c("striped", "condensed"), font_size = 9)
-}
-```
 
 ### Natural-spline trajectory-shape tests
 
@@ -500,10 +809,53 @@ p_trajectory <- ggplot(
 print(p_trajectory)
 ```
 
+## Individual cancer-type trajectories (4.7)
+
+The six site-specific cohorts use the same M0--M3 model definitions as the
+grouped analyses, with a separate risk-set match for each cancer type. Shaded
+areas show the saved pointwise 95% confidence intervals. Curves stop at each
+site's saved prediction limits.
+
+### Individual-type trajectories by model
+
+Each row is one 4.7 site cohort, and each column is one saved model. Shaded
+areas are the saved pointwise 95% confidence intervals. Lines stop at the
+site/model prediction limits shown in the table above.
+
+```{r individual-type-trajectories, fig.width=16, fig.height=16, out.width='100%'}
+p_individual_type_trajectory <- ggplot(
+  individual_type_predictions,
+  aes(x = Age_Centered, y = pred, group = Group, color = Group, fill = Group)
+) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.16, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey35") +
+  facet_grid(Cohort ~ Model) +
+  scale_color_manual(values = group_cols) +
+  scale_fill_manual(values = group_cols) +
+  scale_x_continuous(breaks = seq(-20, 20, by = 4)) +
+  labs(
+    title = "Individual cancer-type trajectories across model specifications",
+    subtitle = "Six site-specific cohorts; shaded areas are saved pointwise 95% confidence intervals",
+    x = "Years relative to cancer diagnosis / assigned index",
+    y = "Predicted frailty index",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    strip.text.y = element_text(angle = 0)
+  )
+print(p_individual_type_trajectory)
+```
+
 ### M2 trajectory plots
 
-The following plot displays only the M2 full-covariate spline model, with one
-cancer cohort per row.
+These plots display only the M2 full-covariate spline model. The first plot has
+one grouped cancer cohort per panel.
 
 ```{r m2-trajectory-plots, fig.width=14, fig.height=10, out.width='100%'}
 m2_predictions <- trajectory_predictions %>%
@@ -535,4 +887,41 @@ p_m2_trajectory <- ggplot(
     strip.text.y = element_text(angle = 0, face = "bold")
   )
 print(p_m2_trajectory)
+```
+
+#### Individual cancer-type M2 trajectories (4.7)
+
+The following plot shows the saved M2 trajectories for the six site-specific
+cohorts. Curves stop at each site's saved prediction limits.
+
+```{r individual-type-m2-trajectories, fig.width=14, fig.height=10, out.width='100%'}
+individual_type_m2_predictions <- individual_type_predictions %>%
+  filter(model_id == "M2_full_spline")
+
+p_individual_type_m2_trajectory <- ggplot(
+  individual_type_m2_predictions,
+  aes(x = Age_Centered, y = pred, group = Group, color = Group, fill = Group)
+) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.16, color = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey35") +
+  facet_wrap(~ Cohort, ncol = 2) +
+  scale_color_manual(values = group_cols) +
+  scale_fill_manual(values = group_cols) +
+  scale_x_continuous(breaks = seq(-20, 20, by = 4)) +
+  labs(
+    title = "Individual cancer-type M2 trajectories",
+    subtitle = "Full-covariate natural-spline model; shaded areas are saved pointwise 95% confidence intervals",
+    x = "Years relative to cancer diagnosis / assigned index",
+    y = "Predicted frailty index",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+print(p_individual_type_m2_trajectory)
 ```

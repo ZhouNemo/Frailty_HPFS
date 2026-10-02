@@ -1,12 +1,23 @@
 # Code README
 
+**Verified rebuild (2026-09-29):** Nemo has now rebuilt all five primary matched cohorts. Their `no_fi_requirement_v1` contracts, outcome/assignment hashes, and Gate G4 pass. This supersedes the earlier pending-regeneration statement for these matched inputs only; downstream model results have not been validated as regenerated. The 3.4 audit uses these actual rebuilt files, not synthetic data.
+
+## Eligibility revision — 2026-09-29
+
+Primary matching imposes **no FI availability requirement** on either cases or controls: no pre-index or recent FI, recent questionnaire participation, post-index FI, or post-index survival is required. Entry remains the first participated designated analytic-cycle questionnaire with usable birth and return dates, regardless of FI. Cases must have incident cancer after entry, usable index/birth dates, a supported index calendar and cohort classification, and at least one eligible control. Controls must have entered on or before the case index, be alive and cancer-free under the existing date rules, be within ±2 years of the case's attained age, and not be that case. Future cases remain eligible before diagnosis. Up to five controls, reuse across risk sets, four-year outcome cycles, FI construction/completeness, and later-own-cancer censoring are unchanged. Survival-stratum classification in 2.4 remains a separate, unchanged subgroup definition.
+
+**Implementation status:** code specification revised 2026-09-29; no matching or model fitting has been run for this change. Existing datasets and results remain previous-specification artifacts pending Nemo's regeneration. The new `no_fi_requirement_v1` contract records `fi_requirement = "none"`, `cohort_entry_rule = "first_participated_analytic_cycle_return"`, `control_entry_on_or_before_index = TRUE`, Gate G4, and hashes of both observed-outcome and assignment files. Legacy and `recent_fi_v1` cohorts are rejected. Every selected assignment, including zero-FI cases and controls, is saved in `riskset_matched_<cohort>_assignments.rds`; existing `*_long.rds` files contain only observed FI rows. Matched-population counts use the complete ledger; FI-contributing and model-complete populations are reported separately. No missing-outcome placeholder rows or outcome-driven control replacements are created.
+
+**Retired:** S7 exact-questionnaire-cycle sensitivity and the separate cancer-free-through-end-of-follow-up design. Their existing datasets, diagnostics, and results are historical only; they are neither regenerated nor included in active reports. The four 9.0/9.1/10.0/10.1 workflow scripts have been deleted. Other sensitivity IDs retain their numbering.
+
+
 Project: Frailty Trajectories Before and After Incident Cancer in the Health Professionals Follow-up Study
 
 Author: Nemo Zhou
 
 Date started: 2026-06-28
 
-Date last updated: 2026-07-28 (added restricted time-varying-covariate M2 GLMEs for active cohorts and the combined 4.7 trajectory visualizer)
+Date last updated: 2026-09-29 (FI-independent eligibility, assignment ledgers, M2-aligned joint-model revision, and 4.7 report integration)
 
 ## Purpose
 
@@ -26,9 +37,7 @@ Knitted HTML/PDF visual reports should be saved to:
 
 `/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Results/cancer/visuals`
 
-Each active 4.x GLME run also saves one three-page PDF in that directory,
-`4.x_GLME_figures.pdf`, containing the event-study contrasts, event-study
-predicted means, and natural-spline trajectory in that order.
+Active 4.x GLME runs save spline data and return plot objects. The event-study analysis was removed on 2026-09-20. Render `4.6_GLME_summary_report.Rmd` for grouped-cohort and 4.7 individual cancer-type results; the report checks 4.7 run status, matching provenance, and current input/engine hashes before displaying its assignment-level Table One and saved trajectories. Rerun the 4.0.3 comparison before rendering its separate df-comparison trajectory report. The shared engine no longer writes PDFs directly.
 
 Persistent PNG files are not saved. Active analysis scripts save plot-ready CSV/RDS data and return plot objects; active R Markdown files render the visual outputs with `knitr`.
 
@@ -49,6 +58,10 @@ rmarkdown::render(
 )
 rmarkdown::render(
   "Code/2_data_analysis/4.6_GLME_summary_report.Rmd",
+  output_dir = "Results/cancer/visuals"
+)
+rmarkdown::render(
+  "Code/2_data_analysis/4.0.3_GLME_m1_df_trajectory_comparison.Rmd",
   output_dir = "Results/cancer/visuals"
 )
 ```
@@ -160,15 +173,15 @@ Run scripts in `2_data_analysis` after the cleaned analytic dataset and time var
 
 2. `2_data_analysis/2.0_riskset_matching_functions.R`
     - Shared incidence-density risk-set matching helper used by 2.1-2.5.
-    - Builds active-at-index eligibility from participation history and applies
-      the identical rule to cases and controls: a latest participated target
-      cycle on/before index within the cycle caliper and at least one nonmissing
-      pre-index FI. Post-index FI and whole-follow-up span never establish entry.
-    - Uses primary `min_visits = 1`, seed `20260703`, and up to 1:5 matching with
+    - FI availability never determines matching eligibility. First participated
+      analytic-cycle return defines entry; controls must enter on/before index.
+      Both arms may have zero FI, post-index-only FI, or only older FI.
+    - Saves a complete assignment ledger independently of observed long rows.
+      Uses seed `20260703` and up to 1:5 matching with
       replacement across risk sets. It retains every eligible analytic-cycle FI
       row and adds ±8/±12/±16/±20 support flags without a relative-time filter.
     - Adds design metadata including `trajectory_id`, `index_cycle`,
-      `index_cycle_rule`, `riskset_size`, `age_gap`, `cycle_gap`, and
+      `index_cycle_rule`, `riskset_size`, `age_gap`, recent/total pre-index FI counts, FI dates/gap, and
       `post_own_cancer`; case-based index-age scaling constants, set-integrity,
       caliper, balance, visit-support, run-configuration, and input-hash metadata;
       writes matching diagnostic CSVs under
@@ -181,45 +194,29 @@ Run scripts in `2_data_analysis` after the cleaned analytic dataset and time var
       cancer-free eligibility, and rejects nonconstant subgroup flags within
       participant rather than reconstructing ever-status from later rows.
     - `build_riskset_matched_long()` no longer accepts `window_yrs`; wrappers
-      2.1–2.5 use the shared unrestricted-row interface. This file is sourced by
+      2.1–2.6 use the shared unrestricted-row interface. This file is sourced by
       the cohort builders and is not intended to be run directly.
 
 3. `2_data_analysis/2.1_create_riskset_high_low_burden.R`
     - Creates and overwrites `Data/riskset_matched_analysis_long.rds`.
-    - Also creates `Data/riskset_matched_analysis_exact_cycle_long.rds` for the
-      exact-cycle S7 rematch, reusing the primary case-based index-age scaling.
-    - Also creates `Data/riskset_matched_analysis_exact_cycle_long.rds` for
-      exact-cycle sensitivity S7, reusing the primary case-based age scale.
     - Uses the canonical `is_high_burden` flag from `7.4_cancer_subtypes.R` to
       build Low/Moderate Burden and High Burden cohorts, each with separately
       matched risk-set controls using the shared 2.0 design settings.
 
 4. `2_data_analysis/2.2_create_riskset_smoking_related.R`
     - Creates and overwrites `Data/riskset_matched_smoking_long.rds`.
-    - Also creates `Data/riskset_matched_smoking_exact_cycle_long.rds` for the
-      exact-cycle S7 rematch, reusing the primary case-based index-age scaling.
-    - Also creates `Data/riskset_matched_smoking_exact_cycle_long.rds` for
-      exact-cycle sensitivity S7, reusing the primary case-based age scale.
     - Uses the canonical `is_smoking_cancer` flag from `7.4_cancer_subtypes.R`
       to build a Smoking-Related Cancer Cohort versus cancer-free controls
       using the shared 2.0 design settings.
 
 5. `2_data_analysis/2.3_create_riskset_obesity_related.R`
     - Creates and overwrites `Data/riskset_matched_obesity_long.rds`.
-    - Also creates `Data/riskset_matched_obesity_exact_cycle_long.rds` for the
-      exact-cycle S7 rematch, reusing the primary case-based index-age scaling.
-    - Also creates `Data/riskset_matched_obesity_exact_cycle_long.rds` for
-      exact-cycle sensitivity S7, reusing the primary case-based age scale.
     - Uses the canonical `is_obesity_cancer` flag from `7.4_cancer_subtypes.R`
       to build an Obesity-Related Cancer Cohort versus cancer-free controls
       using the shared 2.0 design settings.
 
 6. `2_data_analysis/2.4_create_riskset_survival.R`
     - Creates and overwrites `Data/riskset_matched_survival_long.rds`.
-    - Also creates `Data/riskset_matched_survival_exact_cycle_long.rds` for the
-      exact-cycle S7 rematch, reusing the primary case-based index-age scaling.
-    - Also creates `Data/riskset_matched_survival_exact_cycle_long.rds` for
-      exact-cycle sensitivity S7, reusing the primary case-based age scale.
     - Builds Died <=5y and Survived >5y cohorts among incident cancer cases.
       Alive cases with <5 years of observed post-diagnosis follow-up are excluded
       because their >5-year survival status is not determined. Matching uses the
@@ -230,56 +227,34 @@ Run scripts in `2_data_analysis` after the cleaned analytic dataset and time var
     - Pools all incident (first) cancer cases into a single "All Cancer Cohort"
       and matches risk-set cancer-free controls. This is the overall primary
       comparison (any incident cancer vs control); 2.1-2.4 are stratified
-      versions of the same design. It also builds the exact-cycle rematched S7
-      dataset and saves case-eligibility, integrity, balance, scaling, and run
+      versions of the same design. It saves case-eligibility, integrity, balance, scaling, and run
       metadata. The same repaired interface is now used by all subgroup
       builders; production rebuilding remains a separate sequential step.
 
-### Separate cancer-free-through-full-endpoint sensitivity workflow
+8. `2_data_analysis/2.6_create_riskset_individual_types.R`
+    - One script builds six separate first-cancer site cohorts: lung 162,
+      colorectal 153–154, prostate 185, bladder 188, pancreas 157, and
+      kidney/other urinary 189. It uses `cancer_index_icds` from the earliest
+      dated diagnosis; a same-date multi-site case enters each applicable
+      cohort, while later cancers cannot reclassify a case.
+    - Reuses 2.0 matching rules and the full cancer-free control pool. For each
+      site it saves `Data/riskset_matched_site_<site>_long.rds`, the corresponding
+      `_assignments.rds`, separate Gate G4 and matching diagnostics, and source,
+      builder, engine and site-definition provenance. The `site_` prefix avoids
+      replacing the older `riskset_matched_prostate_long.rds` artifact.
+    - Runs all six by default or one with `--site=<site>`. Its status file is
+      `Results/cancer/data/matching_diagnostics/2.6_individual_type_run_status.csv`;
+      a failed site is marked failed even if an older file remains on disk.
+      This is long-running and must be run by Nemo, after 7.4 and before 4.7.
 
-The following scripts are run after the canonical cancer classification and
-analytic FI dataset are available. They are intentionally separate from the
-2.x builders and do not overwrite any primary matching dataset or 3.xx report
-input.
+8a. `tests/2.6_test_individual_type_classification.R`
+    - Fast, synthetic checks of exact ICD matching, colorectal 153/154,
+      simultaneous first-date sites, exclusion of later sites, malformed codes,
+      and `--site` selection. It runs no matching or GLME.
 
-- `2_data_analysis/9.0_cancer_free_matching_functions.R`
-  - Self-contained matching helper based on the active 2.0 design.
-  - Retains alive-at-index, active-follow-up, age, analytic-cycle, and pre-index
-    FI-support eligibility while requiring controls to have no cancer through
-    the maximum observed `cancer_index_dateca` month in the complete input dataset.
-  - Records the derived endpoint, endpoint units, rule, input MD5, matching
-    parameters, output MD5, and endpoint-specific control diagnostics.
+### Retired designs (2026-09-28)
 
-- `2_data_analysis/9.1_create_cancer_free_high_low_burden.R`
-  - Uses the canonical `is_high_burden` flag to match High Burden and
-    Low/Moderate Burden cohorts separately.
-  - Writes isolated primary and exact-cycle S7 outputs:
-    `Data/riskset_matched_analysis_cancer_free_full_endpoint_long.rds` and
-    `Data/riskset_matched_analysis_cancer_free_full_endpoint_exact_cycle_long.rds`.
-  - Writes uniquely prefixed matching diagnostics under
-    `Results/cancer/data/matching_diagnostics`.
-
-### GLME for the cancer-free-through-full-endpoint cohort
-
-Run these scripts only after `9.1_create_cancer_free_high_low_burden.R` has
-completed and its Gate G4, integrity, balance, endpoint-cancer, and MD5
-provenance diagnostics have passed.
-
-- `2_data_analysis/10.0_GLME_cancer_free_functions.R`
-  - Self-contained copy of the active `4.0_GLME_spline_functions.R` engine.
-  - Preserves the event-study and natural-spline Gaussian LME specifications,
-    convergence checks, CR2/CR0/model-based covariance handling, diagnostics,
-    predictions, contrasts, and model outputs.
-  - Refuses to fit a matched input unless its matching provenance identifies the
-    9.xx `through_full_hpfs_endpoint` design and the retained controls pass the
-    endpoint flag assertion.
-
-- `2_data_analysis/10.1_GLME_cancer_free_high_low_burden.R`
-  - Reads `Data/riskset_matched_analysis_cancer_free_full_endpoint_long.rds`.
-  - Runs the high-burden and Low/Moderate Burden cohorts through the 10.0
-    engine and writes uniquely prefixed `10.1_` CSV outputs plus
-    `Results/cancer/visuals/10.1_GLME_figures.pdf`.
-  - Does not modify 4.x model outputs or matching datasets.
+The separate cancer-free-through-full-endpoint workflow (former 9.0/9.1/10.0/10.1 scripts) has been deleted. Existing `*cancer_free_full_endpoint*` datasets and `10.1_*` results remain historical only. S7 exact-cycle outputs are likewise retired; primary builders no longer generate them. Do not execute or report either design as an active analysis.
 
 8. `2_data_analysis/3.1_descriptive_riskset_cohorts.Rmd`
     - Matching-cohort descriptive EDA report for the risk-set matched cohort families
@@ -343,51 +318,38 @@ provenance diagnostics have passed.
       matching or GLME models.
 
 11. `2_data_analysis/4.0_GLME_spline_functions.R`
-    - Shared engine for the time-bin GLME event-study analysis and the
-      natural-spline Gaussian LME model set, used by 4.1-4.5. Methods documented in
-      `Documents/Methods/TimeBin_GLME_EventStudy_Analysis.md` and
-      `Documents/Methods/GLME_Natural_Spline_Trajectory_Analysis.md`.
-    - Per cohort: cuts relative time into the 2-year event-study bins from `1.1`
-      (reference = last pre-index bin `-2 to 0`); fits the saturated
-      `Group * rel_time_bin` GLME with a random intercept; attempts CR2
-      cluster-robust SEs on participant `id` and falls back to CR0 or model-based
-      inference when necessary (control reuse makes `id` non-nested within
-      `match_set`); runs
-      global/pre-index/post-index joint Wald tests; and fits M0 raw df-3 spline,
-      M1 primary df-3 spline, M2 full df-3 spline, and M3 matching-set df-3
-      spline models from the GLME methods file. The models fit all eligible matched long rows
-      and restrict predictions/contrasts/plots to the ±20 support window. S3
-      and S4 retain ±8 and ±12 support windows.
-    - Writes event-study outputs plus spline fixed-effect CIs, predicted
-      trajectories, cancer-minus-control difference curves, theta summaries,
-      and model-status tables. Each run also saves one three-page
-      `4.x_GLME_figures.pdf` to `Results/cancer/visuals`; no PNG files are saved.
-    - Before every primary fit, excludes `post_own_cancer` control rows at or
-      after the control's own later cancer diagnosis, while preserving the
-      pre-diagnosis assignment history and requiring a current matched dataset.
-    - Separates event-study support-qualified bins from the all-eligible model
-      fitting data; centers/scales model-specific spline columns (and M2's
-      continuous dietary covariates), replays those
-      stored transformations for every prediction/contrast grid, and writes
-      support, complete-case-filter, own-cancer-censoring, derivative,
-      spline-scaling, and spline-basis metadata artifacts. Covariance uses the
-      explicit CR2 -> CR0 -> model-based fallback (with M3 retained when robust
-      covariance is unavailable). Adjusted prediction grids use the most common
-      factor level among distinct participants in each model-specific complete-
-      case sample, rather than an arbitrary first factor level; prediction is
-      restricted to a continuous two-arm support window. Every subgroup fit
-      first validates Gate G4 and the matched-RDS input hash.
-    - This file is sourced by 4.1-4.5 and is not intended to be run directly.
+    - Shared spline-only engine, sourced by 4.1, 4.2, 4.3 and 4.5; sourcing does not fit models. Entry point: `run_spline_analysis()`.
+    - Requires matched-RDS Gate G4 and MD5 provenance; censors later-own-cancer control rows; retains all eligible times; applies model-specific complete-case filtering. Fits M0 minimally adjusted, M1 primary, M2 expanded covariates and M3 matching-set spline models. Missing M2 columns skip M2 without blocking the other models.
+    - Retains all support bins, including empty bins, to determine continuous two-arm prediction support. Four-year analytic FI cycles remain upstream; two-year bins only describe support.
+    - Constructs df-3 spline bases and stores scaling; builds reference covariates from unscaled data and applies transformations once. Random slopes use `(age_at_cycle - 60) / 4`; fixed splines remain diagnosis-relative. Numerical remediation precedes evidence-gated structural simplification (see final plan below).
+    - Validates participant alignment, covariance properties, coefficient tests and actual scientific contrasts. Writes per-model covariance logs with stage, warning/error, package version and fallback selection. Model-based fallback remains available but is explicitly flagged for review.
+    - Uses exact endpoint contrasts for theta, cached reference profiles and vectorized derivative grids. M1 fit contexts permit S3--S6 summaries without refitting. The expensive ten-group influence refits are opt-in via `run_influence = TRUE`, not part of ordinary wrapper execution.
+    - Checkpoints model status, convergence, filtering, scaling and metadata on exit. Returns plot objects and writes plot-ready CSV/RDS summaries under `Results/cancer/data`; event-study fitting/output and direct PDF writing are removed. Historical output files are not deleted or regenerated during code repair.
+    - Methods: `Documents/Methods/GLME_Natural_Spline_Trajectory_Analysis.md`. After diagnostics are reviewed, Nemo runs the relevant wrapper, then knits the saved-output report.
+
+11c. `2_data_analysis/4.0.3_GLME_m1_df_aic_comparison.R`
+    - Optional, separate M1-only comparison of natural-spline df 3 versus df 4 for all active cohorts: Low/Moderate Burden and High Burden (4.1), smoking-related (4.2), obesity-related (4.3), and overall cancer (4.5). Run only after the corresponding matched datasets pass Gate G4 and their saved MD5 provenance checks.
+    - Applies the shared engine's M1 analytic rows: observed cancer-excluded FI and relative time, removal of post-own-cancer rows, and complete cases for `index_age_z`, `base_race`, `base_marital`, and `base_living`. Each within-cohort pair uses identical row keys and the same correlated participant intercept and attained-age slope. Both fits use ML; bobyqa/nloptwrap retries are allowed, while random-effects simplification is disabled.
+    - Only spline df changes. The runner checks ML status, fitted row keys, observation counts, paired AIC arithmetic and fit status. If either fit fails, it records both fit statuses and leaves the pair's delta AIC blank. A negative `AIC(df 4) - AIC(df 3)` favors df 4. AIC is compared within each cohort, never across cohorts. The existing df-3 production results and the shared fitters' default REML behavior remain unchanged.
+    - For each successful pair, also saves fixed-effect predictions and conventional model-based pointwise 95% intervals over the contiguous support-gated window. These comparison-only intervals are not CR2 and do not replace production inference. Run from the project root: `Rscript Code/2_data_analysis/4.0.3_GLME_m1_df_aic_comparison.R`. Writes the comparison, fit-status, convergence-attempt, prediction, and run-metadata files named `4.0.3_m1_spline_df_*` under `Results/cancer/data`. The metadata records matched-input/Gate G4 hashes, engine/runner hashes, spline knots/scaling and row-key hashes.
+
+11d. `2_data_analysis/4.0.3_GLME_m1_df_trajectory_comparison.Rmd`
+    - Read-only report for saved fitted M1 trajectories from the 4.0.3 df=3/df=4 ML comparisons. It checks the runner/engine and matched-input hashes in run metadata, displays the within-cohort AIC table, and facets case/control trajectories by cohort and spline df in the style of 4.6. Ribbon intervals are identified as conventional model-based intervals, not CR2. It fits no models and writes no persistent PNG files.
+    - Render after rerunning the 4.0.3 comparison: `rmarkdown::render("Code/2_data_analysis/4.0.3_GLME_m1_df_trajectory_comparison.Rmd", output_dir = "Results/cancer/visuals")`. Output: `Results/cancer/visuals/4.0.3_GLME_m1_df_trajectory_comparison.html`.
+
+11a. `tests/4.0_test_spline_contracts.R`
+    - Fast pure/helper and mocked-orchestration regressions: missing internal support bins, df-3 basis, single-pass dietary scaling, exact theta, invalid covariances, absent optional M2 inputs and failure-safe checkpoints.
+    - Run first: `Rscript Code/tests/4.0_test_spline_contracts.R`. No matching or GLME fitting occurs; temporary fixtures are removed.
+
+11b. `tests/4.0_diagnose_spline.R`
+    - Default `--prepare`: validates provenance and summarizes participant reuse, duplicated observations with assignment-specific clocks, and support. Does not fit models.
+    - Nemo runs `Rscript Code/tests/4.0_diagnose_spline.R --fit` for resumable, same-structure diagnostics: M1 intercept-only, unscaled/scaled correlated slopes, scaled uncorrelated slopes, M3 slopes/intercepts, and attained-age slopes when available. Failed fits retain detailed attempts; accepted fits are cached. Alternative optimizer retries are diagnostic only.
+    - Add `--influence` to compare deletions of the five most reused participants, retaining the full-data basis/reference profile. These are influence checks, not jackknife SEs. Add `--dataset=riskset_matched_analysis_long.rds` (or another matched filename) to inspect subgroup cohorts.
+    - Non-results diagnostics live in `Codex/glme_diagnostics/<dataset>/<input-hash>_<engine-hash>_<runner-hash>/`, including preparation summaries, reuse/support tables, per-configuration attempts/covariance/variance, resumable fit RDS, session information and a comparison table. No production results are overwritten.
 
 11. `2_data_analysis/4.1_GLME_high_low_burden.R`
-    - Loads `Data/riskset_matched_analysis_long.rds` generated by 2.1 and runs the
-      event-study + GLME-methods spline model set for the Low/Moderate Burden
-      and High Burden cohorts. Writes `4.1_eventstudy_*` and `4.1_spline_*`
-      CSV summaries to `Results/cancer/data` and a three-page
-      `4.1_GLME_figures.pdf` to `Results/cancer/visuals`. The shared engine
-      requires the matched input's Gate G4 and output-hash provenance to pass
-      before fitting.
-      Does not create or overwrite matched datasets.
+    - Loads `Data/riskset_matched_analysis_long.rds` from 2.1 and runs M0--M3 for Low/Moderate Burden and High Burden cohorts. Saves 4.1 spline summaries and diagnostics; validates Gate G4/input hash. Render the active R Markdown report for visuals.
+    - No event-study model is fitted and no matched dataset is modified.
 
 12. `2_data_analysis/4.6.1_plot_saved_trajectories.R`
     - Reads the saved 4.1 trajectory-prediction CSV and creates a combined
@@ -410,11 +372,8 @@ provenance diagnostics have passed.
       `Codex/4.1_CR2_diagnosis.csv`.
 
 13. `2_data_analysis/4.2_GLME_smoking_related.R`
-    - Loads `Data/riskset_matched_smoking_long.rds` generated by 2.2 and runs the
-      event-study + GLME-methods spline model set for the Smoking-Related Cancer
-      Cohort. Writes `4.2_*` outputs to `Results/cancer/data` and a three-page
-      `4.2_GLME_figures.pdf` to `Results/cancer/visuals`; Gate G4 and output-hash
-      provenance are checked before fitting.
+    - Loads `Data/riskset_matched_smoking_long.rds` from 2.2 and runs M0--M3 for the Smoking-Related Cancer cohort. Saves 4.2 spline summaries and diagnostics; validates Gate G4/input hash. Render the active R Markdown report for visuals.
+    - No event-study model is fitted and no matched dataset is modified.
 
 14. `2_data_analysis/4.6.2_plot_saved_trajectories.R`
     - Reads the saved 4.2 trajectory-prediction CSV and creates a combined
@@ -458,38 +417,45 @@ provenance diagnostics have passed.
       files, or calculate additional contrasts.
 
 15. `2_data_analysis/4.3_GLME_obesity_related.R`
-    - Loads `Data/riskset_matched_obesity_long.rds` generated by 2.3 and runs the
-      event-study + GLME-methods spline model set for the Obesity-Related Cancer
-      Cohort. Writes `4.3_*` outputs to `Results/cancer/data` and a three-page
-      `4.3_GLME_figures.pdf` to `Results/cancer/visuals`; Gate G4 and output-hash
-      provenance are checked before fitting.
+    - Loads `Data/riskset_matched_obesity_long.rds` from 2.3 and runs M0--M3 for the Obesity-Related Cancer cohort. Saves 4.3 spline summaries and diagnostics; validates Gate G4/input hash. Render the active R Markdown report for visuals.
+    - No event-study model is fitted and no matched dataset is modified.
 
 17. `2_data_analysis/4.5_GLME_overall.R`
-    - Loads `Data/riskset_matched_overall_long.rds` generated by 2.5 and runs the
-      overall primary event-study + GLME-methods spline model set (any incident
-      cancer vs control, single pooled cohort). Fits all eligible relative-time
-      rows while restricting primary predictions/contrasts to supported ±20
-      years. Writes `4.5_eventstudy_*`, `4.5_spline_*`, convergence, covariance,
-      omnibus, variance-component, bounded-outcome, influence, and S1–S12
-      outputs; also writes `4.5_GLME_figures.pdf` to `Results/cancer/visuals`;
-      sensitivities live under `Results/cancer/data/4.5_sensitivities`.
-      Does not create or overwrite matched datasets.
+    - Loads `Data/riskset_matched_overall_long.rds` from 2.5 and runs formal overall M0--M3 only. M1 is required; M3 is diagnostic. Saves a verified M1 cache for later S3--S6 reuse. Sensitivities are explicitly selected through 4.0.1, with separate selection folders (see execution instructions below). This is a long-running script for Nemo to run after diagnostic review; it does not rebuild matching.
+    - No event-study model is fitted and no matched dataset is modified.
+
+17a. `2_data_analysis/4.7_GLME_individual_types.R`
+    - One script fits the shared M0–M3 natural-spline GLME model set separately
+      for each of the six site-specific 2.6 matched inputs. The default runs
+      all six; `--site=<site>` selects one. The source input hash, matching
+      script/engine hashes, exact ICD site definition, saved 2.6 success status,
+      Gate G4, matched-RDS hash and assignment hash must agree before fitting.
+    - Saves the shared model's plot-ready summaries and diagnostics with unique
+      `Results/cancer/data/4.7_<site>_*` prefixes. M1 must pass strict
+      convergence. The site-level status file
+      `Results/cancer/data/4.7_individual_type_run_status.csv` distinguishes
+      fit from failed sites; no model fits are claimed from an absent or stale
+      status. This script does not rebuild matching or create PNG files.
 
 17b. `2_data_analysis/4.6_GLME_summary_report.Rmd`
     - Reads the saved non-survival matched datasets and saved 4.1, 4.2, 4.3,
-      and 4.5 GLME artifacts without rebuilding matching or fitting models.
+      4.5, and six 4.7 individual-type GLME artifacts without rebuilding
+      matching or fitting models. It checks each 4.7 run-status row against
+      the current input, matching/GLME engines, matched RDS, assignment ledger,
+      and saved model metadata before displaying those results.
     - Renders an assignment-level Table One with paired cancer-case/control
-      columns for each active cancer cohort, followed by saved event-study and
-      natural-spline joint Wald tests, then one combined trajectory plot with
-      one cohort row and M0-M3 model columns, plus an M2-only plot with one
-      cancer cohort per row.
+      columns for each active cancer cohort, then one combined trajectory plot with
+      one grouped-cohort row and M0-M3 model columns. A second Table One uses
+      the same paired layout for the six 4.7 site cohorts. Separate plots show
+      site-specific trajectories for M0-M3 and M2; the grouped-cohort M2 plot
+      remains in its own panel.
     - Excludes the removed survival-stratified 4.4 analysis and writes only the
       self-contained HTML report to `Results/cancer/visuals`.
 
 17c. `tests/test_overall_riskset_glme_repair.R`
     - Deterministic synthetic regression tests for one-visit pre-index
       eligibility, absence of post-index look-ahead, symmetric cycle boundaries,
-      unrestricted relative-time retention, case-based age scaling, exact-cycle
+      unrestricted relative-time retention, case-based age scaling, FI-independent
       behavior, and orphan/duplicate matched-set rejection.
 
 16c. `tests/test_cancer_subtype_earliest_event.R`
@@ -646,28 +612,18 @@ Legacy IPCW scripts (do not use for current IPCW inference)
       labels the old df-4 weighted GLME as legacy and directs current IPCW
       interpretation to the paired M2 GEE workflow in 5.0-5.2.
 
-24. `2_data_analysis/8.1_joint_model_overall.R`
-    - Builds the overall cancer joint-modeling datasets and fits a mortality-
-      informative joint model linking the same natural-spline FI trajectory
-      specification used in 7.2 to time from assigned index to all-cause death.
-    - The longitudinal submodel uses `nlme::lme` with
-      `Group * ns(Age_Centered, df = 4)` plus index-age, race, marital-status,
-      and pack-year adjustment, with random intercept and relative-time slope by
-      trajectory assignment (`Cohort__match_set__id__role`) so reused controls at
-      different assigned index times remain distinct.
-    - The survival submodel uses `survival::coxph` for death after assigned index
-      time, censored at the fixed 2020 analytic-cycle date. `JMbayes2::jm` links
-      the Cox model to the latent current-value frailty trajectory.
-    - Writes the longitudinal and survival analysis datasets, survival summary,
-      model summaries, predicted longitudinal trajectories, a joint-model
-      diagnostic, and fitted model object to `Results/cancer/data` using the
-      `8.1_joint_model_overall_*` prefix. `JMbayes2` is required and the script
-      always attempts the linked Bayesian joint model after saving the formulated
-      datasets and component submodels; if the full fit exceeds local runtime or
-      memory, the limitation is recorded in the diagnostic file.
-    - Existing overall joint-model products become stale after the corrected
-      matched RDS and canonical GLME metadata are regenerated; do not interpret
-      them until the joint-model prerequisites are intentionally rebuilt.
+24. Overall M2-aligned joint longitudinal-survival sensitivity (updated 2026-09-29)
+    - `2_data_analysis/8.0_joint_model_functions.R`: Source-safe helpers for schema-3 metadata/provenance, frozen participant assignment selection, complete date audits, M2 transformations, dynamic fixed/random designs, component/JM adapters, posterior checks, and comparisons. Main M2 has index age, race, marital status, living arrangement, categorical pack-years, calories, saturated fat, dietary cholesterol, and alcohol. Spline knots remain shared with the M1 reference frame; all spline/dietary scaling comes from `model_scaling$M2_full_spline`.
+    - `2_data_analysis/8.1_joint_model_overall.R`: `JM_PROFILE=prepare|pilot|full`; default `prepare`. **All profiles currently save available audits and stop with `blocked_date_policy` before any fitter.** There is no runtime bypass. Direct component and joint fitting helpers also enforce the policy. This revision does not run matching or statistical models.
+    - Run order: verified canonical panel/complete assignment ledger/matched output from 2.5 and schema-3 M2 metadata from 4.5, then 8.1 preparation, then review the date audit. Existing current source hashes agree. A separate reviewed date-policy revision is required before Nemo can run a pilot/full profile. Do not rerun 2.5 or 4.5 merely because the agreed date-policy gate remains blocked.
+    - The selected ledger has 15,453 cases and 26,806 controls before FI/M2 exclusions. The 2026-09-29 audit identified 497 same-month diagnosis/death cases and 113 indices on/after administrative end (61 cases, 52 controls). These are month-precision/horizon issues; exact days are unverified. Do not shift dates, exclude early deaths, or extend follow-up. Live runs report overlap and complete-M2 availability rather than adding potentially overlapping counts.
+    - Retain before/after FI and mortality starting at index, control own-cancer censoring, and theta over -8/0/+8. Select matched case priority otherwise earliest control before exclusions; an unusable selected assignment is not replaced. After the policy is resolved, the same selected M2 sample, transformations, reference profile, and accepted attained-age random structure define the longitudinal-only comparator and both joint associations.
+    - Random effects: correlated then diagonal participant intercept/slope with dynamic `(index_age + Age_Centered - 60)/4`. No supported slope means stop. Current-value and value+slope models explicitly use a quadratic B-spline baseline hazard, nine segments, identity time, and second-order smoothing. Save actual priors, hazard knots/controls, internal standardization, and software versions; a Cox initializer is not the final baseline-hazard specification.
+    - Each run creates `Results/cancer/data/8.1_joint_model_overall/<profile>/<unique-run>/`. Configuration schema 2 records `alignment_model_id=M2_full_spline`. Blocked runs contain provenance, configuration, canonical M2 alignment metadata, assignment selection, date audit/summary/overlap, M2 availability, clock contracts, session information, status, and failure text; no prepared fitting sample or components are certified. Later successful runs checkpoint components and each joint object separately, retaining raw dietary companions and exact once-only scaling.
+    - Full numerical eligibility requires R-hat <1.05 and bulk/tail ESS >400 for all monitored free betas, gammas, alphas, residual scale, covariance, baseline-hazard, and smoothing parameters. Structural covariance zeros are verified separately. Failed full runs release no posterior inference tables; pilot summaries remain non-inferential and successful full diagnostics require trace review. Eligible fits save explicitly marginal DIC/WAIC/LPML without automatic selection.
+    - `2_data_analysis/8.1_joint_model_report.Rmd`: Saved-run-only report; set an explicit absolute `params$run_dir` or `JM_RUN_DIR`. Render a unique HTML under `Results/cancer/visuals`. Reports label M2 versus legacy, blocked, pilot, failed, and synthetic states and show date audit, M2 availability, support/comparison, and expanded diagnostics. Temporary SVG graphics only; no persistent PNG. On this Mac, the RStudio Pandoc path is `/Applications/RStudio.app/Contents/Resources/app/quarto/bin/tools/aarch64`.
+    - `tests/8.1_test_joint_model_contract.R`: Model-free synthetic/mock tests; run from the project root. Artifacts belong under `Codex/jm_m2_revision_2026-09-29`. Tests do not invoke matching, lme, coxph, or jm fitters. Source snapshots and protected-file hashes are in that same diagnostic folder.
+    - Detailed equations, assumptions, interfaces, and command: `Documents/Methods/Joint_Modeling_Informative_Mortality.md`. Source-by-source comparison and implementation decisions: `Documents/Methods/Joint_Modeling_M2_Review_2026-09-29.md`.
 
 25. `2_data_analysis/8.2_fda_functions.R`
     - Shared functional data analysis (FDA) helper. Converts a risk-set matched
@@ -706,3 +662,143 @@ Every time code in the `Code` folder is added or updated:
 4. Save generated dataset outputs, including `.rds`, `.csv`, and other analytic data files, to `/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Data`.
 5. Save plot-ready CSV/RDS results data to `/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Results/cancer/data` and knitted R Markdown HTML/PDF reports to `/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Results/cancer/visuals`; do not save persistent PNG figures.
 6. Keep cancer excluded from any frailty-index definition used for cancer-as-exposure analyses unless the analytic goal explicitly changes.
+
+## Cached-fit robust inference diagnostic (2026-09-20)
+
+`tests/4.0_diagnose_cached_inference.R` follows the manual `4.0_diagnose_spline.R --fit` run. Run it from the project root with `Rscript Code/tests/4.0_diagnose_cached_inference.R`; an optional first argument selects another overall diagnostic run directory. It defaults to the verified `364e02ea_0cf6c5ee_f1fa5b8b` cache.
+
+This script never fits GLMEs or runs matching. It checks the matched-data hash, rebuilds and verifies fixed-effect design coordinates against each cached M1 model, and confirms the previous theta estimates. It computes CR2/CR0 covariance, normal-reference theta intervals/tests and chi-square spline-interaction tests without Satterthwaite/HTZ. It independently verifies coefficient SEs with the package's z-test. The package's `form = "estfun"` calculation is checked against the covariance and used to quantify participant contributions to theta variance. Concentration indices are descriptive and must not be interpreted as Satterthwaite degrees of freedom.
+
+For efficiency, the diagnostic requires clubSandwich 0.6.2 and locally reuses its covariance algorithm with participant working-covariance blocks and precomputed row indices. This avoids repeated wide sparse-matrix slicing and whole-data scans. It rejects weights and crossed grouping structures, verifies sampled working-covariance blocks against lme4's sparse design (including the largest cluster), and checks the full intercept-model CR2 result against a separately calculated public `vcovCR` reference. The reference is generated if absent and retained for subsequent runs. The installed package is never modified. This optimization is restricted to these nested participant models; it does not resolve M3's crossed matching-set effects.
+
+Results are diagnostic-only under `<cached-run>/asymptotic_robust`: theta/omnibus and coefficient tables, CR2/CR0 comparisons, participant reuse summaries, CR2 theta-contribution tables, covariance/score caches, verification hashes and session information. Production models and inference policies are not changed. Run after cached fits exist and before deciding the production covariance/testing hierarchy.
+
+## Final attained-age and robust-inference plan (2026-09-20)
+
+The active shared `4.0` engine (wrappers 4.1, 4.2, 4.3 and 4.5) now keeps diagnosis-relative fixed splines and uses participant random intercepts/slopes on `(age_at_cycle - 60)/4`. `age_at_cycle` must be finite and identical across copies of a participant-cycle. Numerical retries precede structural simplification: bobyqa then nloptwrap; unexplained numerical failures stop for review. Only numerically acceptable boundary evidence permits uncorrelated slopes, and only a boundary slope in that structure permits intercept-only. Scaling-only warnings are logged without dropping slopes. M3 can retain a supported participant slope when only its matching-set variance reaches the boundary.
+
+Covariance selection is CR2, then CR0 only upon covariance failure, then explicitly flagged model-based inference. Satterthwaite/HTZ failure retains the selected robust covariance and uses labeled normal/chi-square inference. A conservative `8 * clusters^2 * coefficients^2` allocation bound skips small-sample tests above `getOption("hpfs.small_sample_max_bytes", 256 * 1024^2)`; it is a resource guard, not an estimated effective sample size. The validated nested-participant covariance optimization is reused only for unweighted fits with clubSandwich 0.6.2; other cases go through package support checks. M3 crossed grouping and S11 weights receive separate diagnostic flags. No workaround claiming robust support for either is introduced.
+
+Before production, Nemo runs `Rscript Code/tests/4.0_diagnose_spline.R --fit --plan --influence`. This fits correlated attained-age M1, uncorrelated attained-age M1, intercept-only M1 sensitivity and attained-age M3. It also ranks participants using the finalized M1's CR2 theta contributions, removes all records of each of the top five separately, and removes the top 1% together as an intentionally strong sensitivity. Deletion fits retain the primary basis, scaling and random structure; they do not select the primary model or estimate jackknife SEs. Every fit and covariance failure is logged and cached under a new input/engine/runner hash in `Codex/glme_diagnostics`. Inspect theta/CI, coefficients, AIC, variance components and matching-set boundary before production. `--prepare --plan` does no fitting; contract tests also never fit models.
+
+Older diagnostic hashes remain historical evidence. Standalone legacy 4.2.2 and 10.x engines do not inherit this shared-engine change. The production `run_influence` matched-set deletion option remains separate from the participant-based diagnostic above. No production run is executed by this implementation step.
+
+## Separate formal and sensitivity runs (2026-09-20)
+
+`2_data_analysis/4.0_GLME_spline_functions.R` contains the finalized shared formal-model engine: diagnosis-relative df-3 fixed splines, correlated participant attained-age intercept/slopes centered at 60 and scaled by four, evidence-gated fallback, participant CR2 with covariance-preserving asymptotic fallback, and support-gated theta over ±8 years. Sourcing it performs no analysis. The existing 4.1/4.2/4.3/4.5 cohort wrappers run formal M0–M3; M1 is primary and M3 remains a diagnostic. No S-series analyses are launched by 4.5, and M3 failure does not invalidate an otherwise successful overall M1 run.
+
+New `2_data_analysis/4.0.1_GLME_sensitivity_analyses.R` owns the S-series helpers and runner. Sourcing it exposes functions without fitting; running it without arguments prints usage without fitting. From project root, Nemo can run:
+
+- Formal overall models: `Rscript Code/2_data_analysis/4.5_GLME_overall.R`.
+- Selected new fits: `Rscript Code/2_data_analysis/4.0.1_GLME_sensitivity_analyses.R --only=S1,S2`.
+- M1-derived summaries without refitting: `Rscript Code/2_data_analysis/4.0.1_GLME_sensitivity_analyses.R --only=S3,S4,S5,S6`.
+- Another single analysis: use `--only=S8`, `--only=S9`, etc. (`S7` is retired).
+- Explicit full S1–S6 and S8–S11 run: `--all`. Existing S12 (two-visit restriction) remains available only by explicit selection, for example `--only=S12`.
+
+4.5 saves `Results/cancer/data/4.5_primary_cache.rds` containing M1 contexts, matching provenance and engine hash. S3–S6 require this cache and reject changed input/engine hashes; they never silently refit M1. Run the updated 4.5 first to create it. Other sensitivities do not require this cache. S7 requests fail explicitly as retired; no exact-cycle input is read. S11's weighted-inference limitation remains explicitly flagged.
+
+Each selection writes to `Results/cancer/data/4.5_sensitivities/<IDs joined by underscore>/`, retaining existing filenames inside that directory plus run/input/engine/script provenance. Repeating a selection replaces that selection's outputs; different selections do not overwrite one another. Legacy flat sensitivity outputs are historical and are not regenerated or merged into new selections automatically. Contract tests cover selective execution, explicit S7 retirement and no-refit S3/S5 reuse.
+
+## Observed descriptive trajectories (2026-09-21)
+
+`2_data_analysis/4.0.2_GLME_descriptive_trajectories.R` is a separate, model-free specification check for every active 4.x matched cohort. It validates each matched input's Gate G4/MD5 provenance, then applies the exact M1 outcome, own-cancer-censoring and primary-covariate complete-case filters. It retains all matched assignment copies, including reused controls, and summarizes observed assignment-row-weighted no-cancer FI within the shared, right-closed 2-year diagnosis-relative bins. It saves group means, cancer-minus-control differences, observation/assignment/participant support, M1 eligibility, metadata and hashes under `Results/cancer/data/4.0.2_descriptive_*`. It has no spline, random-effect, adjustment, interval, bootstrap, slope, p-value or model-fitting step.
+
+Run from the project root: `Rscript Code/2_data_analysis/4.0.2_GLME_descriptive_trajectories.R`. Then use `render_descriptive_trajectories()` after sourcing the script, or render `2_data_analysis/4.0.2_GLME_descriptive_trajectories.Rmd`, to write `Results/cancer/visuals/4.0.2_GLME_descriptive_trajectories.html`. The helper falls back to knitr/markdown when Pandoc is unavailable. It displays empirical group means, empirical cancer-minus-control differences, and participant/assignment support over the contiguous two-arm-supported portion of ±20 years. Lines only connect binned observations; they are not fitted smooths. `tests/4.0.2_test_descriptive_contracts.R` verifies filtering, reuse retention, bin/difference/support calculations, provenance failure and no-model behavior.
+
+## M1 spline-degree AIC comparison (2026-09-22)
+
+After the matched inputs and desired formal df-3 cohort runs are ready, Nemo can run `Rscript Code/2_data_analysis/4.0.3_GLME_m1_df_aic_comparison.R` from the project root. It fits M1 with df 3 and df 4 under ML on a shared cohort-specific complete-case sample, using the same primary covariates and correlated attained-age participant random intercept/slope. This comparison-only runner does not alter formal REML outputs. Inspect the cohort-level comparison and fit-status CSVs, and confirm the paired row-key and specification checks before interpreting each cohort's delta AIC. Convergence attempts, support-gated fitted predictions, and input/engine/runner provenance are saved beside the comparison in `Results/cancer/data`. After the user-run fits complete, render `4.0.3_GLME_m1_df_trajectory_comparison.Rmd` to create the paired trajectory report under `Results/cancer/visuals`.
+
+## FI-independent matching and rerun order (2026-09-29)
+
+- `2_data_analysis/2.0_matching_provenance.R`: read-only shared eligibility-version/settings, Gate G4, and outcome/assignment hash validation, plus cohort-entry/version checks for derived data. It maps all six `riskset_matched_site_*_long.rds` inputs to the 2.6 builder for actionable failure messages. Legacy inputs fail with the matching builder required. Called by formal GLME, descriptive, IPCW, joint-model, FDA and current summary readers; historical output files are not altered by validation.
+- `tests/2.0_test_no_fi_eligibility.R`: pure helper/input-preparation tests for FI-independent risk-set flags, entry/death/cancer/age rules, zero-FI and wholly unobserved sets, duplicates, post-index-only FI, complete denominators, stale metadata/hashes, and retirement. Does not invoke matching or fitting.
+- `tests/test_overall_riskset_glme_repair.R`: updated synthetic matching integration fixtures. **Nemo must run this test**, because it invokes the matching builder. It is not part of the agent-run checks.
+
+Run from the project root. Matching and GLME commands below are for **Nemo**, not automatic execution by the coding agent. Preserve historical outputs as needed before rerunning: primary builders retain their existing output names and will replace those primary artifacts.
+
+```sh
+Rscript Code/tests/2.0_test_no_fi_eligibility.R
+Rscript Code/tests/test_overall_riskset_glme_repair.R
+Rscript Code/2_data_analysis/2.1_create_riskset_high_low_burden.R
+Rscript Code/2_data_analysis/2.2_create_riskset_smoking_related.R
+Rscript Code/2_data_analysis/2.3_create_riskset_obesity_related.R
+Rscript Code/2_data_analysis/2.4_create_riskset_survival.R
+Rscript Code/2_data_analysis/2.5_create_riskset_overall.R
+```
+
+Review yield, age/entry integrity, balance and Gate G4 using the assignment ledger. Inspect `*_zero_fi_assignments.csv` and `*_outcome_support.csv` separately: missing outcomes do not invalidate matching sets or trigger replacements. The compatibility `*_inactive_cases.csv` is empty because there are no FI exclusions. Descriptive FI counts use distinct dates and include zeros; `n_preindex_fi`, `n_recent_preindex_fi`, `latest_preindex_fi_date` and `fi_gap_months` never restrict entry. All selected assignments persist in `Data/riskset_matched_<cohort>_assignments.rds`; only observed FI rows appear in existing `*_long.rds` files. The five cohort names are `analysis`, `smoking`, `obesity`, `survival`, and `overall`.
+
+The six additional site analyses are independent of those five groupings.
+After the canonical cancer subtype file is current, Nemo runs:
+
+```sh
+Rscript Code/tests/2.6_test_individual_type_classification.R
+Rscript Code/2_data_analysis/2.6_create_riskset_individual_types.R
+```
+
+Review each site's `riskset_matched_site_<site>_long_gate_g4.csv`, yield,
+balance, assignment-ledger hash and `2.6_individual_type_run_status.csv` before
+modeling. Then Nemo runs:
+
+```sh
+Rscript Code/2_data_analysis/4.7_GLME_individual_types.R
+```
+
+Review `4.7_individual_type_run_status.csv` and each site's
+`4.7_<site>_spline_model_status.csv` and `4.7_<site>_support_by_time_bin.csv`
+before interpreting any site estimate. Use `--site=lung` (or another listed
+site) on either runner to repeat one site. The shared M1 prediction-support
+rule remains at least 50 distinct cases and 250 distinct controls per
+contiguous two-year bin; unsupported sites remain explicitly failed or skipped.
+The 4.6 report includes saved 4.7 results only when all six site run-status
+rows, model artifacts, current source hashes, matched inputs, assignment
+ledgers, and metadata agree. Once Nemo generates the site datasets and
+assignment ledgers, enter their actual dimensions, dates, sources and analytic
+notes in `Data/README.md`.
+
+Formal GLME `*_assignment_flow.csv` and descriptive `4.0.2_descriptive_assignment_flow.csv` distinguish matched assignments, uncensored FI contributors and model-complete assignments. Reports 3.1, 3.3 and 4.6 take matched counts/baselines and missingness denominators from ledgers. IPCW 5.x expands all assignments before its unchanged response-model restrictions; 7.x weights observed rows and records complete-roster denominators/provenance. Joint-model 8.1 chooses one assignment per person from the complete ledger, case first, before outcome exclusions; a zero-FI selected case cannot be replaced by a control assignment.
+
+After matching review, refresh the active formal analyses and descriptive products:
+
+```sh
+Rscript Code/2_data_analysis/4.1_GLME_high_low_burden.R
+Rscript Code/2_data_analysis/4.2_GLME_smoking_related.R
+Rscript Code/2_data_analysis/4.3_GLME_obesity_related.R
+Rscript Code/2_data_analysis/4.5_GLME_overall.R
+Rscript Code/2_data_analysis/4.0.2_GLME_descriptive_trajectories.R
+Rscript -e 'rmarkdown::render("Code/2_data_analysis/3.1_descriptive_riskset_cohorts.Rmd", output_dir="Results/cancer/visuals")'
+Rscript -e 'rmarkdown::render("Code/2_data_analysis/3.3_matched_cohort_availability_attrition.Rmd", output_dir="Results/cancer/visuals")'
+Rscript -e 'rmarkdown::render("Code/2_data_analysis/4.6_GLME_summary_report.Rmd", output_dir="Results/cancer/visuals")'
+Rscript -e 'rmarkdown::render("Code/2_data_analysis/4.0.2_GLME_descriptive_trajectories.Rmd", output_dir="Results/cancer/visuals")'
+```
+
+The four formal GLME wrappers cover the five non-survival cohorts; the survival-stratified matched file remains for its existing descriptive workflow. Do not substitute an obsolete survival fitter. Optional M2 time-varying, IPCW, joint-model, FDA, df-comparison and selected sensitivity products must also be regenerated from the rebuilt inputs before being interpreted as current. Their established separate commands above remain applicable; S7 is unavailable. For example, after 4.5, explicitly selected `--only=S3,S4,S5,S6` sensitivities reuse the new M1 cache. No new broader-eligibility sensitivity is added.
+
+Dependent optional workflows, when selected, must be rebuilt after the corresponding formal models (Nemo only):
+
+```sh
+Rscript Code/2_data_analysis/4.2.2_GLME_M2_time_varying.R
+Rscript Code/2_data_analysis/4.2.2_GLME_M2_time_varying_other_cohorts.R
+Rscript Code/2_data_analysis/4.0.1_GLME_sensitivity_analyses.R --only=S3,S4,S5,S6
+Rscript Code/2_data_analysis/4.0.3_GLME_m1_df_aic_comparison.R
+Rscript Code/2_data_analysis/5.1_ipcw_gee_overall_m2.R
+Rscript Code/2_data_analysis/5.2_ipcw_gee_subtype_m2.R
+Rscript Code/2_data_analysis/7.1_ipcw_overall.R
+Rscript Code/2_data_analysis/7.3_ipcw_subtype_cohorts.R
+Rscript Code/2_data_analysis/7.2_ipcw_glme_spline_overall.R
+Rscript Code/2_data_analysis/7.4_ipcw_glme_spline_subtype_cohorts.R
+JM_PROFILE=prepare Rscript Code/2_data_analysis/8.1_joint_model_overall.R
+```
+
+Joint-model preparation currently saves audits and stops at the agreed unresolved date-policy gate; pilot/full fitting remains blocked pending a separately reviewed policy revision. Do not interpret previous saved IPCW, JM, FDA, sensitivity or df-comparison outputs as results under the new eligibility. S7 and endpoint-based cancer-free workflows remain unavailable. Pure verification commands are `Rscript Code/tests/2.0_test_no_fi_eligibility.R`, `Rscript Code/tests/4.0_test_spline_contracts.R`, `Rscript Code/tests/4.0.2_test_descriptive_contracts.R`, and `Rscript Code/tests/8.1_test_joint_model_contract.R`; the spline/JM suites use mock fitters only.
+
+## 3.4 Pre-index FI availability audit (added 2026-09-29)
+
+`tests/3.4_check_preindex_fi_availability.R` reads all five rebuilt matched assignment ledgers and their observed long files. Run after builders 2.1–2.5; it needs no fitted models. It checks current eligibility, Gate G4, both hashes, keys, ledger-set/control integrity, own-cancer flags and distinct FI counts, then reports availability by cohort and case/control group. Strictly before index uses actual return month < index month; equality is separately reported. The primary view applies later-own-cancer censoring; the saved-row view supports reconciliation. Complete assignments supply denominators, including zero-FI assignments. Unique-person summaries give both any-assignment and all-assignment absence of prior FI because controls can be reused.
+
+```sh
+Rscript Code/tests/3.4_check_preindex_fi_availability.R
+```
+
+Aggregate outputs are saved to a new timestamp/PID directory under `Results/cancer/data/3.4_preindex_fi_availability/`: `gate_g4.csv`, `assignment_summary.csv`, `availability_categories.csv`, `unique_participant_summary.csv`, and `run_metadata.rds`. Existing inputs and previous audit runs are not overwritten. No matching, modeling, report knitting, or PNG generation is performed. The initial execution was on Nemo's final rebuilt datasets.

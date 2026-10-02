@@ -4,7 +4,7 @@
 # Script:  7.2_ipcw_glme_spline_overall.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-30
-# Date last updated: 2026-07-28 (prediction factors use participant-modal levels)
+# Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
 #
 # Purpose:
 #   Fits the IPCW-weighted natural-spline GLME for the OVERALL incident cancer
@@ -62,6 +62,8 @@ if (!file.exists(matched_path)) {
 if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
 
 matched_long <- readRDS(matched_path)
+source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
+validate_derived_assignment_provenance(matched_long, matched_path)
 missing_cols <- setdiff(needed_cols, names(matched_long))
 if (length(missing_cols) > 0) {
   stop("Matched IPCW dataset is missing required columns: ",

@@ -4,13 +4,13 @@
 # Script:  test_overall_riskset_glme_repair.R
 # Author:  Nemo Zhou
 # Date started:      2026-07-18
-# Date last updated: 2026-07-20 (canonical earliest-cancer index date support)
+# Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
 #
 # Purpose:
 #   Runs deterministic synthetic regression tests for the repaired overall-
-#   cancer risk-set matching contract. The tests verify pre-index-only support,
-#   symmetric cycle eligibility, one-visit inclusion, unrestricted relative-
-#   time retention, case-reference age scaling, exact-cycle behavior, and
+#   cancer risk-set matching contract. The tests verify FI-independent entry,
+#   complete assignment ledgers, zero-FI inclusion, unrestricted relative-
+#   time retention, case-reference age scaling, inclusive 48-month behavior, and
 #   post-expansion matched-set/duplicate-key safeguards. No project dataset or
 #   result is created or modified; all synthetic inputs live in tempdir().
 # =============================================================================
@@ -96,42 +96,23 @@ primary <- build_riskset_matched_long(
   target_cycles = target_cycles,
   match_ratio = 1,
   age_caliper = 2,
-  cycle_caliper = 1,
-  min_visits = 1,
   seed = 20260703,
   max_unmatched_fraction = 1,
   max_absolute_smd = Inf
 )
 
-# One pre-index FI is sufficient even when the only second FI is post-index.
-stopifnot(nrow(primary$inactive_cases) == 0)
-stopifnot(all(primary$caliper_integrity$all_preindex_fi_ok))
-stopifnot(all(primary$matched_long$n_preindex_fi == 1L))
-
-# Post-index FI cannot rescue eligibility.
-future_only <- data.frame(
-  id = "future_only", cycle = c("08", "12"), worked_rtmnyr = c(1296, 1344),
-  fi_score_nocancer = c(NA_real_, 0.2), stringsAsFactors = FALSE
-)
-future_support <- preindex_support(future_only, 1296, "08", 1, min_visits = 1)
-stopifnot(future_support$has_active_return, future_support$cycle_ok)
-stopifnot(future_support$n_preindex_fi == 0L, !future_support$eligible)
-
-# The same cycle boundary applies to cases and controls; exact-cycle S7 rejects
-# an adjacent return that the primary ≤4-year caliper accepts.
-adjacent <- data.frame(
-  id = "adjacent", cycle = "04", worked_rtmnyr = 1248,
-  fi_score_nocancer = 0.1, stringsAsFactors = FALSE
-)
-stopifnot(preindex_support(adjacent, 1296, "08", 1, 1)$eligible)
-stopifnot(!preindex_support(adjacent, 1296, "08", 0, 1)$eligible)
+# FI support is descriptive; roster integrity is independent of observed rows.
+stopifnot(nrow(primary$inactive_cases) == 0,
+          identical(primary$run_metadata$eligibility_version, "no_fi_requirement_v1"),
+          all(primary$assignments$first_return <= primary$assignments$index_date),
+          all(primary$matched_long$trajectory_id %in% primary$assignments$trajectory_id))
 
 # All eligible rows are retained, including the +28-year observation.
 stopifnot(any(primary$matched_long$Age_Centered > 20))
 stopifnot(any(!primary$matched_long$in_win_20))
 
 # Scaling uses exactly one retained case per set, not expanded rows or controls.
-case_assignments <- primary$matched_long |>
+case_assignments <- primary$assignments |>
   dplyr::filter(role == "Case") |>
   dplyr::distinct(Cohort, match_set, index_age)
 stopifnot(primary$scaling_metadata$n_reference_cases == nrow(case_assignments))
@@ -161,13 +142,33 @@ expect_error(
     target_cycles = target_cycles,
     match_ratio = 1,
     age_caliper = 2,
-    cycle_caliper = 1,
-    min_visits = 1,
     seed = 20260703,
     max_unmatched_fraction = 1,
     max_absolute_smd = Inf
   ),
-  "Duplicated trajectory_id x cycle rows"
+  "Duplicate participant-cycle records"
 )
+
+
+
+# Nemo-only matching integration: removing every FI must not change assignment
+# selection, case-based scaling, yield, reuse, balance or set integrity.
+no_fi <- synthetic
+no_fi$fi_score_nocancer <- NA_real_
+saveRDS(no_fi,tmp_input)
+no_fi_result <- build_riskset_matched_long(
+  input_path=tmp_input, classification_vars=character(0), classify_fn=classify_all,
+  cohort_levels="All Cancer Cohort", target_cycles=target_cycles,
+  match_ratio=1, age_caliper=2, seed=20260703,
+  max_unmatched_fraction=1, max_absolute_smd=Inf)
+stopifnot(nrow(no_fi_result$matched_long)==0,
+  identical(no_fi_result$assignments$trajectory_id,primary$assignments$trajectory_id),
+  identical(no_fi_result$scaling_metadata,primary$scaling_metadata),
+  identical(no_fi_result$diagnostics,primary$diagnostics),
+  identical(no_fi_result$reuse_diagnostics,primary$reuse_diagnostics),
+  identical(no_fi_result$balance_diagnostics,primary$balance_diagnostics),
+  all(no_fi_result$set_integrity$valid_set),
+  all(no_fi_result$assignments$n_analytic_fi_visits==0))
+unlink(tmp_input)
 
 message("All overall risk-set/GLME repair synthetic tests passed.")

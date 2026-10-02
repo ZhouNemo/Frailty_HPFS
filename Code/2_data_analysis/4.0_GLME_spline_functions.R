@@ -4,59 +4,22 @@
 # Script:  4.0_GLME_spline_functions.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-29
-# Date last updated: 2026-07-20 (reuse the adjusted spline basis across M1-M3;
-#                    use participant-modal factor levels for prediction grids;
-#                    retain failure-safe diagnostic outputs)
+# Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
 #
-# Purpose:
-#   Shared engine for the time-bin GLME event-study analysis and the primary
-#   natural-spline Gaussian LME trajectory model set, used by the per-cohort
-#   wrappers 4.1-4.5. These wrappers read a prebuilt risk-set matched dataset
-#   from 2.1-2.5 and do NOT create or overwrite matching cohorts.
-#
-#   The method is documented in
-#   Documents/Methods/TimeBin_GLME_EventStudy_Analysis.md and
-#   Documents/Methods/GLME_Natural_Spline_Trajectory_Analysis.md.
-#
-#   For each burden/subgroup cohort the engine:
-#     1. Cuts relative time (Age_Centered) into active GLME 2-year event-study
-#        bins (<= -20, 2-year bins through +20, > +20); reference = the last
-#        pre-index bin "-2 to 0". The FDA support diagnostic retains its own
-#        separate support-bin specification.
-#     2. Fits a SATURATED event-study Gaussian LME:
-#          fi_score_nocancer ~ Group * rel_time_bin + index_age_z
-#                            + base_race + base_marital + base_living + (1 | id)
-#        The Group:rel_time_bin coefficients ARE the event-study curve (case-vs-
-#        control gap per bin, relative to the gap in the reference bin).
-#     3. Computes CR2 cluster-robust SEs on participant id (clubSandwich) for the
-#        coefficients, step predicted means, and joint pre/post/global Wald tests.
-#        Clustering is on id, not match_set: control reuse makes id non-nested
-#        within match_set, which clubSandwich's CR estimator requires; id-level
-#        clustering addresses control reuse and within-person dependence; M3
-#        separately assesses residual dependence among members of a matched set.
-#     4. Fits the pre-specified Gaussian LME model set from the GLME methods
-#        file, without running the S1-S11 sensitivity grid:
-#          M0 raw:       Group * ns(Age_Centered, df = 3) + index_age_z
-#          M1 spline:    Group * ns(Age_Centered, df = 3) + primary covars
-#          M2 spline:    Group * ns(Age_Centered, df = 3) + full covars
-#          M3 spline:    Group * ns(Age_Centered, df = 3) + matching-set random intercept
-#        Models fit all eligible matched long rows and restrict only
-#        predictions, contrasts, and plots to the ±20 support window.
-#     5. Writes coefficient tables, predicted trajectories, difference curves,
-#        theta contrasts, model-status tables, and figures.
-#
-#   Saturated bins use a random intercept only (time is categorical). The spline
-#   companion uses a random intercept + slope in continuous relative time.
-#   Control reuse from risk-set matching with replacement is handled by the id
-#   random effect plus CR2 cluster-robust variance clustered on participant id.
-#
-# Units:
-#   Age_Centered is years relative to each person's own attained age at the
-#   assigned index (0 = index). Outcome is fi_score_nocancer (cancer-excluded FI).
-#   The natural-spline terms and M2 continuous dietary covariates are centered
-#   and scaled only for numerical fitting. Their stored transformations are
-#   applied to every prediction/contrast grid, so estimates remain on the
-#   original FI and years-relative-to-index scales.
+# Purpose: Shared natural-spline Gaussian LME engine for wrappers 4.1--4.5.
+# Fits M0--M3 on all eligible matched rows; support bins govern predictions only.
+# Event-study fitting was removed. Original FI construction and matching remain
+# upstream. The primary estimand is the post-minus-pre average differential slope.
+# Numerical scaling, exact contrasts, covariance diagnostics and failure logs are
+# shared with the separately invoked 4.0.1 sensitivity module. Fixed splines use relative time;
+# participant slopes use (attained age - 60)/4. Numerical failure alone never
+# permits structural simplification; valid CR2 survives small-sample-test failure.
+# No analysis runs when sourced.
+# Dataset/plot-ready outputs: Results/cancer/data. Render reports with knitr under
+# Results/cancer/visuals. Non-results diagnostics belong under Codex.
+# The shared fitter defaults to REML; runner 4.0.3 opts into ML for paired AIC
+# and its separate, support-gated M1 trajectory display.
+# See Documents/Methods/GLME_Natural_Spline_Trajectory_Analysis.md.
 # =============================================================================
 
 library(dplyr)
@@ -68,152 +31,266 @@ library(splines)
 # engine's Gate G4 and the provenance record still hashes the exact RDS being
 # fitted.  This check is shared by the subgroup wrappers (4.1-4.4) as well as
 # the overall wrapper; it prevents silently fitting stale pre-repair cohorts.
-validate_matching_provenance <- function(matched_path) {
-  if (!file.exists(matched_path)) {
-    stop("Matched dataset not found at ", matched_path, call. = FALSE)
-  }
-  project_dir <- dirname(dirname(normalizePath(matched_path, mustWork = FALSE)))
-  diagnostics_dir <- file.path(project_dir, "Results", "cancer", "data",
-                                "matching_diagnostics")
-  output_stem <- tools::file_path_sans_ext(basename(matched_path))
-  gate_path <- file.path(diagnostics_dir, paste0(output_stem, "_gate_g4.csv"))
-  run_path <- file.path(diagnostics_dir, paste0(output_stem, "_run_metadata.rds"))
-  if (!file.exists(gate_path) || !file.exists(run_path)) {
-    stop("Gate G4 or matching provenance is missing for ", output_stem,
-         ". Rerun the corresponding matching builder before fitting GLME.",
-         call. = FALSE)
-  }
-  gate <- tryCatch(read.csv(gate_path, stringsAsFactors = FALSE),
-                   error = function(e) {
-                     stop("Could not read matching Gate G4 file ", gate_path,
-                          ": ", conditionMessage(e), call. = FALSE)
-                   })
-  if (!("gate_pass" %in% names(gate)) ||
-      !all(as.logical(gate$gate_pass) %in% TRUE)) {
-    stop("Gate G4 did not pass for ", output_stem,
-         ". Refusing to fit the matched GLME input.", call. = FALSE)
-  }
-  run_metadata <- readRDS(run_path)
-  expected_md5 <- if (!is.null(run_metadata$output_md5)) {
-    unname(as.character(run_metadata$output_md5))
-  } else {
-    character(0)
-  }
-  observed_md5 <- unname(tools::md5sum(matched_path))
-  if (length(expected_md5) != 1L || !nzchar(expected_md5) ||
-      !identical(expected_md5, observed_md5)) {
-    stop("Matched RDS hash does not match its Gate G4 provenance for ",
-         output_stem, ". Rerun the matching builder.", call. = FALSE)
-  }
-  list(output_stem = output_stem, gate = gate, run_metadata = run_metadata,
-       gate_path = gate_path, run_path = run_path, input_md5 = observed_md5)
-}
+source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
 
-# Active GLME event-study bin breaks -------------------------------------------
-.es_inner_breaks <- seq(-20, 20, by = 2)
-.es_rel_breaks   <- c(-Inf, .es_inner_breaks, Inf)
-.es_rel_labels   <- c(
+# Prediction-support bin breaks -------------------------------------------
+.support_inner_breaks <- seq(-20, 20, by = 2)
+.support_rel_breaks   <- c(-Inf, .support_inner_breaks, Inf)
+.support_rel_labels   <- c(
   "<= -20 years",
   paste0(
-    .es_inner_breaks[-length(.es_inner_breaks)],
+    .support_inner_breaks[-length(.support_inner_breaks)],
     " to ",
-    if_else(.es_inner_breaks[-1] > 0,
-            paste0("+", .es_inner_breaks[-1]),
-            as.character(.es_inner_breaks[-1]))
+    if_else(.support_inner_breaks[-1] > 0,
+            paste0("+", .support_inner_breaks[-1]),
+            as.character(.support_inner_breaks[-1]))
   ),
   "> +20"
 )
-.es_ref_label <- "-2 to 0"
+.support_ref_label <- "-2 to 0"
 
-# Numeric midpoint for each bin label, for plotting on a relative-time axis.
-.es_bin_midpoints <- setNames(
-  c(min(.es_inner_breaks) - 1,
-    head(.es_inner_breaks, -1) + 1,
-    max(.es_inner_breaks) + 1),
-  .es_rel_labels
-)
-
-add_relative_time_bin <- function(data, rel_time_col = "Age_Centered",
-                                  ref_label = .es_ref_label) {
+add_relative_time_bin <- function(data, rel_time_col = "Age_Centered") {
   data %>%
     mutate(
       rel_time_bin = cut(
         .data[[rel_time_col]],
-        breaks = .es_rel_breaks,
-        labels = .es_rel_labels,
+        breaks = .support_rel_breaks,
+        labels = .support_rel_labels,
         right = TRUE,
         include.lowest = TRUE
       ),
-      rel_time_bin = factor(rel_time_bin, levels = .es_rel_labels)
+      rel_time_bin = factor(rel_time_bin, levels = .support_rel_labels)
     )
 }
 
 continuous_support_window <- function(support, window_yrs) {
-  support <- support %>% arrange(match(as.character(rel_time_bin), .es_rel_labels))
-  ref_i <- match(.es_ref_label, as.character(support$rel_time_bin))
+  if (anyDuplicated(as.character(support$rel_time_bin))) stop("Duplicate support bins")
+  support <- data.frame(rel_time_bin = .support_rel_labels) %>%
+    left_join(mutate(support, rel_time_bin = as.character(rel_time_bin)), by = "rel_time_bin") %>%
+    mutate(support_ok = !is.na(support_ok) & support_ok)
+  ref_i <- match(.support_ref_label, as.character(support$rel_time_bin))
   if (is.na(ref_i) || !support$support_ok[[ref_i]]) return(c(NA_real_, NA_real_))
   left_i <- ref_i
   right_i <- ref_i
   while (left_i > 1 && support$support_ok[[left_i - 1]]) left_i <- left_i - 1
   while (right_i < nrow(support) && support$support_ok[[right_i + 1]]) right_i <- right_i + 1
-  left_break_i <- match(as.character(support$rel_time_bin[[left_i]]), .es_rel_labels)
-  right_break_i <- match(as.character(support$rel_time_bin[[right_i]]), .es_rel_labels)
-  lo <- max(-window_yrs, .es_rel_breaks[[left_break_i]])
-  hi <- min(window_yrs, .es_rel_breaks[[right_break_i + 1]])
+  left_break_i <- match(as.character(support$rel_time_bin[[left_i]]), .support_rel_labels)
+  right_break_i <- match(as.character(support$rel_time_bin[[right_i]]), .support_rel_labels)
+  lo <- max(-window_yrs, .support_rel_breaks[[left_break_i]])
+  hi <- min(window_yrs, .support_rel_breaks[[right_break_i + 1]])
   c(lo, hi)
 }
 
-# Cluster-robust covariance for the primary participant-level inference. -------
-# Cluster-robust covariance for the fixed effects, clustered on participant id.
-# NOTE: clubSandwich requires the model's random-effect grouping to be nested
-# within the clustering variable. Risk-set matching reuses a participant across
-# match_sets, so id is NOT nested within match_set (they are crossed) and CR on
-# match_set is rejected. Clustering on id pools every row a person contributes
-# across assignments and addresses reuse/within-person dependence. It does not
-# absorb residual dependence between different people in the same matched set;
-# M3 assesses that separately with a matched-set random intercept.
-get_primary_vcov <- function(model, cluster, cluster_name = "id") {
+# Small pure helpers keep prediction and validation contracts independently testable.
+.bind_model_rows <- function(x) {
+  out <- bind_rows(x)
+  if (!"Cohort" %in% names(out)) out$Cohort <- character(nrow(out))
+  if (!"model_id" %in% names(out)) out$model_id <- character(nrow(out))
+  out
+}
+
+.exact_slope_contrasts <- function(difference_design, window) {
+  stopifnot(length(window) == 1L, is.finite(window), window > 0)
+  x <- difference_design(c(-window, 0, window))
+  pre <- (x[2, ] - x[1, ]) / window
+  post <- (x[3, ] - x[2, ]) / window
+  list(pre = pre, post = post, theta = post - pre)
+}
+
+.spline_grid_factory <- function(reference, spec, bases, scaling, beta_names) {
+  rhs <- .fixed_rhs(.model_time_terms(spec, bases), spec$covars)
+  grid <- function(time, group) {
+    g <- .make_ref_grid(reference, covars = spec$covars,
+                        Age_Centered = time, Group = group) %>%
+      mutate(Group = factor(Group, levels = c("Control", "Cancer Case")))
+    .apply_model_scaling(.add_model_time_terms(g, spec, bases), scaling)
+  }
+  design <- function(time, group) model.matrix(rhs, grid(time, group))[, beta_names, drop = FALSE]
+  difference <- function(time) design(time, "Cancer Case") - design(time, "Control")
+  list(grid = grid, design = design, difference = difference)
+}
+
+.inference_constraints <- function(beta_names, time_terms, difference, window = 8,
+                                   theta_supported = TRUE) {
+  terms <- .spline_interaction_terms(beta_names, time_terms)
+  out <- list(omnibus = diag(length(beta_names))[match(terms, beta_names), , drop = FALSE])
+  if (theta_supported) {
+    exact <- .exact_slope_contrasts(difference, window)
+    out$theta <- matrix(exact$theta, nrow = 1)
+    out$pre_slope <- matrix(exact$pre, nrow = 1)
+  }
+  out[vapply(out, nrow, integer(1)) > 0L]
+}
+
+.validate_covariance <- function(V, beta_names) {
+  if (!identical(dim(V), rep(length(beta_names), 2L)) || !all(is.finite(V)))
+    stop("Covariance dimensions or finite values are invalid")
+  if (!identical(rownames(V), beta_names) || !identical(colnames(V), beta_names))
+    stop("Covariance coefficient names/order differ from fixef")
+  if (!isTRUE(all.equal(V, t(V), tolerance = 1e-8))) stop("Covariance is not symmetric")
+  ev <- eigen(V, symmetric = TRUE, only.values = TRUE)$values
+  if (min(ev) < -1e-8 * max(abs(ev), .Machine$double.eps)) stop("Covariance is not positive semidefinite")
+  if (any(diag(V) <= 0)) stop("Nonpositive coefficient variance")
+  invisible(TRUE)
+}
+
+.validate_wald <- function(x) {
+  if (!all(c("Fstat", "df_num", "df_denom", "p_val") %in% names(x)) ||
+      !nrow(x) || any(!is.finite(x$Fstat)) || any(x$Fstat < 0) ||
+      any(!is.finite(x$df_num) | x$df_num <= 0) ||
+      any(!is.finite(x$df_denom) | x$df_denom <= 0) ||
+      any(!is.finite(x$p_val) | x$p_val < 0 | x$p_val > 1)) stop("Invalid Wald inference values")
+  invisible(TRUE)
+}
+
+.nested_covariance_engine <- function(fit, cluster) {
+  stopifnot(as.character(packageVersion('clubSandwich')) == '0.6.2',
+            is.null(fit@call$weights))
+  cluster <- droplevels(factor(cluster))
+  groups <- getME(fit, 'flist')
+  stopifnot(all(vapply(groups, function(g) identical(as.character(g), as.character(cluster)), logical(1))))
+  rows <- split(seq_along(cluster), cluster)
+  frame <- model.frame(fit)
+  vc <- VarCorr(fit, sigma = 1)
+  designs <- lapply(vc, function(G) {
+    terms <- colnames(G)
+    Z <- matrix(1, nrow(frame), length(terms), dimnames = list(NULL, terms))
+    for (v in setdiff(terms, '(Intercept)')) Z[, v] <- frame[[v]]
+    Z
+  })
+  target <- lapply(rows, function(i) {
+    T <- diag(length(i))
+    for (j in seq_along(vc)) {
+      Z <- designs[[j]][i, , drop = FALSE]
+      T <- T + Z %*% as.matrix(vc[[j]]) %*% t(Z)
+    }
+    T
+  })
+  sparse <- Matrix::tcrossprod(getME(fit, 'Z'), getME(fit, 'Lambdat'))
+  probe <- unique(c(1L, length(rows), which.max(lengths(rows)),
+                    round(seq(1, length(rows), length.out = 10))))
+  for (j in probe) {
+    Z <- sparse[rows[[j]], , drop = FALSE]
+    original <- as.matrix(Matrix::tcrossprod(Z)) + diag(length(rows[[j]]))
+    stopifnot(isTRUE(all.equal(unname(target[[j]]), unname(original), tolerance = 1e-10)))
+  }
+  rm(sparse)
+  weights <- lapply(target, function(T) chol2inv(chol(T)))
+  core <- getFromNamespace('vcov_CR', 'clubSandwich')
+  scope <- new.env(parent = environment(core))
+  scope$weightMatrix <- function(obj, cluster) weights
+  scope$targetVariance <- function(obj, cluster) target
+  # Reuse row indices instead of scanning all observations once per cluster.
+  scope$matrix_list <- function(x, fac, dim) {
+    stopifnot(identical(fac, cluster), dim == 'row', is.matrix(x))
+    lapply(rows, function(i) x[i, , drop = FALSE])
+  }
+  environment(core) <- scope
+  function(type, form = 'sandwich') core(fit, cluster, type = type,
+                                         inverse_var = TRUE, form = form)
+}
+
+# Use the validated optimization only for unweighted participant-nested fits.
+# Crossed/weighted models keep the package's explicit support checks.
+.participant_vcov <- function(model, cluster, type, form = "sandwich") {
+  nested <- inherits(model, "lmerMod") && is.null(model@call$weights) &&
+    as.character(utils::packageVersion("clubSandwich")) == "0.6.2" &&
+    all(vapply(lme4::getME(model, "flist"), function(g)
+      identical(as.character(g), as.character(cluster)), logical(1)))
+  if (nested) return(.nested_covariance_engine(model, cluster)(type, form))
+  clubSandwich::vcovCR(model, cluster = cluster, type = type, form = form)
+}
+
+# Covariance selection is independent of small-sample inference feasibility.
+# The bound deliberately guards the J-by-J, coefficient-sized intermediate
+# arrays in small-sample tests; it is conservative, not a memory guarantee.
+.small_sample_feasible <- function(model, cluster) {
+  bytes <- 8 * length(unique(cluster))^2 * length(lme4::fixef(model))^2
+  is.finite(bytes) && bytes <= getOption("hpfs.small_sample_max_bytes", 256 * 1024^2)
+}
+
+get_primary_vcov <- function(model, cluster, cluster_name = "id", constraints = list(),
+                             diagnostic_path = NULL) {
   fe <- names(lme4::fixef(model))
-  if (requireNamespace("clubSandwich", quietly = TRUE)) {
-    for (cr_type in c("CR2", "CR0")) {
-      out_cs <- tryCatch(
-        clubSandwich::vcovCR(model, cluster = cluster, type = cr_type),
-        error = function(e) NULL
-      )
-      if (!is.null(out_cs)) {
-        out <- as.matrix(out_cs)
-        robust_ok <- nrow(out) == length(fe) && ncol(out) == length(fe) &&
-          all(is.finite(out)) && isTRUE(all.equal(out, t(out), tolerance = 1e-8))
-        if (robust_ok) {
-          # Validate the downstream operations used by this analysis, not only
-          # vcovCR construction. A crossed M3 covariance can be constructed but
-          # still fail coefficient or small-sample Wald inference.
-          robust_ok <- tryCatch({
-            clubSandwich::coef_test(model, vcov = out_cs, test = "Satterthwaite")
-            probe <- matrix(0, nrow = 1, ncol = length(fe))
-            probe[1, 1] <- 1
-            clubSandwich::Wald_test(model, constraints = probe, vcov = out_cs,
-                                    test = "HTZ")
-            TRUE
-          }, error = function(e) FALSE)
-        }
-        if (robust_ok) {
-          dimnames(out) <- list(fe, fe)
-          return(list(V = out, V_cs = out_cs, robust = TRUE,
-                      type = paste0(cr_type, " (cluster-robust on ", cluster_name, ")")))
-        }
-      }
+  records <- list()
+  add <- function(type, stage, status, message = NA_character_) {
+    records[[length(records) + 1L]] <<- data.frame(
+      type = type, stage = stage, status = status, message = message,
+      n_rows = nobs(model), n_clusters = length(unique(cluster)),
+      clubSandwich_version = if (requireNamespace("clubSandwich", quietly = TRUE))
+        as.character(utils::packageVersion("clubSandwich")) else NA_character_,
+      generated_at = format(Sys.time(), tz = "UTC", usetz = TRUE))
+    if (!is.null(diagnostic_path)) {
+      dir.create(dirname(diagnostic_path), recursive = TRUE, showWarnings = FALSE)
+      write.csv(bind_rows(records), diagnostic_path, row.names = FALSE)
     }
   }
-  out <- as.matrix(vcov(model))
-  dimnames(out) <- list(fe, fe)
-  list(V = out, V_cs = NULL, robust = FALSE, type = "model-based")
+  attempt <- function(type, stage, expr) {
+    tryCatch(withCallingHandlers({
+      value <- force(expr); add(type, stage, "success"); list(ok = TRUE, value = value)
+    }, warning = function(w) { add(type, stage, "warning", conditionMessage(w)); invokeRestart("muffleWarning") }),
+    error = function(e) { add(type, stage, "error", conditionMessage(e)); list(ok = FALSE) })
+  }
+  frame <- model.frame(model)
+  if (inherits(model, "lmerMod")) {
+    if (!is.null(model@call$weights)) add(NA_character_, "model_support", "weighted_requires_review",
+      "Weighted lmer covariance is a separate limitation (S11); inspect package errors")
+    if (length(lme4::getME(model, "flist")) > 1L) add(NA_character_, "model_support", "crossed_requires_review",
+      "Multiple grouping factors: participant-clustered covariance may be unsupported (M3)")
+  }
+  aligned <- length(cluster) == nrow(frame) && !anyNA(cluster) &&
+    cluster_name %in% names(frame) &&
+    identical(as.character(cluster), as.character(frame[[cluster_name]]))
+  add(NA_character_, "cluster_alignment", if (aligned) "success" else "error",
+      if (aligned) NA_character_ else "Cluster vector does not match fitted model rows")
+  if (!aligned) stop("Cluster vector does not match fitted model rows; see covariance diagnostics")
+  if (aligned && requireNamespace("clubSandwich", quietly = TRUE)) {
+    for (type in c("CR2", "CR0")) {
+      cv <- attempt(type, "vcovCR", .participant_vcov(model, cluster, type))
+      if (!cv$ok) next
+      V <- as.matrix(cv$value)
+      valid <- attempt(type, "covariance_validation", .validate_covariance(V, fe))
+      if (!valid$ok) next
+      for (name in names(constraints)) attempt(type, paste0("constraint_validation_", name), {
+        C <- constraints[[name]]
+        VV <- C %*% V %*% t(C)
+        if (any(!is.finite(VV)) || qr(VV)$rank < nrow(C) || any(diag(VV) <= 0))
+          stop("Constraint covariance is singular or invalid; this test requires review")
+        TRUE
+      })
+      small_sample <- .small_sample_feasible(model, cluster)
+      ct <- list(ok = FALSE, value = NULL)
+      if (small_sample) ct <- attempt(type, "coef_test", {
+        tab <- as.data.frame(clubSandwich::coef_test(model, vcov = cv$value, test = "Satterthwaite"))
+        if (nrow(tab) != length(fe) || !all(c("SE", "df_Satt", "p_Satt") %in% names(tab)) ||
+            any(!is.finite(tab$SE) | tab$SE <= 0) ||
+            any(!is.finite(tab$df_Satt) | tab$df_Satt <= 0) ||
+            any(!is.finite(tab$p_Satt) | tab$p_Satt < 0 | tab$p_Satt > 1)) stop("Invalid coefficient inference values")
+        tab
+      })
+      if (!small_sample) add(type, "small_sample", "skipped_memory_guard",
+        "Conservative allocation bound exceeds hpfs.small_sample_max_bytes; retaining robust covariance")
+      if (!ct$ok) add(type, "inference", "asymptotic",
+        "Using normal/chi-square inference with the selected robust covariance")
+      add(type, "selection", "selected")
+      return(list(V = V, V_cs = cv$value, robust = TRUE, coefficient_test = ct$value,
+                  small_sample = small_sample && ct$ok,
+                  type = paste0(type, " (cluster-robust on ", cluster_name, ")"),
+                  inference_status = if (ct$ok) "robust_small_sample" else "robust_asymptotic", diagnostics = bind_rows(records), record = add))
+    }
+  } else if (!requireNamespace("clubSandwich", quietly = TRUE)) add(NA_character_, "package", "error", "clubSandwich not installed")
+  V <- as.matrix(vcov(model))
+  valid <- attempt("model-based", "covariance_validation", .validate_covariance(V, fe))
+  if (!valid$ok) stop("Model-based covariance also invalid; see covariance diagnostics")
+  add("model-based", "selection", "fallback_requires_review")
+  warning("Robust inference unavailable; selected model-based covariance. Inspect covariance diagnostics.", call. = FALSE)
+  list(V = V, V_cs = NULL, robust = FALSE, type = "model-based",
+       inference_status = "model_based_fallback_requires_review", diagnostics = bind_rows(records), record = add)
 }
 
 coef_table_with_vcov <- function(model, Vobj) {
-  if (!is.null(Vobj$V_cs)) {
-    ct <- as.data.frame(clubSandwich::coef_test(model, vcov = Vobj$V_cs,
-                                                test = "Satterthwaite"))
+  if (!is.null(Vobj$coefficient_test)) {
+    ct <- Vobj$coefficient_test
   } else {
     beta <- lme4::fixef(model)
     se <- sqrt(diag(Vobj$V))
@@ -229,28 +306,38 @@ coef_table_with_vcov <- function(model, Vobj) {
     Term, Estimate, SE, df = as.numeric(df), p_value = as.numeric(p_value),
     CI_low = Estimate - qt(0.975, df = df) * SE,
     CI_high = Estimate + qt(0.975, df = df) * SE,
-    infer_method = if (Vobj$robust) paste(Vobj$type, "Satterthwaite") else "model-based normal"
+    infer_method = if (!is.null(Vobj$coefficient_test)) paste(Vobj$type, "Satterthwaite") else paste(Vobj$type, "normal")
   )
 }
 
 wald_with_vcov <- function(model, Vobj, constraints, label) {
-  if (!is.null(Vobj$V_cs)) {
-    ans <- as.data.frame(clubSandwich::Wald_test(
-      model, constraints = constraints, vcov = Vobj$V_cs, test = "HTZ"
-    ))
-    return(ans %>% transmute(
+  if (!is.null(Vobj$V_cs) && isTRUE(Vobj$small_sample)) {
+    ans <- tryCatch({
+      x <- as.data.frame(clubSandwich::Wald_test(model, constraints = constraints,
+                                               vcov = Vobj$V_cs, test = "HTZ"))
+      .validate_wald(x); x
+    }, error = function(e) e)
+    if (inherits(ans, "error") && is.function(Vobj$record))
+      Vobj$record(Vobj$type, paste0("downstream_Wald_", label), "error", conditionMessage(ans))
+    if (!inherits(ans, "error")) return(ans %>% transmute(
       Test = label, Fstat, df_num, df_denom, p_value = p_val,
       infer_method = paste(Vobj$type, "HTZ")
     ))
+    if (is.function(Vobj$record)) Vobj$record(Vobj$type,
+      paste0("downstream_Wald_", label), "asymptotic", "Retained covariance after optional HTZ failure")
+    # A failed optional test never changes the selected covariance.
   }
   beta <- lme4::fixef(model)
   est <- as.vector(constraints %*% beta)
   VV <- constraints %*% Vobj$V %*% t(constraints)
   q <- qr(VV)$rank
+  if (q < nrow(constraints) || any(diag(VV) <= 0)) return(data.frame(
+    Test = label, Fstat = NA_real_, df_num = q, df_denom = NA_real_, p_value = NA_real_,
+    infer_method = paste(Vobj$type, "constraint covariance invalid")))
   chisq <- as.numeric(t(est) %*% MASS::ginv(VV) %*% est)
   data.frame(Test = label, Fstat = chisq / q, df_num = q,
              df_denom = Inf, p_value = pchisq(chisq, q, lower.tail = FALSE),
-             infer_method = "model-based Wald chi-square")
+             infer_method = paste(Vobj$type, "asymptotic Wald chi-square"))
 }
 
 # Joint Wald test that a named subset of fixed-effect coefficients are all 0. ---
@@ -264,20 +351,6 @@ joint_wald <- function(model, Vobj, terms, label) {
   }
   constraints <- diag(length(beta))[match(terms, names(beta)), , drop = FALSE]
   wald_with_vcov(model, Vobj, constraints, label)
-}
-
-# Event-study interaction terms (Group x rel_time_bin), order-agnostic. --------
-# Bin labels contain no ":", "rel_time_bin", or "GroupCancer Case" substrings,
-# so stripping those tokens from a coefficient name returns the bin label.
-.es_interaction_terms <- function(beta_names) {
-  it <- beta_names[grepl(":", beta_names) &
-                   grepl("rel_time_bin", beta_names) &
-                   grepl("GroupCancer Case", beta_names)]
-  data.frame(
-    term = it,
-    bin  = gsub("GroupCancer Case|rel_time_bin|:", "", it),
-    stringsAsFactors = FALSE
-  )
 }
 
 # Build a per-cohort prediction grid with covariates held at reference levels. --
@@ -294,7 +367,7 @@ joint_wald <- function(model, Vobj, terms, label) {
     time_structure = "natural spline",
     spline_df = 3L,
     basis_key = "m0_spline",
-    random = "(1 + Age_Centered | id)",
+    random = "(1 + .random_time | id)",
     matching_set_random = FALSE
   ),
   M1_primary_spline = list(
@@ -304,7 +377,7 @@ joint_wald <- function(model, Vobj, terms, label) {
     time_structure = "natural spline",
     spline_df = 3L,
     basis_key = "adjusted_spline",
-    random = "(1 + Age_Centered | id)",
+    random = "(1 + .random_time | id)",
     matching_set_random = FALSE
   ),
   M2_full_spline = list(
@@ -314,7 +387,7 @@ joint_wald <- function(model, Vobj, terms, label) {
     time_structure = "natural spline",
     spline_df = 3L,
     basis_key = "adjusted_spline",
-    random = "(1 + Age_Centered | id)",
+    random = "(1 + .random_time | id)",
     matching_set_random = FALSE
   ),
   M3_primary_matching_spline = list(
@@ -324,7 +397,7 @@ joint_wald <- function(model, Vobj, terms, label) {
     time_structure = "natural spline",
     spline_df = 3L,
     basis_key = "adjusted_spline",
-    random = "(1 + Age_Centered | id) + (1 | matching_id)",
+    random = "(1 + .random_time | id) + (1 | matching_id)",
     matching_set_random = TRUE
   )
 )
@@ -367,13 +440,9 @@ joint_wald <- function(model, Vobj, terms, label) {
     mutate(!!!base_cols)
 }
 
-.fixed_rhs <- function(spline_terms = NULL, covars = .primary_covars,
-                       time_term = "rel_time_bin") {
-  group_time <- if (is.null(spline_terms)) {
-    paste0("Group * ", time_term)
-  } else {
-    paste0("Group * (", paste(spline_terms, collapse = " + "), ")")
-  }
+.fixed_rhs <- function(spline_terms, covars = .primary_covars) {
+  if (!length(spline_terms)) stop("Spline terms are required")
+  group_time <- paste0("Group * (", paste(spline_terms, collapse = " + "), ")")
   as.formula(paste("~", paste(c(group_time, covars), collapse = " + ")))
 }
 
@@ -451,7 +520,7 @@ joint_wald <- function(model, Vobj, terms, label) {
   opt_code <- fit@optinfo$conv$opt
   opt_code <- if (length(opt_code) == 0 || is.null(opt_code)) 0L else as.integer(opt_code[[1]])
   conv_messages <- fit@optinfo$conv$lme4$messages
-  substantive_messages <- conv_messages
+  substantive_messages <- conv_messages[!grepl("very different scales|consider rescaling", conv_messages, ignore.case = TRUE)]
   if (allow_singular && length(substantive_messages)) {
     substantive_messages <- substantive_messages[
       !grepl("^boundary \\(singular\\) fit", substantive_messages)
@@ -478,6 +547,17 @@ joint_wald <- function(model, Vobj, terms, label) {
        singular = singular, finite = finite)
 }
 
+.participant_boundary <- function(fit, tolerance = 1e-4) {
+  blocks <- lme4::VarCorr(fit, sigma = 1)
+  blocks <- blocks[grepl("^id($|\\.)", names(blocks))]
+  slope <- unlist(lapply(blocks, function(G) diag(G)[names(diag(G)) == ".random_time"]))
+  singular <- any(vapply(blocks, function(G)
+    min(eigen(G, symmetric = TRUE, only.values = TRUE)$values) <= tolerance^2, logical(1)))
+  list(slope_boundary = length(slope) > 0 && all(slope <= tolerance^2),
+       correlation_boundary = singular && any(lengths(blocks) > 1L),
+       participant_supported = length(blocks) > 0 && !singular)
+}
+
 .matching_zero_variance <- function(fit, tolerance = 1e-7) {
   vc <- as.data.frame(lme4::VarCorr(fit))
   matching_var <- vc$vcov[vc$grp == "matching_id" &
@@ -487,17 +567,17 @@ joint_wald <- function(model, Vobj, terms, label) {
   list(
     permitted = length(matching_var) == 1L && length(id_var) == 1L &&
       is.finite(matching_var) && is.finite(id_var) &&
-      matching_var <= tolerance && id_var > tolerance,
+      matching_var <= tolerance && id_var > tolerance &&
+      .participant_boundary(fit)$participant_supported,
     matching_id_variance = if (length(matching_var) == 1L) matching_var else NA_real_
   )
 }
 
-.fit_lmer_with_ladder <- function(formula, data, model_label, weights = NULL,
-                                  allow_matching_boundary = FALSE) {
+.lmer_attempts <- function(formula, numerical_retries = FALSE, simplify = TRUE) {
   formula_text <- paste(deparse(formula), collapse = "")
-  slope_uncorrelated <- as.formula(gsub("\\(1 \\+ Age_Centered \\| id\\)",
-                                        "(1 + Age_Centered || id)", formula_text))
-  intercept_only <- as.formula(gsub("\\(1 \\+ Age_Centered \\|\\| id\\)|\\(1 \\+ Age_Centered \\| id\\)",
+  slope_uncorrelated <- as.formula(gsub("\\(1 \\+ .random_time \\| id\\)",
+                                        "(1 + .random_time || id)", formula_text))
+  intercept_only <- as.formula(gsub("\\(1 \\+ .random_time \\|\\| id\\)|\\(1 \\+ .random_time \\| id\\)",
                                     "(1 | id)", formula_text))
   attempts <- list(
     list(
@@ -520,18 +600,77 @@ joint_wald <- function(model, Vobj, terms, label) {
     )
   )
 
+  if (!simplify) attempts <- attempts[1]
+  formula_keys <- vapply(attempts, function(x) paste(deparse(x$formula), collapse = ""), character(1))
+  attempts <- attempts[!duplicated(formula_keys)]
+  for (i in seq_along(attempts)) {
+    txt <- paste(deparse(attempts[[i]]$formula), collapse = "")
+    attempts[[i]]$rung <- if (!grepl(".random_time", txt, fixed = TRUE)) "random intercept only" else
+      if (grepl("||", txt, fixed = TRUE)) "uncorrelated random slope" else "correlated random slope"
+    attempts[[i]]$optimizer <- "bobyqa"
+  }
+  if (numerical_retries) attempts <- unlist(lapply(attempts, function(at) {
+    retry <- at
+    retry$optimizer <- "nloptwrap"
+    retry$control <- lmerControl(optimizer = "nloptwrap", calc.derivs = TRUE,
+      optCtrl = list(maxeval = 2e5, ftol_abs = 1e-8, xtol_abs = 1e-8))
+    list(at, retry)
+  }), recursive = FALSE)
+  attempts
+}
+
+.set_random_clock <- function(data, random_clock = "attained_age", random_time_scale = 4) {
+  if (random_clock == "attained_age") {
+    if (!"age_at_cycle" %in% names(data) || any(!is.finite(data$age_at_cycle)))
+      stop("Finite age_at_cycle is required for attained-age random slopes")
+    if (all(c("id", "cycle") %in% names(data))) {
+      copies <- split(data$age_at_cycle, interaction(data$id, data$cycle, drop = TRUE))
+      if (any(vapply(copies, function(x) diff(range(x)) > 1e-8, logical(1))))
+        stop("Attained age differs across copies of the same participant-cycle")
+    }
+    data$.random_time <- (data$age_at_cycle - 60) / random_time_scale
+  } else if (random_clock == "relative_time") {
+    data$.random_time <- data$Age_Centered / random_time_scale
+  } else stop("Unknown random clock")
+  data
+}
+
+# Isolated call boundary permits orchestration tests without running a model.
+.fit_lmer_candidate <- function(formula, data, control, weights = NULL,
+                                reml = TRUE) {
+  if (is.null(weights)) lme4::lmer(formula, data = data, REML = reml,
+                                  control = control, na.action = na.fail)
+  else lme4::lmer(formula, data = data, REML = reml, control = control,
+                  weights = weights, na.action = na.fail)
+}
+
+.fit_lmer_with_ladder <- function(formula, data, model_label, weights = NULL,
+                                  allow_matching_boundary = FALSE,
+                                  numerical_retries = TRUE, simplify = TRUE,
+                                  random_clock = "attained_age", random_time_scale = 4,
+                                  diagnostic_path = NULL, reml = TRUE) {
+  stopifnot(is.finite(random_time_scale), random_time_scale > 0)
+  data <- .set_random_clock(data, random_clock, random_time_scale)
+  formula_text <- paste(deparse(formula), collapse = "")
+  formula_text <- gsub("Age_Centered |", ".random_time |", formula_text, fixed = TRUE)
+  formula <- as.formula(formula_text, env = environment(formula))
+  attempts <- .lmer_attempts(formula, numerical_retries, simplify)
   last_error <- NULL
   attempt_log <- list()
-  for (at in attempts) {
-    warnings_seen <- character()
-    fit_call <- function() {
-      if (is.null(weights)) {
-        lme4::lmer(at$formula, data = data, REML = TRUE, control = at$control)
-      } else {
-        lme4::lmer(at$formula, data = data, REML = TRUE, control = at$control,
-                   weights = weights)
-      }
+  save_attempts <- function() {
+    if (!is.null(diagnostic_path)) {
+      dir.create(dirname(diagnostic_path), recursive = TRUE, showWarnings = FALSE)
+      write.csv(bind_rows(attempt_log), diagnostic_path, row.names = FALSE)
     }
+  }
+  on.exit(save_attempts(), add = TRUE)
+  supported_fallbacks <- character()
+  initial_rung <- attempts[[1]]$rung
+  for (at in attempts) {
+    if (at$rung != initial_rung && !at$rung %in% supported_fallbacks) next
+    warnings_seen <- character()
+    fit_call <- function() .fit_lmer_candidate(at$formula, data, at$control,
+                                                weights, reml = reml)
     fit <- tryCatch(withCallingHandlers(
       fit_call(),
       warning = function(w) {
@@ -545,23 +684,31 @@ joint_wald <- function(model, Vobj, terms, label) {
     )
     if (is.null(fit)) {
       attempt_log[[length(attempt_log) + 1L]] <- data.frame(
-        model_label = model_label, rung = at$rung, accepted = FALSE,
+        model_label = model_label, rung = at$rung, optimizer = at$optimizer,
+        random_clock = random_clock, random_time_center = if (random_clock == "attained_age") 60 else 0,
+        random_time_scale = random_time_scale, accepted = FALSE,
         optimizer_code = NA_integer_, convergence_messages = NA_character_,
         scaled_gradient = NA_real_, singular = NA, finite = NA,
         warnings = paste(warnings_seen, collapse = " | "), error = last_error
       )
       next
     }
-    boundary_matching <- if (identical(at$rung, "random intercept only") &&
-                             isTRUE(allow_matching_boundary)) {
+    boundary_matching <- if (isTRUE(allow_matching_boundary)) {
       .matching_zero_variance(fit)
     } else {
       list(permitted = FALSE, matching_id_variance = NA_real_)
     }
     check <- .assess_lmer_fit(fit, allow_singular = boundary_matching$permitted)
-    # Strict acceptance rejects fitting warnings except a boundary warning for
-    # M3's intercept-only fallback when only matching_id variance is zero.
-    substantive_warnings <- warnings_seen
+    # Scaling warnings alone do not justify changing the random structure.
+    structural <- .participant_boundary(fit)
+    numerical <- .assess_lmer_fit(fit, allow_singular = TRUE)
+    if (numerical$converged) {
+      if (structural$correlation_boundary || structural$slope_boundary)
+        supported_fallbacks <- union(supported_fallbacks, "uncorrelated random slope")
+      if (at$rung == "uncorrelated random slope" && structural$slope_boundary)
+        supported_fallbacks <- union(supported_fallbacks, "random intercept only")
+    }
+    substantive_warnings <- warnings_seen[!grepl("very different scales|consider rescaling", warnings_seen, ignore.case = TRUE)]
     if (boundary_matching$permitted && length(substantive_warnings)) {
       substantive_warnings <- substantive_warnings[
         !grepl("^boundary \\(singular\\) fit", substantive_warnings)
@@ -569,13 +716,19 @@ joint_wald <- function(model, Vobj, terms, label) {
     }
     check$converged <- check$converged && length(substantive_warnings) == 0
     attempt_log[[length(attempt_log) + 1L]] <- data.frame(
-      model_label = model_label, rung = at$rung, accepted = check$converged,
+      model_label = model_label, rung = at$rung, optimizer = at$optimizer,
+        random_clock = random_clock, random_time_center = if (random_clock == "attained_age") 60 else 0,
+        random_time_scale = random_time_scale, accepted = check$converged,
       optimizer_code = check$optimizer_code,
       convergence_messages = check$convergence_messages,
       scaled_gradient = check$scaled_gradient, singular = check$singular,
       finite = check$finite, warnings = paste(warnings_seen, collapse = " | "),
-      error = NA_character_
+      fallback_evidence = paste(supported_fallbacks, collapse = " | "),
+      error = NA_character_, logLik = as.numeric(logLik(fit)),
+      variance_components = paste(capture.output(print(VarCorr(fit))), collapse = " | "),
+      fixed_effects = paste(names(fixef(fit)), signif(fixef(fit), 10), collapse = " | ")
     )
+    save_attempts()
     if (check$converged) {
       return(c(list(fit = fit, rung = at$rung, error = NA_character_,
                     attempts = bind_rows(attempt_log),
@@ -621,8 +774,9 @@ joint_wald <- function(model, Vobj, terms, label) {
       summarize_residuals(x, unique(x$Group))
     })
   )
-  re_summary <- bind_rows(lapply(names(ranef(model)), function(grp) {
-    re <- ranef(model)[[grp]]
+  random_effects <- ranef(model, condVar = FALSE)
+  re_summary <- bind_rows(lapply(names(random_effects), function(grp) {
+    re <- random_effects[[grp]]
     bind_rows(lapply(names(re), function(term) {
       z <- re[[term]]
       data.frame(Cohort = cohort, model_id = model_id,
@@ -639,7 +793,7 @@ joint_wald <- function(model, Vobj, terms, label) {
                Reduce(`|`, lapply(sterms, grepl, x = beta_names))]
 }
 
-run_eventstudy_spline_analysis <- function(matched_path,
+run_spline_analysis <- function(matched_path,
                                            results_dir,
                                            visuals_dir,
                                            out_prefix,
@@ -648,10 +802,11 @@ run_eventstudy_spline_analysis <- function(matched_path,
                                            window_yrs   = 20,
                                            spline_df    = 3,
                                            min_case_bin = 50,
-                                           min_ctrl_bin = 250) {
+                                           min_ctrl_bin = 250,
+                                           run_influence = FALSE) {
 
   needed_cols <- c("Cohort", "Group", "Age_Centered", "index_age_z",
-                   "base_race", "base_marital", "base_living", "base_pckgr",
+                   "base_race", "base_marital", "base_living",
                    "id", "match_set", "role", "cycle", "fi_score_nocancer")
 
   if (!file.exists(matched_path)) {
@@ -660,6 +815,7 @@ run_eventstudy_spline_analysis <- function(matched_path,
 
   matching_provenance <- validate_matching_provenance(matched_path)
   matched_long <- readRDS(matched_path)
+  assignment_ledger <- readRDS(matching_provenance$assignment_path)
   missing_cols <- setdiff(needed_cols, names(matched_long))
   if (length(missing_cols) > 0) {
     stop("Matched dataset is missing required columns: ", paste(missing_cols, collapse = ", "))
@@ -677,6 +833,16 @@ run_eventstudy_spline_analysis <- function(matched_path,
     stop("Matched dataset is missing post_own_cancer. Rebuild it with 2.0_riskset_matching_functions.R before fitting GLME models.")
   }
 
+  if ("base_pckgr" %in% names(matched_long)) matched_long$base_pckgr <- factor(matched_long$base_pckgr)
+  if (anyNA(matched_long[c("id", "Group", "matching_id", "trajectory_id", "cycle", "post_own_cancer")])) {
+    stop("Missing identifiers, group, cycle or own-cancer censoring flag")
+  }
+  if (!all(matched_long$Group %in% c("Control", "Cancer Case"))) stop("Unexpected Group values")
+  if (any(!is.na(matched_long$fi_score_nocancer) &
+          (!is.finite(matched_long$fi_score_nocancer) | matched_long$fi_score_nocancer < 0 |
+             matched_long$fi_score_nocancer > 1)) ||
+      any(!is.na(matched_long$Age_Centered) & !is.finite(matched_long$Age_Centered)))
+    stop("FI must be finite in [0,1] and observed relative time must be finite")
   n_post_own_cancer_rows <- sum(matched_long$post_own_cancer %in% TRUE, na.rm = TRUE)
   censoring_log <- matched_long %>%
     group_by(Cohort, Group, role) %>%
@@ -698,8 +864,7 @@ run_eventstudy_spline_analysis <- function(matched_path,
       trajectory_id = factor(trajectory_id),
       base_race = factor(base_race),
       base_marital = factor(base_marital),
-      base_living = factor(base_living),
-      base_pckgr = factor(base_pckgr)
+      base_living = factor(base_living)
     ) %>%
     # Future cases remain eligible controls at an earlier index, but primary
     # follow-up ends at that control's own subsequent cancer diagnosis.
@@ -720,15 +885,13 @@ run_eventstudy_spline_analysis <- function(matched_path,
     data.frame(
       model_id = model_id, model_label = spec$label, model_role = spec$role,
       time_structure = spec$time_structure, spline_df = spec$spline_df,
+      random_clock = "attained_age", random_time_center = 60, random_time_scale = 4,
       covariates = paste(spec$covars, collapse = " + "),
       random_effects = spec$random,
       stringsAsFactors = FALSE
     )
   }))
 
-  es_coef_all   <- list()
-  es_pred_all   <- list()
-  es_tests_all  <- list()
   support_all   <- list()
   filter_all    <- list()
   metadata_all  <- list()
@@ -746,8 +909,39 @@ run_eventstudy_spline_analysis <- function(matched_path,
   omnibus_all <- list()
   influence_all <- list()
   scaling_all <- list()
-  es_models     <- list()
   sp_models     <- list()
+  sp_contexts <- list()
+
+  dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+  assignment_flow <- bind_rows(lapply(names(.trajectory_model_specs), function(model_id) {
+    spec <- .trajectory_model_specs[[model_id]]
+    missing_covars <- setdiff(spec$covars, names(matched_long))
+    model_rows <- if (length(missing_covars)) matched_long[FALSE, ] else
+      matched_long %>% filter(if_all(all_of(spec$covars), ~ !is.na(.x)))
+    assignment_ledger %>% group_by(Cohort, Group) %>% summarize(
+      n_matched_assignments = n(),
+      n_fi_contributing_assignments = sum(trajectory_id %in% matched_long$trajectory_id),
+      n_model_complete_assignments = if (length(missing_covars)) NA_integer_ else
+        sum(trajectory_id %in% model_rows$trajectory_id),
+      n_without_usable_fi = n_matched_assignments - n_fi_contributing_assignments,
+      n_removed_model_completeness = n_fi_contributing_assignments - n_model_complete_assignments,
+      model_id = model_id,
+      status = if (length(missing_covars)) "missing_covariate_columns" else "assessed",
+      .groups = "drop")
+  }))
+  write.csv(assignment_flow, file.path(results_dir, paste0(out_prefix, "_assignment_flow.csv")), row.names = FALSE)
+  checkpoint <- function() {
+    write.csv(bind_rows(unlist(sp_status_all, recursive = FALSE)),
+              file.path(results_dir, paste0(out_prefix, "_spline_model_status.csv")), row.names = FALSE)
+    write.csv(bind_rows(convergence_all),
+              file.path(results_dir, paste0(out_prefix, "_convergence_attempts.csv")), row.names = FALSE)
+    write.csv(bind_rows(filter_all),
+              file.path(results_dir, paste0(out_prefix, "_model_filter_log.csv")), row.names = FALSE)
+    write.csv(bind_rows(scaling_all),
+              file.path(results_dir, paste0(out_prefix, "_spline_scaling.csv")), row.names = FALSE)
+    saveRDS(metadata_all, file.path(results_dir, paste0(out_prefix, "_spline_metadata.rds")))
+  }
+  on.exit(checkpoint(), add = TRUE)
 
   for (ch in cohorts) {
 
@@ -757,6 +951,7 @@ run_eventstudy_spline_analysis <- function(matched_path,
 
     filter_all[[ch]] <- bind_rows(lapply(names(.trajectory_model_specs), function(model_id) {
       spec <- .trajectory_model_specs[[model_id]]
+      if (!all(spec$covars %in% names(d_base))) return(NULL)
       d_model_check <- d_base %>% filter(if_all(all_of(spec$covars), ~ !is.na(.x)))
       before <- d_base %>% distinct(Group, trajectory_id) %>%
         count(Group, name = "n_before_complete_case")
@@ -773,102 +968,16 @@ run_eventstudy_spline_analysis <- function(matched_path,
         )
     }))
     if (any(filter_all[[ch]]$pct_dropped_complete_case > 5, na.rm = TRUE)) {
-      warning("Complete-case filtering removes more than 5% of rows in at least one arm/model for ",
+      warning("Complete-case filtering removes more than 5% of assignments in at least one arm/model for ",
               ch, ". See the model filter log.", call. = FALSE)
     }
-
-    d_es <- d_base %>%
-      filter(if_all(all_of(.primary_covars), ~ !is.na(.x))) %>%
-      droplevels()
-
-    # ---- bin support; drop bins lacking both-arm support, keep reference ----
-    support <- d_es %>%
-      group_by(rel_time_bin, .drop = FALSE) %>%
-      summarize(
-        n_case = n_distinct(id[Group == "Cancer Case"]),
-        n_ctrl = n_distinct(id[Group == "Control"]),
-        .groups = "drop"
-      ) %>%
-      mutate(
-        support_ok = (n_case >= min_case_bin & n_ctrl >= min_ctrl_bin)
-      )
-
-    support_all[[ch]] <- support %>% mutate(Cohort = ch, analysis = "event_study_M1")
-
-    cat("\n======== Event-study cohort:", ch, "========\n")
-    cat("Bin support (distinct ids); bins with no case or no control are dropped:\n")
-    print(as.data.frame(support), row.names = FALSE)
-
-    keep_bins <- as.character(support$rel_time_bin[support$support_ok])
-    if (!(.es_ref_label %in% keep_bins)) {
-      stop("Reference bin '", .es_ref_label, "' has no both-arm support in cohort ", ch)
-    }
-
-    d_es <- d_es %>%
-      filter(as.character(rel_time_bin) %in% keep_bins) %>%
-      mutate(rel_time_bin = relevel(droplevels(factor(rel_time_bin)),
-                                    ref = .es_ref_label))
-
-    # ---------------------------- 1) event-study GLME ---------------------------
-    es_fixed_rhs <- .fixed_rhs(covars = .primary_covars,
-                               time_term = "rel_time_bin")
-
-    m_es_info <- .fit_lmer_with_ladder(
-      update(es_fixed_rhs, fi_score_nocancer ~ . + (1 | id)), d_es,
-      paste0("event study ", ch)
-    )
-    m_es <- m_es_info$fit
-    convergence_all[[paste(ch, "event_study", sep = "__")]] <-
-      m_es_info$attempts %>% mutate(Cohort = ch, model_id = "event_study", .before = 1)
-    es_models[[ch]] <- m_es
-
-    beta <- fixef(m_es)
-    Vcr  <- get_primary_vcov(m_es, d_es$id, cluster_name = "id")
-    Ves  <- Vcr$V
-    se   <- sqrt(diag(Ves))
-
-    coef_tab <- coef_table_with_vcov(m_es, Vcr) %>%
-      mutate(Cohort = ch, vcov_type = Vcr$type, .before = 1)
-    es_coef_all[[ch]] <- coef_tab
-
-    # event-study interaction terms -> per-bin gap relative to reference bin
-    es_it     <- .es_interaction_terms(names(beta))
-    int_terms <- es_it$term
-    mids      <- .es_bin_midpoints[es_it$bin]
-
-    # joint Wald tests (global / pre-index / post-index interaction terms)
-    pre_terms  <- int_terms[!is.na(mids) & mids < 0]
-    post_terms <- int_terms[!is.na(mids) & mids > 0]
-    es_tests_all[[ch]] <- bind_rows(
-      joint_wald(m_es, Vcr, int_terms,  "Global: any differential trajectory"),
-      joint_wald(m_es, Vcr, pre_terms,  "Pre-index: parallel-trends test"),
-      joint_wald(m_es, Vcr, post_terms, "Post-index: differential post-diagnosis")
-    ) %>% mutate(Cohort = ch, vcov_type = Vcr$type, .before = 1)
-
-    # ---- step predicted means by bin x group (model-based mean + CR2 CI) ----
-    grid_es <- .make_ref_grid(
-      d_es,
-      rel_time_bin = levels(d_es$rel_time_bin),
-      Group = c("Control", "Cancer Case")
-    ) %>%
-      mutate(
-        rel_time_bin = factor(rel_time_bin, levels = levels(d_es$rel_time_bin)),
-        Group = factor(Group, levels = c("Control", "Cancer Case")),
-        mid = .es_bin_midpoints[as.character(rel_time_bin)]
-      )
-    Xes <- model.matrix(es_fixed_rhs, data = grid_es)[, names(beta), drop = FALSE]
-    pe  <- as.vector(Xes %*% beta)
-    sde <- sqrt(rowSums((Xes %*% Ves) * Xes))
-    grid_es$pred <- pe; grid_es$lwr <- pe - 1.96 * sde; grid_es$upr <- pe + 1.96 * sde
-    grid_es$Cohort <- ch
-    grid_es$vcov_type <- Vcr$type
-    es_pred_all[[ch]] <- grid_es
 
     # ---------------------------- 2) trajectory GLME/LME model set -------------
     # M0-M3 share a df-3 spline basis estimated on the primary complete-case
     # sample.
     d_spline_basis <- d_base %>%
       filter(if_all(all_of(.primary_covars), ~ !is.na(.x)))
+    if (!nrow(d_spline_basis)) stop("No primary complete-case rows for cohort: ", ch)
     adjusted_spline_df <- 3L
     spline_bases <- list(
       m0_spline = .make_spline_basis(d_spline_basis$Age_Centered,
@@ -877,7 +986,13 @@ run_eventstudy_spline_analysis <- function(matched_path,
                                             spline_df = adjusted_spline_df, prefix = "S")
     )
     metadata_all[[ch]] <- list(
-      schema_version = 2L,
+      schema_version = 3L,
+      input_md5 = matching_provenance$input_md5,
+      assignment_md5 = matching_provenance$assignment_md5,
+      inference_policy = "CR2 then CR0 then labeled model-based fallback; policy review pending",
+      event_study = FALSE,
+      influence_refits_requested = run_influence,
+      random_clock = "attained_age", random_time_center = 60, random_time_scale = 4,
       generated_at = format(Sys.time(), tz = "UTC", usetz = TRUE),
       cohort = ch,
       outcome = "fi_score_nocancer",
@@ -943,23 +1058,6 @@ run_eventstudy_spline_analysis <- function(matched_path,
         filter(if_all(all_of(spec$covars), ~ !is.na(.x))) %>%
         droplevels()
 
-      # This is a purely numerical reparameterization: centering/scaling the
-      # spline basis retains the same fixed-effect column space, while M2's
-      # continuous dietary covariates need commensurate scales with the spline
-      # and factor columns.  Store every parameter for exact grid reconstruction.
-      scaling_columns <- time_terms
-      if (identical(model_id, "M2_full_spline")) {
-        scaling_columns <- c(scaling_columns,
-                             c("base_calor", "base_sat", "base_diet_chol", "base_alco"))
-      }
-      scaling <- .scale_model_numeric_columns(d_model, scaling_columns)
-      d_model <- scaling$data
-      metadata_all[[ch]]$model_scaling[[model_id]] <- scaling$parameters
-      scaling_all[[paste(ch, model_id, sep = "__")]] <-
-        scaling$parameters %>%
-        mutate(Cohort = ch, model_id = model_id, model_label = spec$label,
-               .before = 1)
-
       if (length(unique(d_model$Group)) < 2 || nrow(d_model) == 0) {
         msg <- paste("Skipped", spec$label, "for", ch,
                      "- insufficient two-arm support after model-specific complete-case filtering.")
@@ -977,7 +1075,26 @@ run_eventstudy_spline_analysis <- function(matched_path,
         next
       }
 
+      reference_profile <- .make_ref_grid(d_model, covars = spec$covars, .reference = 1)
+      # This is a purely numerical reparameterization: centering/scaling the
+      # spline basis retains the same fixed-effect column space, while M2's
+      # continuous dietary covariates need commensurate scales with the spline
+      # and factor columns.  Store every parameter for exact grid reconstruction.
+      scaling_columns <- time_terms
+      if (identical(model_id, "M2_full_spline")) {
+        scaling_columns <- c(scaling_columns,
+                             c("base_calor", "base_sat", "base_diet_chol", "base_alco"))
+      }
+      scaling <- .scale_model_numeric_columns(d_model, scaling_columns)
+      d_model <- scaling$data
+      metadata_all[[ch]]$model_scaling[[model_id]] <- scaling$parameters
+      scaling_all[[paste(ch, model_id, sep = "__")]] <-
+        scaling$parameters %>%
+        mutate(Cohort = ch, model_id = model_id, model_label = spec$label,
+               .before = 1)
+
       model_support <- d_model %>%
+        mutate(rel_time_bin = factor(rel_time_bin, levels = .support_rel_labels)) %>%
         group_by(rel_time_bin, .drop = FALSE) %>%
         summarize(
           n_case = n_distinct(id[Group == "Cancer Case"]),
@@ -1009,11 +1126,7 @@ run_eventstudy_spline_analysis <- function(matched_path,
       }
 
       sp_fixed_rhs <- .fixed_rhs(spline_terms = time_terms, covars = spec$covars)
-      random_rhs <- if (isTRUE(spec$matching_set_random)) {
-        "(1 + Age_Centered | id) + (1 | matching_id)"
-      } else {
-        "(1 + Age_Centered | id)"
-      }
+      random_rhs <- spec$random
       model_formula <- as.formula(paste(
         "fi_score_nocancer",
         paste(deparse(sp_fixed_rhs), collapse = ""),
@@ -1049,13 +1162,26 @@ run_eventstudy_spline_analysis <- function(matched_path,
         )
         next
       }
+      sp_status_all[[ch]][[model_id]] <- data.frame(
+        Cohort = ch, model_id = model_id, model_label = spec$label,
+        status = "fit_pending_inference", convergence = fit_info$converged,
+        rung = fit_info$rung, message = NA_character_)
       m_sp <- fit_info$fit
       convergence_all[[paste(ch, model_id, sep = "__")]] <-
         fit_info$attempts %>% mutate(Cohort = ch, model_id = model_id, .before = 1)
       sp_models[[ch]][[model_id]] <- m_sp
 
       beta_sp <- fixef(m_sp)
-      Vobj <- get_primary_vcov(m_sp, d_model$id, cluster_name = "id")
+      grids <- .spline_grid_factory(reference_profile, spec, spline_bases,
+                                     scaling$parameters, names(beta_sp))
+      constraints <- .inference_constraints(names(beta_sp), time_terms, grids$difference,
+        theta_supported = prediction_window[[1]] <= -8 && prediction_window[[2]] >= 8)
+      Vobj <- get_primary_vcov(m_sp, model.frame(m_sp)$id, constraints = constraints,
+        diagnostic_path = file.path(results_dir, paste0(out_prefix, "_covariance_",
+          gsub("[^A-Za-z0-9]+", "_", ch), "_", model_id, ".csv")))
+      if (identical(model_id, "M1_primary_spline")) sp_contexts[[ch]] <- list(
+        fit = m_sp, grids = grids, Vobj = Vobj, window = prediction_window,
+        support = model_support, rung = fit_info$rung)
       Vsp <- Vobj$V
       se_sp <- sqrt(diag(Vsp))
 
@@ -1069,22 +1195,11 @@ run_eventstudy_spline_analysis <- function(matched_path,
         mutate(Cohort = ch, model_id = model_id, model_label = spec$label,
                model_role = spec$role, vcov_type = Vobj$type, .before = 1)
 
-      make_sp_grid <- function(age_values, group_value) {
-        g <- .make_ref_grid(
-          d_model,
-          covars = spec$covars,
-          Age_Centered = age_values,
-          Group = group_value
-        ) %>%
-          mutate(Group = factor(Group, levels = c("Control", "Cancer Case")))
-        g %>%
-          .add_model_time_terms(spec, spline_bases) %>%
-          .apply_model_scaling(scaling$parameters)
-      }
+      make_sp_grid <- grids$grid
 
       pred_age <- seq(prediction_window[[1]], prediction_window[[2]], by = 0.25)
       grid_sp <- .make_ref_grid(
-        d_model,
+        reference_profile,
         covars = spec$covars,
         Age_Centered = pred_age,
         Group = c("Control", "Cancer Case")
@@ -1145,7 +1260,7 @@ run_eventstudy_spline_analysis <- function(matched_path,
            model.matrix(sp_fixed_rhs, data = r_minus)[, names(beta_sp), drop = FALSE]) /
           (2 * h)
       }
-      deriv_X <- do.call(rbind, lapply(pred_age, deriv_row))
+      deriv_X <- deriv_row(pred_age)
       deriv_est <- as.vector(deriv_X %*% beta_sp)
       deriv_se <- sqrt(rowSums((deriv_X %*% Vsp) * deriv_X))
       sp_deriv_all[[ch]][[model_id]] <- data.frame(
@@ -1158,11 +1273,12 @@ run_eventstudy_spline_analysis <- function(matched_path,
         infer_method = paste(Vobj$type, "normal approximation")
       )
       theta_supported <- prediction_window[[1]] <= -8 && prediction_window[[2]] >= 8
-      theta_grid_post <- seq(0.025, 7.975, by = 0.05)
-      theta_grid_pre <- seq(-7.975, -0.025, by = 0.05)
-      c_post <- colMeans(do.call(rbind, lapply(theta_grid_post, deriv_row)))
-      c_pre <- colMeans(do.call(rbind, lapply(theta_grid_pre, deriv_row)))
-      c_theta <- c_post - c_pre
+      difference_design <- function(t) {
+        model.matrix(sp_fixed_rhs, make_sp_grid(t, "Cancer Case"))[, names(beta_sp), drop = FALSE] -
+          model.matrix(sp_fixed_rhs, make_sp_grid(t, "Control"))[, names(beta_sp), drop = FALSE]
+      }
+      exact <- .exact_slope_contrasts(difference_design, 8)
+      c_post <- exact$post; c_pre <- exact$pre; c_theta <- exact$theta
       theta <- if (theta_supported) as.numeric(c_theta %*% beta_sp) else NA_real_
       theta_se <- if (theta_supported) sqrt(as.numeric(t(c_theta) %*% Vsp %*% c_theta)) else NA_real_
       theta_test <- if (theta_supported) {
@@ -1172,7 +1288,7 @@ run_eventstudy_spline_analysis <- function(matched_path,
                    df_denom = NA_real_, p_value = NA_real_, infer_method = Vobj$type)
       }
       theta_df <- theta_test$df_denom[[1]]
-      theta_crit <- if (is.finite(theta_df)) qt(0.975, df = theta_df) else qnorm(0.975)
+      theta_crit <- if (is.na(theta_df)) NA_real_ else qt(0.975, df = theta_df)
       pre_theta <- if (theta_supported) as.numeric(c_pre %*% beta_sp) else NA_real_
       pre_theta_se <- if (theta_supported) sqrt(as.numeric(t(c_pre) %*% Vsp %*% c_pre)) else NA_real_
       endpoint_diff <- function(t) {
@@ -1186,7 +1302,7 @@ run_eventstudy_spline_analysis <- function(matched_path,
       } else NA_real_
       theta_difference <- theta - theta_closed_form
       if (theta_supported && (!is.finite(theta_difference) || abs(theta_difference) > 1e-6)) {
-        stop("Numerical and closed-form theta differ by more than 1e-6 for ",
+        stop("Exact contrast and endpoint theta differ by more than 1e-6 for ",
              ch, " / ", model_id, ": ", format(theta_difference, digits = 12), call. = FALSE)
       }
       pre_constraint <- matrix(c_pre, nrow = 1)
@@ -1194,7 +1310,7 @@ run_eventstudy_spline_analysis <- function(matched_path,
         wald_with_vcov(m_sp, Vobj, pre_constraint, "pre-index average differential slope")
       } else data.frame(p_value = NA_real_, df_denom = NA_real_)
       pre_df <- pre_test$df_denom[[1]]
-      pre_crit <- if (is.finite(pre_df)) qt(0.975, df = pre_df) else qnorm(0.975)
+      pre_crit <- if (is.na(pre_df)) NA_real_ else qt(0.975, df = pre_df)
       interaction_terms <- .spline_interaction_terms(names(beta_sp), time_terms)
       omnibus_all[[paste(ch, model_id, sep = "__")]] <-
         joint_wald(m_sp, Vobj, interaction_terms,
@@ -1206,6 +1322,8 @@ run_eventstudy_spline_analysis <- function(matched_path,
         df = theta_df, p_value = theta_test$p_value[[1]],
         lwr = theta - theta_crit * theta_se,
         upr = theta + theta_crit * theta_se,
+        infer_method = theta_test$infer_method[[1]],
+        inference_status = Vobj$inference_status,
         theta_closed_form = theta_closed_form,
         theta_closed_form_difference = theta_difference,
         pre_index_slope = pre_theta, pre_index_slope_se = pre_theta_se,
@@ -1224,7 +1342,7 @@ run_eventstudy_spline_analysis <- function(matched_path,
       # Deterministic grouped jackknife: sort matched sets, assign ten nearly
       # equal groups, and refit the primary-adjusted spline (M1) after dropping
       # each group in turn.
-      if (identical(model_id, "M1_primary_spline") && theta_supported) {
+      if (run_influence && identical(model_id, "M1_primary_spline") && theta_supported) {
         set_ids <- sort(unique(as.character(d_model$matching_id)))
         decile_map <- setNames(pmin(10L, ceiling(seq_along(set_ids) * 10 / length(set_ids))),
                                set_ids)
@@ -1269,45 +1387,29 @@ run_eventstudy_spline_analysis <- function(matched_path,
         scaled_gradient = fit_info$scaled_gradient,
         convergence_messages = fit_info$convergence_messages,
         vcov_type = Vobj$type,
+        inference_status = Vobj$inference_status,
         matching_id_variance = fit_info$matching_id_variance,
         message = if (isTRUE(fit_info$boundary_matching_variance_zero)) {
           "matching_id intercept variance was on the permitted zero boundary"
         } else NA_character_
       )
+      checkpoint()
     }
   }
 
-  es_coef   <- bind_rows(es_coef_all)
-  es_pred   <- bind_rows(es_pred_all)   %>% mutate(Cohort = factor(Cohort, levels = cohorts))
-  es_tests  <- bind_rows(es_tests_all)
   support   <- bind_rows(support_all)
   filter_log <- bind_rows(filter_all)
-  es_points <- bind_rows(lapply(cohorts, function(ch) {
-    coef_tab <- es_coef_all[[ch]]
-    beta <- setNames(coef_tab$Estimate, coef_tab$Term)
-    se   <- setNames(coef_tab$SE, coef_tab$Term)
-    es_it <- .es_interaction_terms(names(beta))
-    bind_rows(
-      data.frame(Cohort = ch, rel_time_bin = es_it$bin,
-                 estimate = as.numeric(beta[es_it$term]), se = se[es_it$term]),
-      data.frame(Cohort = ch, rel_time_bin = .es_ref_label, estimate = 0, se = 0)
-    )
-  })) %>%
-    mutate(mid = .es_bin_midpoints[rel_time_bin],
-           CI_low = estimate - 1.96 * se, CI_high = estimate + 1.96 * se,
-           Cohort = factor(Cohort, levels = cohorts)) %>%
-    arrange(Cohort, mid)
-  sp_pred <- bind_rows(unlist(sp_pred_all, recursive = FALSE)) %>%
+  sp_pred <- .bind_model_rows(unlist(sp_pred_all, recursive = FALSE)) %>%
     mutate(Cohort = factor(Cohort, levels = cohorts))
-  sp_diff <- bind_rows(unlist(sp_diff_all, recursive = FALSE)) %>%
+  sp_diff <- .bind_model_rows(unlist(sp_diff_all, recursive = FALSE)) %>%
     mutate(Cohort = factor(Cohort, levels = cohorts))
-  sp_deriv <- bind_rows(unlist(sp_deriv_all, recursive = FALSE)) %>%
+  sp_deriv <- .bind_model_rows(unlist(sp_deriv_all, recursive = FALSE)) %>%
     mutate(Cohort = factor(Cohort, levels = cohorts))
-  sp_coef <- bind_rows(unlist(sp_coef_all, recursive = FALSE)) %>%
+  sp_coef <- .bind_model_rows(unlist(sp_coef_all, recursive = FALSE)) %>%
     mutate(Cohort = factor(Cohort, levels = cohorts))
-  sp_theta <- bind_rows(unlist(sp_theta_all, recursive = FALSE)) %>%
+  sp_theta <- .bind_model_rows(unlist(sp_theta_all, recursive = FALSE)) %>%
     mutate(Cohort = factor(Cohort, levels = cohorts))
-  sp_status <- bind_rows(unlist(sp_status_all, recursive = FALSE)) %>%
+  sp_status <- .bind_model_rows(unlist(sp_status_all, recursive = FALSE)) %>%
     mutate(Cohort = factor(Cohort, levels = cohorts))
   convergence_log <- bind_rows(convergence_all)
   variance_components <- bind_rows(variance_all)
@@ -1315,44 +1417,11 @@ run_eventstudy_spline_analysis <- function(matched_path,
   random_effect_diagnostics <- bind_rows(random_effect_diag_all)
   bounded_diagnostics <- bind_rows(bounded_diag_all)
   spline_omnibus <- bind_rows(omnibus_all)
-  influence_diagnostics <- bind_rows(influence_all)
+  influence_diagnostics <- if (length(influence_all)) bind_rows(influence_all) else
+    data.frame(Cohort = cohorts, model_id = "M1_primary_spline",
+               status = "not_run; use the separate diagnostic runner")
   spline_scaling <- bind_rows(scaling_all)
   sp_pred_primary <- sp_pred %>% filter(model_id == "M1_primary_spline")
-
-  cat("\n---- Joint Wald tests (CR2) ----\n"); print(es_tests, row.names = FALSE)
-
-  # --------------------------------- figures ----------------------------------
-  p_event <- ggplot(es_points, aes(x = mid, y = estimate)) +
-    geom_hline(yintercept = 0, color = "grey40") +
-    geom_vline(xintercept = 0, linetype = "dashed", color = "black", alpha = 0.6) +
-    geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.6, color = "#de2d26") +
-    geom_point(size = 2, color = "#de2d26") +
-    geom_line(color = "#de2d26", alpha = 0.5) +
-    facet_wrap(~ Cohort) +
-    theme_minimal(base_size = 14) +
-    theme(panel.grid.minor = element_blank()) +
-    labs(title = analysis_title,
-         subtitle = "Event-study: case-vs-control FI gap per 2-year bin (ref = -2 to 0); CR2 95% CIs",
-         x = "Years relative to index (bin midpoint)",
-         y = "Cancer - Control difference in FI vs reference bin") +
-    scale_x_continuous(breaks = seq(-window_yrs, window_yrs, by = 4))
-
-  p_step <- ggplot(es_pred, aes(x = mid, y = pred, color = Group, fill = Group)) +
-    geom_vline(xintercept = 0, linetype = "dashed", color = "black", alpha = 0.6) +
-    geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5,
-                  position = position_dodge(width = 0.6)) +
-    geom_point(position = position_dodge(width = 0.6), size = 2) +
-    geom_step(direction = "mid", alpha = 0.5) +
-    facet_wrap(~ Cohort) +
-    scale_color_manual(values = group_cols) +
-    scale_fill_manual(values = group_cols) +
-    theme_minimal(base_size = 14) +
-    theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
-    labs(title = analysis_title,
-         subtitle = "Event-study predicted mean FI by bin (CR2 95% CIs)",
-         x = "Years relative to index (bin midpoint)",
-         y = "Predicted frailty index (no-cancer FI)", color = NULL, fill = NULL) +
-    scale_x_continuous(breaks = seq(-window_yrs, window_yrs, by = 4))
 
   # Persist the actionable diagnostics when the primary M1 spline has no
   # predictions rather than
@@ -1392,6 +1461,8 @@ run_eventstudy_spline_analysis <- function(matched_path,
     theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
     labs(title = analysis_title,
          subtitle = "M1 primary natural-spline Gaussian LME; centered on own attained age at index",
+         caption = paste("Pointwise normal-approximation intervals; covariance:",
+                         paste(unique(sp_pred_primary$vcov_type), collapse = "; ")),
          x = "Years relative to index",
          y = "Predicted frailty index (no-cancer FI)", color = NULL, fill = NULL) +
     scale_x_continuous(breaks = seq(-window_yrs, window_yrs, by = 4))
@@ -1400,21 +1471,6 @@ run_eventstudy_spline_analysis <- function(matched_path,
   if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
   if (!dir.exists(visuals_dir)) dir.create(visuals_dir, recursive = TRUE)
 
-  figure_pdf <- file.path(visuals_dir, paste0(out_prefix, "_GLME_figures.pdf"))
-  grDevices::pdf(figure_pdf, width = 8, height = 5.5, onefile = TRUE)
-  on.exit(grDevices::dev.off(), add = TRUE)
-  print(p_event)
-  print(p_step)
-  print(p_spline)
-
-  write.csv(es_coef, file.path(results_dir, paste0(out_prefix, "_eventstudy_fixed_effects_CI.csv")),
-            row.names = FALSE)
-  write.csv(es_points[, c("Cohort", "rel_time_bin", "mid", "estimate", "se", "CI_low", "CI_high")],
-            file.path(results_dir, paste0(out_prefix, "_eventstudy_bin_contrasts.csv")), row.names = FALSE)
-  write.csv(es_pred[, c("Cohort", "Group", "rel_time_bin", "mid", "pred", "lwr", "upr", "vcov_type")],
-            file.path(results_dir, paste0(out_prefix, "_eventstudy_predicted_means.csv")), row.names = FALSE)
-  write.csv(es_tests, file.path(results_dir, paste0(out_prefix, "_eventstudy_joint_tests.csv")),
-            row.names = FALSE)
   write.csv(support, file.path(results_dir, paste0(out_prefix, "_support_by_time_bin.csv")),
             row.names = FALSE)
   write.csv(filter_log, file.path(results_dir, paste0(out_prefix, "_model_filter_log.csv")),
@@ -1458,14 +1514,12 @@ run_eventstudy_spline_analysis <- function(matched_path,
             file.path(results_dir, "glme_spline_metadata.rds"))
   }
 
-  cat("\nSaved event-study and spline outputs (prefix '", out_prefix, "') to: ",
+  cat("\nSaved spline outputs (prefix '", out_prefix, "') to: ",
       results_dir, "\n", sep = "")
-  cat("Saved combined three-page GLME figure PDF to: ", figure_pdf, "\n", sep = "")
+
 
   invisible(list(
-    es_models = es_models, sp_models = sp_models,
-    es_coef = es_coef, es_points = es_points, es_pred = es_pred,
-    es_tests = es_tests, sp_coef = sp_coef, sp_pred = sp_pred,
+    sp_contexts = sp_contexts, sp_models = sp_models, sp_coef = sp_coef, sp_pred = sp_pred,
     sp_diff = sp_diff, sp_deriv = sp_deriv, sp_theta = sp_theta, sp_status = sp_status,
     convergence_log = convergence_log, variance_components = variance_components,
     residual_diagnostics = residual_diagnostics,
@@ -1474,319 +1528,8 @@ run_eventstudy_spline_analysis <- function(matched_path,
     influence_diagnostics = influence_diagnostics, spline_scaling = spline_scaling,
     model_specification = model_specification,
     matching_provenance = matching_provenance,
-    figure_pdf = figure_pdf,
-    figures = list(eventstudy = p_event, step = p_step, spline = p_spline)
+    figures = list(spline = p_spline)
   ))
-}
-
-# Overall-cancer sensitivity grid ---------------------------------------------
-# This deliberately fits the M1 primary-adjusted spline only. M0--M3 are
-# already produced by run_eventstudy_spline_analysis(); each sensitivity
-# changes one feature of M1 and writes harmonized, row-bindable outputs.
-.filter_two_visit_sensitivity <- function(d) {
-  support <- d %>%
-    filter(!post_own_cancer, !is.na(fi_score_nocancer), !is.na(Age_Centered)) %>%
-    distinct(trajectory_id, cycle) %>%
-    count(trajectory_id, name = "n_distinct_fi_dates")
-  keep_trajectory <- support$trajectory_id[support$n_distinct_fi_dates >= 2]
-  d2 <- d %>% filter(trajectory_id %in% keep_trajectory)
-  valid_sets <- d2 %>%
-    distinct(matching_id, trajectory_id, Group) %>%
-    group_by(matching_id) %>%
-    summarize(n_case = sum(Group == "Cancer Case"),
-              n_control = sum(Group == "Control"), .groups = "drop") %>%
-    filter(n_case == 1, n_control >= 1)
-  out <- d2 %>% filter(matching_id %in% valid_sets$matching_id)
-  retained_integrity <- out %>%
-    distinct(matching_id, trajectory_id, Group) %>%
-    group_by(matching_id) %>%
-    summarize(n_case = sum(Group == "Cancer Case"),
-              n_control = sum(Group == "Control"), .groups = "drop")
-  if (any(retained_integrity$n_case != 1 | retained_integrity$n_control < 1)) {
-    stop("S12 matched-set integrity failed after the two-visit restriction.")
-  }
-  retained_visits <- out %>%
-    distinct(trajectory_id, cycle) %>%
-    count(trajectory_id, name = "n_distinct_fi_dates")
-  if (any(retained_visits$n_distinct_fi_dates < 2)) {
-    stop("S12 retained a trajectory with fewer than two distinct analytic FI dates.")
-  }
-  attr(out, "visit_support") <- support
-  attr(out, "set_support") <- retained_integrity
-  out
-}
-
-.fit_one_spline_sensitivity <- function(d, spec, cohort_label = "All Cancer Cohort") {
-  required <- c("Group", "id", "matching_id", "trajectory_id", "cycle",
-                "Age_Centered", "index_age_z", "base_race", "base_marital",
-                "base_living", "post_own_cancer", spec$outcome)
-  missing_cols <- setdiff(required, names(d))
-  if (length(missing_cols)) stop("missing columns: ", paste(missing_cols, collapse = ", "))
-
-  d <- d %>%
-    mutate(Group = factor(Group, levels = c("Control", "Cancer Case")),
-           id = factor(id), matching_id = factor(matching_id),
-           trajectory_id = factor(trajectory_id), cycle = factor(cycle),
-           base_race = factor(base_race), base_marital = factor(base_marital),
-           base_living = factor(base_living)) %>%
-    filter(!post_own_cancer, !is.na(.data[[spec$outcome]]), !is.na(Age_Centered),
-           if_all(all_of(.primary_covars), ~ !is.na(.x))) %>%
-    droplevels()
-  visit_support <- NULL
-  set_support <- NULL
-  if (identical(spec$id, "S12")) {
-    d <- .filter_two_visit_sensitivity(d)
-    visit_support <- attr(d, "visit_support")
-    set_support <- attr(d, "set_support")
-  }
-  if (nrow(d) == 0 || n_distinct(d$Group) < 2) stop("insufficient two-arm support")
-
-  min_case_bin <- if (is.null(spec$min_case_bin)) 50 else spec$min_case_bin
-  min_ctrl_bin <- if (is.null(spec$min_ctrl_bin)) 250 else spec$min_ctrl_bin
-  support <- add_relative_time_bin(d) %>%
-    group_by(rel_time_bin, .drop = FALSE) %>%
-    summarize(n_case = n_distinct(id[Group == "Cancer Case"]),
-              n_ctrl = n_distinct(id[Group == "Control"]), .groups = "drop") %>%
-    mutate(support_ok = n_case >= min_case_bin & n_ctrl >= min_ctrl_bin,
-           spec = spec$id)
-  supported_window <- continuous_support_window(support, spec$prediction_window)
-  if (anyNA(supported_window) || supported_window[[1]] > -spec$prediction_window ||
-      supported_window[[2]] < spec$prediction_window) {
-    stop("requested +/-", spec$prediction_window,
-         " prediction window lacks continuous two-arm support (requires >=",
-         min_case_bin, " cases and >=", min_ctrl_bin, " controls per bin)")
-  }
-
-  y_name <- spec$outcome
-  if (identical(spec$id, "S10")) {
-    if (!("n_answered_nocancer" %in% names(d))) {
-      stop("n_answered_nocancer is required for S10")
-    }
-    if (any(d$n_answered_nocancer <= 1, na.rm = TRUE)) {
-      stop("S10 requires n_answered_nocancer > 1")
-    }
-    d <- d %>% mutate(
-      .outcome_s10 = qlogis((.data[[y_name]] * (n_answered_nocancer - 1) + 0.5) /
-                              n_answered_nocancer)
-    )
-    y_name <- ".outcome_s10"
-  }
-
-  B <- ns(d$Age_Centered, df = spec$spline_df)
-  knots <- attr(B, "knots")
-  boundary <- attr(B, "Boundary.knots")
-  sterms <- paste0("S", seq_len(ncol(B)))
-  d <- bind_cols(d, setNames(as.data.frame(B), sterms))
-  covars <- .primary_covars
-  if (identical(spec$id, "S8")) covars <- c(covars, "cycle")
-  rhs <- .fixed_rhs(sterms, covars)
-  form <- as.formula(paste(y_name, paste(deparse(rhs), collapse = ""),
-                           "+ (1 + Age_Centered | id)"))
-  fit_weights <- NULL
-  if (identical(spec$id, "S11")) {
-    assignment_weights <- d %>%
-      distinct(matching_id, trajectory_id, Group) %>%
-      group_by(matching_id) %>%
-      mutate(n_controls = sum(Group == "Control"),
-             match_weight = if_else(Group == "Cancer Case", 1, 1 / n_controls)) %>%
-      ungroup() %>% select(matching_id, trajectory_id, match_weight)
-    d <- d %>% left_join(assignment_weights, by = c("matching_id", "trajectory_id"))
-    fit_weights <- d$match_weight
-  }
-  fit_info <- .fit_lmer_with_ladder(form, d, paste("sensitivity", spec$id),
-                                    weights = fit_weights)
-  fit <- fit_info$fit
-  Vobj <- get_primary_vcov(fit, d$id, "id")
-  beta <- fixef(fit)
-
-  make_grid <- function(t, group) {
-    g <- .make_ref_grid(d, covars = covars, Age_Centered = t, Group = group) %>%
-      mutate(Group = factor(Group, levels = c("Control", "Cancer Case")))
-    bg <- ns(g$Age_Centered, knots = knots, Boundary.knots = boundary)
-    bind_cols(g, setNames(as.data.frame(bg), sterms))
-  }
-  design <- function(t, group) {
-    model.matrix(rhs, make_grid(t, group))[, names(beta), drop = FALSE]
-  }
-  diff_design <- function(t) design(t, "Cancer Case") - design(t, "Control")
-  deriv_design <- function(t, h = 1e-4) {
-    (diff_design(t + h) - diff_design(t - h)) / (2 * h)
-  }
-  times <- seq(-spec$prediction_window, spec$prediction_window, by = .25)
-  Xc <- design(times, "Cancer Case")
-  Xr <- design(times, "Control")
-  Xd <- Xc - Xr
-  mu_c <- as.vector(Xc %*% beta)
-  mu_r <- as.vector(Xr %*% beta)
-  est <- as.vector(Xd %*% beta)
-  se <- sqrt(rowSums((Xd %*% Vobj$V) * Xd))
-  response_diff <- rep(NA_real_, length(times))
-  response_se <- rep(NA_real_, length(times))
-  response_lwr <- rep(NA_real_, length(times))
-  response_upr <- rep(NA_real_, length(times))
-  if (identical(spec$id, "S10")) {
-    response_diff <- plogis(mu_c) - plogis(mu_r)
-    response_gradient <- Xc * (plogis(mu_c) * (1 - plogis(mu_c))) -
-      Xr * (plogis(mu_r) * (1 - plogis(mu_r)))
-    response_se <- sqrt(rowSums((response_gradient %*% Vobj$V) * response_gradient))
-    response_lwr <- response_diff - 1.96 * response_se
-    response_upr <- response_diff + 1.96 * response_se
-  }
-  curve <- data.frame(
-    spec = spec$id, Age_Centered = times, estimate = est, se = se,
-    lwr = est - 1.96 * se, upr = est + 1.96 * se,
-    case_prediction = mu_c, control_prediction = mu_r,
-    back_transformed_difference = response_diff,
-    back_transformed_se = response_se,
-    back_transformed_lwr = response_lwr,
-    back_transformed_upr = response_upr,
-    vcov_type = Vobj$type
-  )
-
-  w <- spec$theta_window
-  post <- seq(.025, w - .025, by = .05)
-  pre <- seq(-w + .025, -.025, by = .05)
-  c_post <- colMeans(do.call(rbind, lapply(post, deriv_design)))
-  c_pre <- colMeans(do.call(rbind, lapply(pre, deriv_design)))
-  c_theta <- c_post - c_pre
-  theta <- as.numeric(c_theta %*% beta)
-  theta_closed <- (as.numeric(diff_design(w) %*% beta) -
-                     as.numeric(diff_design(0) %*% beta)) / w -
-    (as.numeric(diff_design(0) %*% beta) -
-       as.numeric(diff_design(-w) %*% beta)) / w
-  theta_difference <- theta - theta_closed
-  if (!is.finite(theta_difference) || abs(theta_difference) > 1e-6) {
-    stop(spec$id, " numerical and closed-form theta differ by more than 1e-6")
-  }
-  theta_se <- sqrt(as.numeric(t(c_theta) %*% Vobj$V %*% c_theta))
-  theta_wald <- wald_with_vcov(fit, Vobj, matrix(c_theta, nrow = 1), "theta")
-  theta_df <- theta_wald$df_denom[[1]]
-  crit <- if (is.finite(theta_df)) qt(.975, theta_df) else qnorm(.975)
-  theta_out <- data.frame(
-    spec = spec$id, theta = theta, se = theta_se,
-    lwr = theta - crit * theta_se, upr = theta + crit * theta_se,
-    p_value = theta_wald$p_value[[1]], df = theta_df,
-    pre_window = paste0("[-", w, ",0)"), post_window = paste0("(0,+", w, "]"),
-    theta_closed_form = theta_closed,
-    theta_closed_form_difference = theta_difference,
-    transformed_scale = identical(spec$id, "S10"), vcov_type = Vobj$type,
-    rung = fit_info$rung
-  )
-  status <- data.frame(
-    spec = spec$id, status = "fit", n_obs = nrow(d), n_id = n_distinct(d$id),
-    n_trajectory_id = n_distinct(d$trajectory_id),
-    n_matching_id = n_distinct(d$matching_id),
-    fitting_min_time = min(d$Age_Centered), fitting_max_time = max(d$Age_Centered),
-    prediction_window = spec$prediction_window, spline_df = spec$spline_df,
-    outcome = spec$outcome, rung = fit_info$rung, singular = fit_info$singular,
-    convergence = fit_info$converged, optimizer_code = fit_info$optimizer_code,
-    scaled_gradient = fit_info$scaled_gradient, vcov_type = Vobj$type,
-    message = NA_character_
-  )
-  list(curve = curve, theta = theta_out, status = status,
-       convergence = fit_info$attempts %>% mutate(spec = spec$id, .before = 1),
-       variance = .variance_components(fit, cohort_label, spec$id),
-       support = support, visit_support = visit_support, set_support = set_support)
-}
-
-run_overall_glme_sensitivities <- function(matched_path, exact_cycle_path,
-                                           sensitivity_dir) {
-  if (!dir.exists(sensitivity_dir)) dir.create(sensitivity_dir, recursive = TRUE)
-  base <- readRDS(matched_path)
-  if (!("matching_id" %in% names(base))) {
-    base <- base %>% mutate(matching_id = paste(Cohort, match_set, sep = "__"))
-  }
-  if (!("trajectory_id" %in% names(base))) {
-    base <- base %>% mutate(trajectory_id = paste(Cohort, match_set, id, role, sep = "__"))
-  }
-  if (!("index_age" %in% names(base))) {
-    stop("Primary matched input is missing index_age; common S7 scaling cannot be verified.")
-  }
-  primary_case_age <- base %>%
-    filter(Group == "Cancer Case") %>%
-    distinct(matching_id, index_age)
-  if (anyDuplicated(primary_case_age$matching_id)) {
-    stop("Primary matched input has more than one case index age per matched set.")
-  }
-  primary_age_mean <- mean(primary_case_age$index_age, na.rm = TRUE)
-  primary_age_sd <- stats::sd(primary_case_age$index_age, na.rm = TRUE)
-  if (!is.finite(primary_age_mean) || !is.finite(primary_age_sd) || primary_age_sd <= 0) {
-    stop("Primary case-based index-age scaling constants are invalid.")
-  }
-  specs <- list(
-    list(id = "S1", spline_df = 2, prediction_window = 20, theta_window = 8,
-         outcome = "fi_score_nocancer", data = base),
-    list(id = "S2", spline_df = 4, prediction_window = 20, theta_window = 8,
-         outcome = "fi_score_nocancer", data = base),
-    list(id = "S3", spline_df = 3, prediction_window = 8, theta_window = 8,
-         outcome = "fi_score_nocancer", data = base),
-    list(id = "S4", spline_df = 3, prediction_window = 12, theta_window = 8,
-         outcome = "fi_score_nocancer", data = base),
-    list(id = "S5", spline_df = 3, prediction_window = 20, theta_window = 4,
-         outcome = "fi_score_nocancer", data = base),
-    list(id = "S6", spline_df = 3, prediction_window = 20, theta_window = 12,
-         outcome = "fi_score_nocancer", data = base),
-    list(id = "S8", spline_df = 3, prediction_window = 20, theta_window = 8,
-         outcome = "fi_score_nocancer", data = base),
-    list(id = "S9", spline_df = 3, prediction_window = 20, theta_window = 8,
-         outcome = "fi_score_nocancer_nocarry", data = base),
-    list(id = "S10", spline_df = 3, prediction_window = 20, theta_window = 8,
-         outcome = "fi_score_nocancer", data = base),
-    list(id = "S11", spline_df = 3, prediction_window = 20, theta_window = 8,
-         outcome = "fi_score_nocancer", data = base),
-    list(id = "S12", spline_df = 3, prediction_window = 20, theta_window = 8,
-         outcome = "fi_score_nocancer", data = base)
-  )
-  if (!file.exists(exact_cycle_path)) {
-    stop("S7 exact-cycle matched input not found at ", exact_cycle_path)
-  }
-  exact_provenance <- validate_matching_provenance(exact_cycle_path)
-  exact <- readRDS(exact_cycle_path)
-  if (!("matching_id" %in% names(exact))) exact <- exact %>% mutate(matching_id = paste(Cohort, match_set, sep = "__"))
-  if (!("trajectory_id" %in% names(exact))) exact <- exact %>% mutate(trajectory_id = paste(Cohort, match_set, id, role, sep = "__"))
-  if (!("index_age" %in% names(exact))) {
-    stop("S7 exact-cycle matched input is missing index_age.")
-  }
-  exact <- exact %>%
-    mutate(index_age_z = (index_age - primary_age_mean) / primary_age_sd)
-  specs <- append(specs, list(list(id = "S7", spline_df = 3, prediction_window = 20,
-                                  theta_window = 8, outcome = "fi_score_nocancer", data = exact)), after = 6)
-
-  ans <- lapply(specs, function(spec) {
-    tryCatch(.fit_one_spline_sensitivity(spec$data, spec), error = function(e) {
-      list(curve = NULL, theta = NULL,
-           status = data.frame(spec = spec$id, status = "skipped_or_failed",
-                               n_obs = NA_integer_, n_id = NA_integer_, n_trajectory_id = NA_integer_,
-                               n_matching_id = NA_integer_, fitting_min_time = NA_real_,
-                               fitting_max_time = NA_real_, prediction_window = spec$prediction_window,
-                               spline_df = spec$spline_df, outcome = spec$outcome,
-                               rung = NA_character_, singular = NA, convergence = FALSE,
-                               optimizer_code = NA_integer_, scaled_gradient = NA_real_,
-                               vcov_type = NA_character_, message = conditionMessage(e)),
-           convergence = attr(e, "attempts"), variance = NULL,
-           support = NULL, visit_support = NULL, set_support = NULL)
-    })
-  })
-  names(ans) <- vapply(specs, `[[`, character(1), "id")
-  write.csv(bind_rows(lapply(ans, `[[`, "curve")),
-            file.path(sensitivity_dir, "4.5_sensitivity_difference_curves.csv"), row.names = FALSE)
-  write.csv(bind_rows(lapply(ans, `[[`, "theta")),
-            file.path(sensitivity_dir, "4.5_sensitivity_theta.csv"), row.names = FALSE)
-  write.csv(bind_rows(lapply(ans, `[[`, "status")),
-            file.path(sensitivity_dir, "4.5_sensitivity_status.csv"), row.names = FALSE)
-  write.csv(bind_rows(lapply(ans, `[[`, "convergence")),
-            file.path(sensitivity_dir, "4.5_sensitivity_convergence_attempts.csv"), row.names = FALSE)
-  write.csv(bind_rows(lapply(ans, `[[`, "variance")),
-            file.path(sensitivity_dir, "4.5_sensitivity_variance_components.csv"), row.names = FALSE)
-  write.csv(bind_rows(lapply(ans, `[[`, "support")),
-            file.path(sensitivity_dir, "4.5_sensitivity_support_by_time_bin.csv"), row.names = FALSE)
-  s12 <- ans[["S12"]]
-  if (!is.null(s12$visit_support)) {
-    write.csv(s12$visit_support, file.path(sensitivity_dir, "4.5_S12_visit_support.csv"), row.names = FALSE)
-    write.csv(s12$set_support, file.path(sensitivity_dir, "4.5_S12_matched_set_support.csv"), row.names = FALSE)
-  }
-  attr(ans, "exact_cycle_provenance") <- exact_provenance
-  invisible(ans)
 }
 
 render_overall_glme_html_report <- function(results_dir, sensitivity_dir, visuals_dir,

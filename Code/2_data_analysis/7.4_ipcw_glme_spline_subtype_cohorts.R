@@ -4,7 +4,7 @@
 # Script:  7.4_ipcw_glme_spline_subtype_cohorts.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-30
-# Date last updated: 2026-07-28 (prediction factors use participant-modal levels)
+# Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
 #
 # Purpose:
 #   Fits IPCW-weighted natural-spline GLME trajectory models for the active
@@ -266,6 +266,8 @@ for (spec in subtype_specs) {
          ". Run ", spec$builder_script, " first.")
   }
   dat <- readRDS(spec$path)
+  source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
+  validate_derived_assignment_provenance(dat, spec$path)
   missing_cols <- setdiff(needed_cols, names(dat))
   if (length(missing_cols) > 0) {
     stop("Dataset ", basename(spec$path), " is missing required columns: ",

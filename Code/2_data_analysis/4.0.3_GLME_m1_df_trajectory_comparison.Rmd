@@ -1,0 +1,302 @@
+---
+title: "M1 Spline df=3 versus df=4: Fitted Trajectories"
+author: "Nemo Zhou"
+date: "2026-09-23"
+output:
+  html_document:
+    self_contained: true
+    theme: readable
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Results/cancer/visuals") })
+---
+
+<!--
+Project: Frailty Trajectories Before and After Incident Cancer in the
+         Health Professionals Follow-up Study
+Script:  4.0.3_GLME_m1_df_trajectory_comparison.Rmd
+Author:  Nemo Zhou
+Date started:      2026-09-23
+Date last updated: 2026-09-23
+
+Purpose:
+  Read-only visual report of the saved M1 df=3 versus df=4 ML comparison
+  trajectories across the five active 4.x cohorts. Uses the paired prediction
+  CSV, fit-status CSV, AIC table and run metadata produced by
+  4.0.3_GLME_m1_df_aic_comparison.R. It does not fit models or regenerate
+  predictions. Confidence bands are conventional model-based, pointwise 95%
+  intervals from the ML fit covariance; they are not CR2 intervals or the basis
+  for formal inference. The paired AIC comparison remains within cohort.
+
+Output:
+  Results/cancer/visuals/4.0.3_GLME_m1_df_trajectory_comparison.html
+-->
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS"
+results_dir <- file.path(project_dir, "Results", "cancer", "data")
+runner_path <- file.path(project_dir, "Code", "2_data_analysis",
+                         "4.0.3_GLME_m1_df_aic_comparison.R")
+engine_path <- file.path(project_dir, "Code", "2_data_analysis",
+                         "4.0_GLME_spline_functions.R")
+required_files <- c(
+  "4.0.3_m1_spline_df_aic_comparison.csv",
+  "4.0.3_m1_spline_df_fit_status.csv",
+  "4.0.3_m1_spline_df_predicted_trajectories.csv",
+  "4.0.3_m1_spline_df_run_metadata.rds"
+)
+missing_files <- required_files[!file.exists(file.path(results_dir, required_files))]
+if (length(missing_files)) {
+  stop(
+    "Run Code/2_data_analysis/4.0.3_GLME_m1_df_aic_comparison.R first; missing: ",
+    paste(missing_files, collapse = ", "), call. = FALSE
+  )
+}
+
+comparison <- read.csv(file.path(results_dir, required_files[[1]]),
+                       stringsAsFactors = FALSE, check.names = FALSE)
+fit_status <- read.csv(file.path(results_dir, required_files[[2]]),
+                       stringsAsFactors = FALSE, check.names = FALSE)
+predictions <- read.csv(file.path(results_dir, required_files[[3]]),
+                        stringsAsFactors = FALSE, check.names = FALSE)
+metadata <- readRDS(file.path(results_dir, required_files[[4]]))
+
+if (!identical(unname(tools::md5sum(runner_path)), metadata$runner_md5) ||
+    !identical(unname(tools::md5sum(engine_path)), metadata$shared_engine_md5)) {
+  stop(
+    "The saved outputs were made by different runner or engine code. Rerun ",
+    "the 4.0.3 comparison before rendering this report.", call. = FALSE
+  )
+}
+for (input_name in names(metadata$inputs)) {
+  input_record <- metadata$inputs[[input_name]]
+  provenance_pairs <- list(
+    c(input_record$input_path, input_record$input_md5),
+    c(input_record$gate_path, input_record$gate_md5),
+    c(input_record$matching_run_path, input_record$matching_run_md5)
+  )
+  for (provenance_pair in provenance_pairs) {
+    provenance_path <- provenance_pair[[1]]
+    expected_md5 <- provenance_pair[[2]]
+    if (is.na(provenance_path) || !file.exists(provenance_path) ||
+        !identical(unname(tools::md5sum(provenance_path)), expected_md5)) {
+      stop("Saved matched-data or Gate G4 provenance changed after the ",
+           "comparison for ", input_name, ". Rerun 4.0.3 before rendering.",
+           call. = FALSE)
+    }
+  }
+}
+
+cohort_order <- c(
+  "Low/Moderate Burden Cohort",
+  "High Burden Cohort",
+  "Smoking-Related Cancer Cohort",
+  "Obesity-Related Cancer Cohort",
+  "All Cancer Cohort"
+)
+model_order <- c("M1_df3", "M1_df4")
+model_labels <- c("M1_df3" = "M1 spline, df = 3 (ML)",
+                  "M1_df4" = "M1 spline, df = 4 (ML)")
+group_order <- c("Control", "Cancer Case")
+group_cols <- c("Control" = "#3182bd", "Cancer Case" = "#de2d26")
+
+if (!nrow(comparison) || !all(c("AIC_df3", "AIC_df4",
+                                  "delta_AIC_df4_minus_df3",
+                                  "row_keys_identical", "status",
+                                  "prediction_status") %in% names(comparison))) {
+  stop("The saved comparison table is missing required paired AIC fields.",
+       call. = FALSE)
+}
+if (!nrow(fit_status) || !all(c("model_id", "Cohort", "status",
+                                  "prediction_status", "ml_verified",
+                                  "fit_row_keys_match") %in% names(fit_status))) {
+  stop("The saved fit-status table is missing required validation fields.",
+       call. = FALSE)
+}
+if (!nrow(predictions)) {
+  stop("No paired fitted trajectories were saved. Inspect the 4.0.3 fit-status output.",
+       call. = FALSE)
+}
+
+successful_pairs <- comparison %>%
+  filter(status == "fit", prediction_status == "saved",
+         row_keys_identical %in% TRUE) %>%
+  pull(Cohort) %>%
+  unique()
+if (!length(successful_pairs)) {
+  stop("No cohort has a complete, validated df=3/df=4 prediction pair.",
+       call. = FALSE)
+}
+if (any(!fit_status$ml_verified[fit_status$Cohort %in% successful_pairs] %in% TRUE) ||
+    any(!fit_status$fit_row_keys_match[fit_status$Cohort %in% successful_pairs] %in% TRUE)) {
+  stop("A plotted cohort has an unverified ML fit or fitted row-key mismatch.",
+       call. = FALSE)
+}
+
+comparison <- comparison %>%
+  mutate(Cohort = factor(Cohort, levels = cohort_order)) %>%
+  arrange(Cohort)
+predictions <- predictions %>%
+  filter(Cohort %in% successful_pairs, model_id %in% model_order) %>%
+  mutate(
+    Cohort = factor(Cohort, levels = cohort_order),
+    Model = factor(model_id, levels = model_order,
+                   labels = unname(model_labels[model_order])),
+    Group = factor(Group, levels = group_order)
+  ) %>%
+  arrange(Cohort, Model, Group, Age_Centered)
+
+expected_groups <- predictions %>%
+  distinct(Cohort, model_id, Group) %>%
+  count(Cohort, model_id, name = "n_groups")
+model_coverage <- predictions %>%
+  group_by(Cohort) %>%
+  summarize(
+    has_df3 = any(model_id == "M1_df3"),
+    has_df4 = any(model_id == "M1_df4"),
+    .groups = "drop"
+  )
+if (any(expected_groups$n_groups != length(group_order)) ||
+    any(!model_coverage$has_df3 | !model_coverage$has_df4)) {
+  stop("Saved predictions do not contain both groups and both spline degrees for every plotted cohort.",
+       call. = FALSE)
+}
+
+format_aic <- function(x) formatC(x, format = "f", digits = 2, big.mark = ",")
+comparison_display <- comparison %>%
+  mutate(
+    Cohort = as.character(Cohort),
+    `AIC (df=3)` = format_aic(AIC_df3),
+    `AIC (df=4)` = format_aic(AIC_df4),
+    `Delta AIC (df=4 - df=3)` = formatC(
+      delta_AIC_df4_minus_df3, format = "f", digits = 2, big.mark = ","
+    ),
+    `Observations` = formatC(n_obs, format = "d", big.mark = ","),
+    `Participants` = formatC(n_participants, format = "d", big.mark = ",")
+  ) %>%
+  select(Cohort, `AIC (df=3)`, `AIC (df=4)`,
+         `Delta AIC (df=4 - df=3)`, Observations, Participants, status,
+         prediction_status)
+
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE,
+  fig.path = file.path(tempdir(), "4.0.3_m1_df_trajectory_figures", ""),
+  dev = "png", fig.retina = 1
+)
+options(knitr.kable.NA = "—")
+```
+
+## Purpose and interpretation
+
+This report displays the paired M1 natural-spline trajectories from the df=3
+versus df=4 **maximum-likelihood (ML) comparison**. Each pair uses the same
+M1-complete-case rows, covariates, correlated participant random intercept and
+attained-age random slope. Only the relative-time spline degrees of freedom
+change. Existing df=3 production models and their REML/CR2 inference are not
+replaced by these comparison fits.
+
+The curves show adjusted fixed-effect predictions at the shared M1 reference
+profile for each cohort. Shaded regions are pointwise 95% intervals computed
+from the conventional model-based covariance matrix of each ML fit. They are
+included to display curve uncertainty, are **not CR2 intervals**, and are not
+used for the AIC comparison or formal inference. Predictions are restricted
+to the contiguous diagnosis-relative interval whose two-year bins meet the
+shared support thresholds of at least 50 distinct cancer-case participants
+and 250 distinct control participants. The dashed vertical line marks diagnosis
+or the matched-control assigned index time.
+
+## A. Within-cohort AIC comparison
+
+Negative `AIC(df=4) - AIC(df=3)` favors df=4. AIC values are interpreted only
+within their cohort; do not rank AIC across different cohorts.
+
+```{r aic-table}
+knitr::kable(
+  comparison_display,
+  caption = "Paired M1 ML AIC and sample sizes by cohort",
+  align = "lrrrrrll"
+) %>%
+  kable_styling(full_width = TRUE,
+                bootstrap_options = c("striped", "condensed"),
+                font_size = 9)
+```
+
+## B. Fitted M1 trajectories by spline degree
+
+Each row is a cancer cohort; the two columns compare df=3 and df=4 on the same
+cohort-specific analytic rows. Case and control curves share the same color
+scheme as the 4.6 summary report.
+
+```{r trajectory-plots, fig.width=16, fig.height=14, out.width='100%'}
+p_trajectory <- ggplot(
+  predictions,
+  aes(x = Age_Centered, y = pred, group = Group, color = Group, fill = Group)
+) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.16, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4,
+             color = "grey35") +
+  facet_grid(Cohort ~ Model) +
+  scale_color_manual(values = group_cols) +
+  scale_fill_manual(values = group_cols) +
+  scale_x_continuous(breaks = seq(-20, 20, by = 4)) +
+  labs(
+    title = "M1 fitted trajectories by natural-spline degrees of freedom",
+    subtitle = paste(
+      "Paired ML fits; shaded regions are conventional model-based",
+      "pointwise 95% intervals (not CR2)"
+    ),
+    x = "Years relative to cancer diagnosis / assigned index",
+    y = "Predicted cancer-excluded frailty index",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    strip.text.y = element_text(angle = 0)
+  )
+print(p_trajectory)
+```
+
+## Fit and prediction status
+
+The figure includes only cohorts with both models accepted, their common fitted
+row keys verified, and paired predictions saved. The status file records the
+convergence rung, optimizer, ML check, support interval, and any prediction
+failure for each candidate fit.
+
+```{r fit-status}
+fit_status %>%
+  filter(Cohort %in% successful_pairs) %>%
+  mutate(
+    Cohort = as.character(Cohort),
+    model_id = factor(model_id, levels = model_order),
+    prediction_window = ifelse(
+      is.finite(prediction_window_min) & is.finite(prediction_window_max),
+      paste0(prediction_window_min, " to ", prediction_window_max, " years"),
+      NA_character_
+    )
+  ) %>%
+  select(Cohort, model_id, status, method, ml_verified, fit_row_keys_match,
+         n_obs_fit, n_participants, convergence_rung, optimizer,
+         prediction_status, prediction_window, prediction_message) %>%
+  knitr::kable(caption = "Model and saved-trajectory status") %>%
+  kable_styling(full_width = TRUE,
+                bootstrap_options = c("striped", "condensed"),
+                font_size = 8)
+```
+
+## Model specification
+
+For both candidates, the outcome is `fi_score_nocancer`; fixed effects are
+`Group × natural spline(Age_Centered)` plus index age, race, marital status,
+and living arrangement. The random effects are a correlated participant
+intercept and attained-age slope, `(1 + (age_at_cycle - 60) / 4 | id)`. The
+estimator is ML (`REML = FALSE`). The comparison runner allows numerical
+optimizer retries but does not simplify the random-effects structure.

@@ -4,7 +4,7 @@
 # Script:  5.0_ipcw_gee_functions.R
 # Author:  Nemo Zhou
 # Date started:      2026-07-27
-# Date last updated: 2026-07-28
+# Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
 #
 # Purpose:
 #   Shared implementation of the inverse-probability-of-censoring-weighted
@@ -45,6 +45,8 @@
 #   Documents/Methods/IPCW_Censoring_Weights.md
 #   Documents/Methods/GLME_Natural_Spline_Trajectory_Analysis.md
 # =============================================================================
+
+source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
 
 library(dplyr)
 library(geepack)
@@ -105,6 +107,8 @@ ipcw_gee_validate_matching_provenance <- function(matched_path) {
   }
 
   run_metadata <- readRDS(run_path)
+  assert_matching_metadata(run_metadata, matched_path)
+  assignment_provenance <- validate_assignment_provenance(run_metadata, matched_path)
   expected_md5 <- unname(as.character(run_metadata$output_md5))
   observed_md5 <- unname(tools::md5sum(matched_path))
   if (length(expected_md5) != 1L || !nzchar(expected_md5) ||
@@ -117,7 +121,8 @@ ipcw_gee_validate_matching_provenance <- function(matched_path) {
     output_stem = output_stem,
     gate_path = gate_path,
     run_path = run_path,
-    input_md5 = observed_md5
+    input_md5 = observed_md5,
+    assignment_md5 = assignment_provenance$assignment_md5
   )
 }
 
@@ -431,7 +436,7 @@ ipcw_gee_fit_full_response_model <- function(panel_path) {
 }
 
 ipcw_gee_build_assignment_panel <- function(matched_path, cohort, response_model) {
-  matched <- readRDS(matched_path)
+  matched <- read_matching_assignments(matched_path)
   matched_required <- c("id", "Cohort", "Group", "match_set", "role", "index_date", "index_age",
                         .ipcw_gee_m2_covars)
   missing_matched <- setdiff(matched_required, names(matched))
@@ -441,6 +446,7 @@ ipcw_gee_build_assignment_panel <- function(matched_path, cohort, response_model
   }
 
   assignment_columns <- c("Cohort", "Group", "match_set", "id", "role", "index_date", "index_age",
+                          "first_return", "eligibility_version",
                           .ipcw_gee_m2_covars)
   assignment_meta <- matched %>%
     mutate(
@@ -478,7 +484,8 @@ ipcw_gee_build_assignment_panel <- function(matched_path, cohort, response_model
       post_own_cancer = as.character(Group) == "Control" &
         !is.na(cancer_index_dateca) & cancer_index_dateca > index_date &
         cycle_date >= cancer_index_dateca,
-      assignment_eligible = !post_own_cancer,
+      assignment_observation_date = coalesce(index_date + 12 * (age_at_cycle - index_age), cycle_date),
+      assignment_eligible = !post_own_cancer & assignment_observation_date >= first_return,
       fi_observed = if_else(alive_at_cycle & assignment_eligible, observed == 1L, NA)
     ) %>%
     arrange(trajectory_id, cycle_order)
@@ -773,6 +780,9 @@ ipcw_gee_write_outputs <- function(result, out_prefix, results_dir, data_out_pat
     group_by(Cohort, Group) %>%
     summarize(
       n_assignment_cycles = n(),
+      n_matched_assignments = n_distinct(trajectory_id),
+      n_fi_contributing_assignments = n_distinct(trajectory_id[fi_observed %in% TRUE]),
+      n_retained_gee_assignments = n_distinct(trajectory_id[retained_gee_row %in% TRUE]),
       n_distinct_ids = n_distinct(id),
       n_alive_eligible_cycles = sum(alive_at_cycle & assignment_eligible, na.rm = TRUE),
       n_at_risk = sum(at_risk, na.rm = TRUE),
@@ -816,6 +826,9 @@ ipcw_gee_write_outputs <- function(result, out_prefix, results_dir, data_out_pat
     group_by(Group, rel_time_bin, .drop = FALSE) %>%
     summarize(
       n_assignment_cycles = n(),
+      n_matched_assignments = n_distinct(trajectory_id),
+      n_fi_contributing_assignments = n_distinct(trajectory_id[fi_observed %in% TRUE]),
+      n_retained_gee_assignments = n_distinct(trajectory_id[retained_gee_row %in% TRUE]),
       n_pden_lt_005 = sum(p_den < 0.05),
       percent_pden_lt_005 = 100 * n_pden_lt_005 / n_assignment_cycles,
       positivity_warning = percent_pden_lt_005 > 1,

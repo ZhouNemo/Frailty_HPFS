@@ -4,7 +4,7 @@
 # Script:  2.1_create_riskset_high_low_burden.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-29
-# Date last updated: 2026-07-18 (symmetric pre-index eligibility and S7 exact-cycle rematch)
+# Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
 #
 # Purpose:
 #   Creates and overwrites the incidence-density risk-set matched cohort dataset
@@ -14,9 +14,12 @@
 #   Documents/Methods/Cancer_Classification.md. Controls are matched separately
 #   within each cancer-burden cohort and inherit the case's index date.
 #
+# Eligibility: analytic-cohort entry by index; no FI availability or
+# questionnaire-recency requirement. A complete assignment ledger is also saved.
+#
 # Output:
 #   Data/riskset_matched_analysis_long.rds
-#   Data/riskset_matched_analysis_exact_cycle_long.rds (S7)
+#   Data/riskset_matched_analysis_assignments.rds
 # =============================================================================
 
 library(dplyr)
@@ -25,14 +28,11 @@ project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Rese
 data_dir    <- file.path(project_dir, "Data")
 input_path  <- file.path(data_dir, "FI_longitudinal_1986_2020_IMPUTED_Cancer.rds")
 output_path <- file.path(data_dir, "riskset_matched_analysis_long.rds")
-exact_cycle_output_path <- file.path(data_dir, "riskset_matched_analysis_exact_cycle_long.rds")
 
 source(file.path(project_dir, "Code", "2_data_analysis", "2.0_riskset_matching_functions.R"))
 
 MATCH_RATIO  <- 5
 AGE_CALIPER  <- 2
-CYCLE_CALIPER <- 1
-MIN_VISITS   <- 1
 SEED         <- 20260703
 target_cycles <- c("88", "92", "96", "00", "04", "08", "12", "16", "20")
 
@@ -51,32 +51,7 @@ matched_result <- build_riskset_matched_long(
   target_cycles = target_cycles,
   match_ratio = MATCH_RATIO,
   age_caliper = AGE_CALIPER,
-  cycle_caliper = CYCLE_CALIPER,
-  min_visits = MIN_VISITS,
   seed = SEED
 )
 
 save_riskset_match(matched_result, output_path, "High/low burden risk-set cohort")
-
-# S7: rematch with an exact active-cycle requirement, reusing the primary
-# case-based age standardization constants so subgroup sensitivity estimates
-# remain on the same age scale as the primary matched cohort.
-exact_cycle_result <- build_riskset_matched_long(
-  input_path = input_path,
-  classification_vars = "is_high_burden",
-  classify_fn = classify_fn,
-  cohort_levels = cohort_levels,
-  target_cycles = target_cycles,
-  match_ratio = MATCH_RATIO,
-  age_caliper = AGE_CALIPER,
-  cycle_caliper = 0,
-  min_visits = MIN_VISITS,
-  seed = SEED,
-  index_age_scaling = matched_result$scaling_metadata
-)
-
-save_riskset_match(
-  exact_cycle_result,
-  exact_cycle_output_path,
-  "High/low burden exact-cycle risk-set cohort (S7)"
-)
