@@ -4,7 +4,7 @@
 # Script:  4.2.2_GLME_M2_time_varying.R
 # Author:  Nemo Zhou
 # Date started:      2026-07-28
-# Date last updated: 2026-07-28
+# Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
 #
 # Purpose:
 #   Fit only the requested M2 natural-spline GLME for the smoking-related
@@ -41,6 +41,8 @@
 #   Results/cancer/data/4.2.2_m2_time_varying_predicted_trajectories.csv
 #   Results/cancer/data/4.2.2_m2_time_varying_model.rds
 # =============================================================================
+
+source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
 
 library(dplyr)
 library(lme4)
@@ -83,6 +85,8 @@ if (!"gate_pass" %in% names(gate) || !all(as.logical(gate$gate_pass) %in% TRUE))
   stop("Gate G4 did not pass for ", matching_stem, call. = FALSE)
 }
 run_metadata <- readRDS(run_metadata_path)
+assert_matching_metadata(run_metadata, matched_path)
+validate_assignment_provenance(run_metadata, matched_path)
 expected_md5 <- unname(as.character(run_metadata$output_md5))
 observed_md5 <- unname(tools::md5sum(matched_path))
 if (length(expected_md5) != 1L || !nzchar(expected_md5) ||

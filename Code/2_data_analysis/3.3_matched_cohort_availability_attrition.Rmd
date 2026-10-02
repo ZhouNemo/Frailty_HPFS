@@ -16,7 +16,7 @@ Project: Frailty Trajectories Before and After Incident Cancer in the
 Script:  3.3_matched_cohort_availability_attrition.Rmd
 Author:  Nemo Zhou
 Date started:      2026-07-27
-Date last updated: 2026-07-27 (separated death, later own-cancer,
+Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
                    loss-to-follow-up, and administrative censoring)
 
 Purpose:
@@ -158,6 +158,8 @@ write_csv_base <- function(x, path) {
 
 read_matched <- function(analysis, path) {
   if (!file.exists(path)) stop("Matched dataset not found for ", analysis, ": ", path)
+  source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
+  validate_matching_provenance(path)
   dat <- readRDS(path)
   required_cols <- c(
     "id", "match_set", "trajectory_id", "role", "Cohort", "Group",
@@ -198,8 +200,11 @@ matched_long <- bind_rows(lapply(seq_len(nrow(matched_specs)), function(i) {
   read_matched(matched_specs$Analysis[i], matched_specs$matched_path[i])
 }))
 
-assignment_summary <- matched_long %>%
-  filter(!post_own_cancer) %>%
+matched_assignments <- bind_rows(lapply(seq_len(nrow(matched_specs)), function(i) {
+  read_matching_assignments(matched_specs$matched_path[i]) %>% mutate(Analysis = matched_specs$Analysis[i])
+}))
+
+assignment_summary <- matched_assignments %>%
   distinct(Analysis, Cohort, match_set, id, role, Group, index_date, index_age) %>%
   mutate(
     assignment_id = paste(Analysis, Cohort, match_set, id, role, sep = "__")
@@ -284,12 +289,11 @@ knitr::kable(reuse_summary_display, digits = 2)
 
 # Construct the Matched Assignment-by-Cycle Panel
 
-The matched RDS files are used only as existing analytic inputs; this report does not rebuild any risk sets. A complete 1988-2020 four-year cycle grid is created by joining each distinct matched assignment to the canonical FI data. This is necessary to count FI non-observation after participants stop contributing observed FI values.
+The matched RDS files are used only as existing analytic inputs; this report does not rebuild any risk sets. A complete 1988-2020 four-year cycle grid is created by joining each assignment from the complete ledger, including assignments with no observed FI, to the canonical FI data. This is necessary to count FI non-observation after participants stop contributing observed FI values.
 
 ```{r load-and-construct-panel}
-assignment_meta <- matched_long %>%
-  filter(!post_own_cancer) %>%
-  distinct(Analysis, Cohort, match_set, id, role, Group, index_date, index_age) %>%
+assignment_meta <- matched_assignments %>%
+  distinct(Analysis, Cohort, match_set, id, role, Group, index_date, index_age, first_return) %>%
   mutate(
     Cohort = factor(Cohort, levels = cohort_levels),
     Group = factor(Group, levels = group_levels),
@@ -371,8 +375,10 @@ matched_assignment_panel <- assignment_meta %>%
       !is.na(own_cancer_month) & !is.na(index_date) &
       own_cancer_month > index_date &
       analytic_time_month >= own_cancer_month,
-    analytic_row = !post_own_cancer,
-    source_row = analytic_row & !is.na(participated) & participated == 1,
+    analytic_row = !post_own_cancer & analytic_time_month >= first_return,
+    source_row = analytic_row & !is.na(participated) & participated == 1 &
+      is.finite(worked_rtmnyr) & is.finite(dbmy09),
+    fi_score_nocancer = if_else(source_row, fi_score_nocancer, NA_real_),
     age_group = cut(
       age_at_cycle,
       breaks = c(-Inf, 60, 70, 80, Inf),
@@ -401,7 +407,7 @@ if (any(censoring_reentry$post_cancer_reentry)) {
 
 # FI Availability and Missingness by Analytic Cycle
 
-The denominator for `FI not observed` is the number of non-censored matched assignments represented at that cycle. It includes assignments with an observed FI score, a missing FI score, or no usable cycle-level source row. Therefore, the percentage measures non-observation among all analytic assignments, not missingness among respondents only. The separate pre-matching plot below compares all participants who participated in the cycle (`participated == 1`) with those having a valid overall FI score. Missing individual FI components do not count as unusable FI when the overall score is still calculable.
+The denominator for `FI not observed` is the number of non-censored matched assignments represented at that cycle. It includes assignments with an observed FI score, a missing FI score, or no usable cycle-level source row. Therefore, the percentage measures non-observation among all assignments after analytic-cohort entry and under the existing censoring rules, including those without any FI; it is not restricted to respondents. The separate pre-matching plot below compares all participants who participated in the cycle (`participated == 1`) with those having a valid overall FI score. Missing individual FI components do not count as unusable FI when the overall score is still calculable.
 
 ```{r fi-availability}
 fi_availability <- matched_assignment_panel %>%

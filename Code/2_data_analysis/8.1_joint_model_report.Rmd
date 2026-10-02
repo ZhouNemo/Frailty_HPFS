@@ -1,0 +1,225 @@
+---
+title: "Overall cancer joint-model mortality sensitivity"
+author: "Nemo Zhou"
+output:
+  html_document:
+    toc: true
+    theme: readable
+params:
+  run_dir: null
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_dir = "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Results/cancer/visuals") })
+---
+
+```{r setup, include=FALSE}
+# Project: Frailty Trajectories Before and After Incident Cancer in the
+#          Health Professionals Follow-up Study
+# Author: Nemo Zhou
+# Date started: 2026-09-20
+# Date last updated: 2026-09-29 (M2 specification and explicit date-policy audit)
+# Purpose: Render a selected 8.1 run's preparation, survival, model comparison,
+# and chain diagnostics without fitting any model. Requires an explicit run_dir
+# (or JM_RUN_DIR); never selects a stale run implicitly. HTML belongs exclusively
+# in Results/cancer/visuals. Inline plots use embedded temporary graphics;
+# no persistent PNG or separate figure folder is retained.
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, dev="svglite", fig.width=10, fig.height=5)
+run_dir <- params$run_dir
+if (is.null(run_dir) || !nzchar(run_dir)) run_dir <- Sys.getenv("JM_RUN_DIR", "")
+if (!nzchar(run_dir) || !file.exists(file.path(run_dir,"run_status.rds"))) stop("Set params$run_dir or JM_RUN_DIR to an explicit 8.1 run directory.")
+run_dir <- normalizePath(run_dir)
+project_dir <- "/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS"
+visuals_dir <- normalizePath(file.path(project_dir,"Results","cancer","visuals"),mustWork=FALSE)
+knitr::opts_knit$set(root.dir=project_dir)
+read_csv <- function(name) {
+  p <- file.path(run_dir,name)
+  if (file.exists(p)) utils::read.csv(p,check.names=FALSE) else NULL
+}
+read_rds <- function(name) {
+  p <- file.path(run_dir,name)
+  if (file.exists(p)) readRDS(p) else NULL
+}
+show_table <- function(x) {
+  if (is.null(x) || !nrow(x)) cat("Not available for this run.\n\n") else print(knitr::kable(x,digits=4))
+}
+status <- read_rds("run_status.rds")
+config <- read_rds("configuration.rds")
+alignment <- if(!is.null(config$alignment_model_id)) config$alignment_model_id else "LEGACY / M2 alignment not established"
+synthetic <- !is.null(config$input_hashes) && any(grepl("synthetic",config$input_hashes,ignore.case=TRUE))
+report_m2 <- identical(alignment,"M2_full_spline")
+library(ggplot2)
+```
+
+## Run status and interpretation
+
+```{r status, results='asis'}
+cat("**Profile:** ",status$profile,"  \n**Status:** ",status$status,"  \n",sep="")
+cat("**Run directory:** `",run_dir,"`\n\n",sep="")
+cat("**Alignment:** ",alignment,"\n\n",sep="")
+if(synthetic) cat("**SYNTHETIC SOFTWARE QA: these values are test fixtures, not HPFS estimates.**\n\n")
+if(identical(status$status,"blocked_date_policy")) cat("**FITTING BLOCKED — unresolved month-level date policy. No component or joint model was fitted. Source cases and dates were preserved.**\n\n")
+if(!report_m2) cat("**Legacy run:** this report does not establish M2 alignment. The M2 specification below describes the revised workflow, not this historical fit.\n\n")
+if (!is.null(status$error)) cat("**Failure:** ",status$error,"\n\n",sep="")
+if(status$profile=="prepare") cat("**Preparation only: no models were fitted.**\n\n")
+if(status$profile=="pilot") cat("**NON-INFERENTIAL PILOT.** All cases plus a seeded 25% sample of retained controls; component and joint comparisons use this same sample.\n\n")
+if(status$profile=="full") cat("Numerical diagnostic success requires visual review of the trace plots below before inference. A returned model alone does not establish convergence.\n\n")
+```
+
+## Revised M2 specification
+
+The longitudinal and mortality components include index age, baseline race,
+marital status, living arrangement, categorical pack-years, calories, saturated
+fat, dietary cholesterol, and alcohol. The longitudinal fixed effects use Group
+by df-3 natural spline of years since index. Canonical M2 spline and dietary
+scaling is applied once. Random effects use participant intercepts and attained-age
+slopes, `(index_age + Age_Centered - 60)/4`, evaluated dynamically at hazard times.
+
+Current-value and current-value-plus-slope associations are prespecified.
+The joint baseline hazard uses quadratic B-splines with nine segments, identity
+time, and second-order smoothing. The Cox component initializes the joint model;
+it does not imply an unspecified Cox baseline in the final joint likelihood.
+
+This is a secondary analysis of one selected matched assignment per participant.
+Case assignments take priority; otherwise the earliest control assignment is
+retained. Selection occurs before FI/covariate exclusions. This changes the
+original matched population and does not preserve its balance automatically.
+
+Index is time zero. Pre-index FI contributes history; mortality follow-up starts
+at index conditional on being alive then, and ends at death, own cancer for
+controls, or the fixed 2020 administrative endpoint. Cancer-date ties censor
+controls. Questionnaire nonresponse is not treated as end of mortality
+ascertainment. Censoring at own cancer may be informative.
+
+Reported curves are fixed-effect FI trajectories at the common reference
+covariates, with random effects set to zero. They are not dynamically
+survivor-standardized averages. Joint-versus-longitudinal differences are
+model-based sensitivity differences, not identified mortality-bias corrections.
+The analysis neither defines FI after death nor reverses selection from survival
+to index. Residual matched-set dependence and the selected cohort remain limitations.
+
+## Date-policy decision and audit
+
+The agreed policy is to keep fitting blocked while resolving date precision.
+Diagnosis and death fields are recorded in months since 1900. Readable dates
+assign day 15; this is a convention rather than an observed day. A same-month
+record is not evidence of missing dates or death on the diagnosis day.
+Exact-day availability on the HPFS server has not been verified. No case is
+excluded and no date is shifted to make survival duration positive.
+
+Counts below cover selected assignments **before FI or M2 covariate exclusions**.
+Issue counts can overlap; the overlap table makes the two principal categories
+explicit. Absence of a death date is not an error when the participant is present
+in the death-source panel; conflicting recorded death dates are a separate issue.
+
+```{r date_audit, results='asis'}
+show_table(read_csv("date_audit_summary.csv"))
+show_table(read_csv("date_issue_overlap.csv"))
+show_table(read_csv("M2_covariate_availability.csv"))
+```
+
+## Preparation and cohort changes
+
+```{r filters, results='asis'}
+show_table(read_csv("filter_log.csv"))
+show_table(read_csv("source_hash_mismatch.csv"))
+show_table(read_csv("survival_summary.csv"))
+show_table(read_csv("clock_basis_contract.csv"))
+```
+
+```{r balance, results='asis'}
+balance <- read_csv("cohort_balance.csv")
+show_table(balance)
+if(!is.null(balance) && any(abs(balance$smd[balance$population=="JM_complete_case"])>0.1,na.rm=TRUE)) cat("**Balance warning:** selected-cohort absolute SMD exceeds 0.1 for one or more characteristics. Inspect overlap and adjustment before interpreting arm contrasts.\n\n")
+```
+
+## Relative-time support and mortality extrapolation
+
+```{r support, results='asis'}
+show_table(read_csv("support_by_time.csv"))
+z <- read_csv("mortality_extrapolation.csv")
+if(!is.null(z)) {
+  zz <- aggregate(z[c("years_after_last_FI","years_before_first_FI","beyond_canonical_boundary","beyond_cohort_FI")],list(Group=z$Group),mean)
+  show_table(zz)
+  cat("Values above are mean years per participant. Positive values identify survival follow-up requiring FI extrapolation; inspect the saved participant-level audit before interpretation.\n\n")
+}
+```
+
+## Component models and survival
+
+```{r components, results='asis'}
+show_table(read_csv("component_attempts.csv"))
+components <- read_rds("components.rds")
+if(!is.null(components)) {
+  cat("**Accepted random effects:** ",components$random_structure,"\n\n",sep="")
+  cat("**Longitudinal comparator covariance:** ",components$covariance,"\n\n",sep="")
+  if(!is.null(components$zph$table)) show_table(as.data.frame(components$zph$table)) else cat("Cox PH diagnostics unavailable.\n\n")
+}
+```
+
+```{r survival}
+if(!is.null(components$km) && length(components$km$time)) {
+  km <- components$km
+  z <- data.frame(time=km$time,survival=km$surv,Group=rep(names(km$strata),km$strata))
+  print(ggplot(z,aes(time,survival,color=Group))+geom_step()+theme_minimal()+labs(x="Years since index",y="Estimated survival",title="Descriptive Kaplan–Meier curves in the selected run cohort"))
+} else {
+  cat("Kaplan–Meier output is unavailable for this run.\n")
+}
+```
+
+## Longitudinal-only and joint-posterior comparisons
+
+```{r comparisons, results='asis'}
+longitudinal <- read_rds("longitudinal_only_summaries.rds")
+if(!is.null(longitudinal)) show_table(longitudinal$theta)
+all_curves <- list()
+if(!is.null(longitudinal) && nrow(longitudinal$curves)) {
+  z <- longitudinal$curves; z$model <- "Longitudinal only"; all_curves[[1]] <- z
+}
+for(nm in c("value","value_slope")) {
+  st <- read_rds(file.path(nm,"status.rds"))
+  cat("\n\n### Association: ",nm,"\n\n",sep="")
+  if(is.null(st)) {cat("Not fitted.\n\n"); next}
+  cat("**Status:** ",st$status,"\n\n",sep="")
+  if(!is.null(st$error)) cat(st$error,"\n\n")
+  sums <- read_rds(file.path(nm,"posterior_summaries.rds"))
+  if(is.null(sums)) {cat("No posterior inference released. Inspect fit/diagnostic status.\n\n"); next}
+  cat("**Interpretation status:** ",sums$inference_status,"\n\n",sep="")
+  show_table(sums$theta); show_table(sums$associations); show_table(sums$group_mortality_hr)
+  cat("Marginal likelihood criteria below compare eligible models within this run; no automatic model selection is performed.\n\n")
+  show_table(read_csv(file.path(nm,"marginal_fit_statistics.csv")))
+  if(nrow(sums$curves)) {z <- sums$curves; z$model <- paste("Joint",nm); all_curves[[length(all_curves)+1]] <- z}
+}
+curves <- dplyr::bind_rows(all_curves)
+if(nrow(curves)) print(ggplot(curves,aes(time,estimate,color=model,fill=model))+
+  geom_ribbon(aes(ymin=lower,ymax=upper),alpha=0.12,color=NA)+geom_line()+
+  geom_vline(xintercept=0,linetype="dashed")+facet_wrap(~quantity,scales="free_y")+
+  theme_minimal()+labs(x="Years relative to index",y="FI (derivative: FI/year)",
+  title="Same-cohort component and joint-model comparisons",
+  subtitle=if(status$profile=="pilot") "NON-INFERENTIAL PILOT" else "Pointwise intervals; review diagnostics and cohort balance"))
+```
+
+## Chain diagnostics and trace review
+
+All monitored free regression, association, residual-scale, covariance,
+baseline-hazard, and smoothing parameters require R-hat <1.05 and bulk/tail
+ESS >400 for full-run numerical eligibility. Structural covariance zeros are
+verified separately. Numerical eligibility still requires human trace review.
+
+```{r traces, results='asis', fig.height=9}
+for(nm in c("value","value_slope")) {
+  cat("\n\n### ",nm,"\n\n",sep="")
+  show_table(read_csv(file.path(nm,"mcmc_diagnostics.csv")))
+  show_table(read_csv(file.path(nm,"constrained_parameters.csv")))
+  trace <- read_rds(file.path(nm,"trace_data.rds"))
+  if(is.null(trace)) next
+  trace$label <- paste(trace$block,trace$parameter,sep=": ")
+  chunks <- split(unique(trace$label),ceiling(seq_along(unique(trace$label))/6))
+  for(labels in chunks) print(ggplot(trace[trace$label %in% labels,],aes(iteration,value,color=factor(chain)))+
+    geom_line(alpha=0.65,linewidth=0.25)+facet_wrap(~label,scales="free_y",ncol=2)+theme_minimal()+
+    labs(color="Chain",title=paste("Trace review:",nm),x="Retained draw within chain"))
+}
+```
+
+## Provenance
+
+```{r provenance}
+if(!is.null(config)) print(config[c("schema_version","alignment_model_id","profile","seed","admin_date","date_policy","covariates","random_formula","canonical_scaling","baseline_hazard","prediction_window","mcmc","input_hashes","script_hashes","priors","software_versions")])
+```

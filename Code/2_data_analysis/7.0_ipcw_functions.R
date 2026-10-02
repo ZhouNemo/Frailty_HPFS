@@ -4,7 +4,7 @@
 # Script:  7.0_ipcw_functions.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-29
-# Date last updated: 2026-07-20 (canonical earliest-cancer index date)
+# Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
 #
 # Purpose:
 #   Shared inverse-probability-of-censoring-weighting (IPCW) utilities used by
@@ -253,6 +253,8 @@ attach_ipcw_to_matched <- function(matched_path,
                                    trunc = c(0.01, 0.99)) {
 
   if (!file.exists(matched_path)) stop("Matched dataset not found at ", matched_path)
+  source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
+  provenance <- validate_matching_provenance(matched_path)
   ml <- readRDS(matched_path) %>%
     mutate(id = as.character(id), cycle = as.character(cycle))
 
@@ -282,7 +284,19 @@ attach_ipcw_to_matched <- function(matched_path,
   qs <- quantile(ml$sw_ipcw_raw, probs = trunc, na.rm = TRUE)
   ml <- ml %>% mutate(sw_ipcw = pmin(pmax(sw_ipcw_raw, qs[1]), qs[2]))
 
+  # Assignment counts are independent of whether an outcome received a weight.
+  ledger <- read_matching_assignments(matched_path)
+  attr(ml, "assignment_provenance") <- provenance[c("assignment_path", "assignment_md5", "input_md5")]
   saveRDS(ml, out_path)
+  if (!is.null(results_dir) && !is.null(out_prefix)) {
+    if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+    flow <- ledger %>% group_by(Cohort, Group) %>% summarize(
+      n_matched_assignments = n(),
+      n_with_weighted_outcomes = sum(trajectory_id %in% ml$trajectory_id),
+      n_without_outcome_rows = n_matched_assignments - n_with_weighted_outcomes,
+      .groups = "drop")
+    write.csv(flow, file.path(results_dir, paste0(out_prefix, "_assignment_flow.csv")), row.names = FALSE)
+  }
 
   cat("\nAttached IPCW to:", basename(matched_path), "\n")
   cat("Truncation bounds [", round(qs[1], 3), ",", round(qs[2], 3), "]\n")

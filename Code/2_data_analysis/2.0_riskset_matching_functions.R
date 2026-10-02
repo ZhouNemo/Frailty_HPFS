@@ -4,16 +4,16 @@
 # Script:  2.0_riskset_matching_functions.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-29
-# Date last updated: 2026-07-20 (canonical earliest-cancer index date)
+# Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
 #
 # Purpose:
 #   Shared incidence-density risk-set matching utilities used by scripts
 #   2.1-2.5. These functions prepare the longitudinal FI panel, classify
 #   incident cancer cases into analysis cohorts using precomputed cancer
 #   subgroup flags, sample matched controls with replacement from participants
-#   alive, actively followed, cancer-free, age-calipered, and same/adjacent-cycle
-#   eligible at each case's index date, and return the matched long-format
-#   analytic dataset used by downstream trajectory scripts.
+#   already enrolled, alive, cancer-free, and age-calipered at each case index.
+#   FI availability and questionnaire recency do not determine entry.
+#   Returns the matched long-format analytic data for trajectory scripts.
 #
 #   This file centralizes risk-set construction so trajectory model scripts do
 #   not recreate or overwrite matching cohorts. Downstream scripts should read
@@ -93,57 +93,94 @@ latest_observed_cycle_before <- function(obs_dates, obs_cycles, index_date) {
   list(cycle = as.character(obs_cycles[[idx]]), date = obs_dates[[idx]])
 }
 
-preindex_support <- function(obs, index_date, index_cycle, cycle_caliper,
-                             min_visits = 1L) {
-  empty <- list(
-    active_cycle = NA_character_, active_date = NA_real_, cycle_gap = NA_real_,
-    n_preindex_fi = 0L, latest_preindex_fi_date = NA_real_,
-    has_active_return = FALSE, cycle_ok = FALSE, fi_ok = FALSE, eligible = FALSE
-  )
-  if (is.null(obs) || is.na(index_date) || is.na(index_cycle)) return(empty)
+# Only index-time cohort entry, age, survival, and cancer status determine
+# control eligibility. This pure helper never inspects FI or future response.
+riskset_control_flags <- function(pool, case_id, index_date, case_age, age_caliper) {
+  age <- (index_date - pool$dob) / 12
+  flags <- data.frame(
+    not_self = pool$id != case_id,
+    entered = is.finite(pool$first) & pool$first <= index_date,
+    alive = is.na(pool$dth) | pool$dth > index_date,
+    cancer_free = is.na(pool$canc) | pool$canc > index_date,
+    age_ok = is.finite(age) & abs(age - case_age) <= age_caliper)
+  flags$eligible <- with(flags, not_self & entered & alive & cancer_free & age_ok)
+  flags$eligible[is.na(flags$eligible)] <- FALSE
+  flags
+}
 
-  valid_dates <- !is.na(obs$worked_rtmnyr)
-  if (!all(valid_dates)) obs <- obs[valid_dates, , drop = FALSE]
-  if (nrow(obs) == 0) return(empty)
-  if (is.unsorted(obs$worked_rtmnyr)) {
-    obs <- obs[order(obs$worked_rtmnyr), , drop = FALSE]
-  }
-  if (!("cum_distinct_fi" %in% names(obs))) {
-    fi_seen <- !is.na(obs$fi_score_nocancer)
-    distinct_fi <- logical(nrow(obs))
-    fi_pos <- which(fi_seen)
-    distinct_fi[fi_pos] <- !duplicated(obs$worked_rtmnyr[fi_pos])
-    obs$cum_distinct_fi <- cumsum(distinct_fi)
-    latest_marker <- ifelse(fi_seen, obs$worked_rtmnyr, -Inf)
-    obs$cum_latest_fi_date <- cummax(latest_marker)
-    obs$cum_latest_fi_date[!is.finite(obs$cum_latest_fi_date)] <- NA_real_
-  }
-  active_pos <- findInterval(index_date, obs$worked_rtmnyr)
-  if (active_pos == 0L) return(empty)
-  active_cycle <- as.character(obs$cycle[[active_pos]])
-  active_date <- as.numeric(obs$worked_rtmnyr[[active_pos]])
-  cycle_gap <- abs(cycle_to_number(active_cycle) - cycle_to_number(index_cycle))
-  n_preindex_fi <- as.integer(obs$cum_distinct_fi[[active_pos]])
-  latest_fi <- as.numeric(obs$cum_latest_fi_date[[active_pos]])
-  cycle_ok <- !is.na(cycle_gap) && cycle_gap <= (4L * cycle_caliper)
-  fi_ok <- n_preindex_fi >= min_visits
-
-  list(
-    active_cycle = active_cycle,
-    active_date = active_date,
-    cycle_gap = cycle_gap,
-    n_preindex_fi = as.integer(n_preindex_fi),
-    latest_preindex_fi_date = latest_fi,
-    has_active_return = TRUE,
-    cycle_ok = cycle_ok,
-    fi_ok = fi_ok,
-    eligible = cycle_ok && fi_ok
-  )
+# Expand already selected assignments; this helper performs no matching.
+# A zero-outcome assignment remains in the ledger, not as a phantom FI row.
+expand_matched_assignments <- function(assignments, person_level, baseline_covs,
+                                      fi_rows, cohort_levels, target_cycles,
+                                      index_age_mean, index_age_sd) {
+  ledger <- assignments %>%
+    left_join(select(person_level, id, dbmy09, dtdth, cancer_dateca,
+                     true_age_at_cancer, first_return), by = "id") %>%
+    left_join(baseline_covs, by = "id") %>%
+    mutate(index_age = (index_date - dbmy09) / 12,
+           index_age_z = (index_age - index_age_mean) / index_age_sd,
+           Group = if_else(role == "Case", "Cancer Case", "Control"),
+           trajectory_id = paste(Cohort, match_set, id, role, sep = "__"),
+           matching_id = paste(Cohort, match_set, sep = "__"),
+           eligibility_version = "no_fi_requirement_v1",
+           own_cancer_after_index = !is.na(cancer_dateca) & cancer_dateca > index_date)
+  if (anyDuplicated(ledger$trajectory_id)) stop("Duplicated assignment ledger keys.")
+  if (any(!is.finite(ledger$first_return) | ledger$first_return > ledger$index_date))
+    stop("Assignment predates analytic-cohort entry.")
+  long <- ledger %>%
+    inner_join(fi_rows, by = "id", relationship = "many-to-many") %>%
+    mutate(Age_Centered = age_at_cycle - index_age,
+           Post = if_else(Age_Centered > 0, 1L, 0L),
+           Age_Post = if_else(Post == 1L, Age_Centered, 0),
+           in_win_8 = abs(Age_Centered) <= 8,
+           in_win_12 = abs(Age_Centered) <= 12,
+           in_win_16 = abs(Age_Centered) <= 16,
+           in_win_20 = abs(Age_Centered) <= 20,
+           post_own_cancer = role == "Control" & own_cancer_after_index &
+             !is.na(worked_rtmnyr) & worked_rtmnyr >= cancer_dateca)
+  if (anyDuplicated(long[c("trajectory_id", "cycle")]))
+    stop("Duplicated trajectory_id x cycle rows detected in matched output.")
+  if (any(!long$trajectory_id %in% ledger$trajectory_id))
+    stop("Outcome row is absent from assignment ledger.")
+  availability <- long %>% group_by(trajectory_id) %>% summarize(
+    n_analytic_fi_visits = n_distinct(worked_rtmnyr),
+    n_uncensored_fi_visits = n_distinct(worked_rtmnyr[!post_own_cancer]),
+    n_preindex_fi = n_distinct(worked_rtmnyr[worked_rtmnyr <= index_date]),
+    n_postindex_fi = n_distinct(worked_rtmnyr[worked_rtmnyr > index_date]),
+    n_recent_preindex_fi = n_distinct(worked_rtmnyr[
+      worked_rtmnyr <= index_date & worked_rtmnyr >= index_date - 48]),
+    latest_preindex_fi_date = {
+      dates <- worked_rtmnyr[worked_rtmnyr <= index_date]
+      if (length(dates)) max(dates) else NA_real_
+    }, .groups = "drop")
+  ledger <- ledger %>% left_join(availability, by = "trajectory_id") %>%
+    mutate(across(c(n_analytic_fi_visits, n_uncensored_fi_visits, n_preindex_fi,
+                    n_postindex_fi, n_recent_preindex_fi), ~ coalesce(.x, 0L)),
+           fi_gap_months = index_date - latest_preindex_fi_date,
+           contributes_fi = n_uncensored_fi_visits > 0L)
+  long <- long %>% left_join(availability, by = "trajectory_id") %>%
+    mutate(fi_gap_months = index_date - latest_preindex_fi_date,
+           Cohort = factor(Cohort, levels = cohort_levels),
+           Group = factor(Group, levels = c("Control", "Cancer Case")),
+           id = factor(id), match_set = factor(match_set),
+           role = factor(role, levels = c("Control", "Case")),
+           index_cycle = factor(index_cycle, levels = target_cycles))
+  set_integrity <- ledger %>% group_by(Cohort, match_set) %>% summarize(
+    n_cases = sum(role == "Case"), n_controls = sum(role == "Control"),
+    valid_set = n_cases == 1L & n_controls >= 1L, .groups = "drop")
+  if (any(!set_integrity$valid_set)) stop("Assignment-ledger matched-set integrity failed.")
+  outcome_support <- ledger %>% group_by(Cohort, match_set) %>% summarize(
+    n_cases_with_fi = sum(role == "Case" & contributes_fi),
+    n_controls_with_fi = sum(role == "Control" & contributes_fi),
+    n_assignments_without_fi = sum(!contributes_fi),
+    both_arms_with_fi = n_cases_with_fi > 0 & n_controls_with_fi > 0,
+    .groups = "drop")
+  list(assignments = ledger, matched_long = long,
+       set_integrity = set_integrity, outcome_support = outcome_support)
 }
 
 prepare_riskset_inputs <- function(input_path,
                                    target_cycles,
-                                   min_visits,
                                    classification_vars = character(0)) {
   fi_long <- readRDS(input_path)
 
@@ -169,6 +206,9 @@ prepare_riskset_inputs <- function(input_path,
       participated      = as.numeric(as.character(participated)),
       age_at_cancer     = (cancer_dateca - dbmy09) / 12
     )
+
+  if (anyDuplicated(fi_time[c("id", "cycle")]))
+    stop("Duplicate participant-cycle records in matching input.")
 
   missing_class_vars <- setdiff(classification_vars, names(fi_time))
   if (length(missing_class_vars) > 0) {
@@ -205,8 +245,8 @@ prepare_riskset_inputs <- function(input_path,
       participated == 1,
       cycle %in% target_cycles,
       !is.na(fi_score_nocancer),
-      !is.na(worked_rtmnyr),
-      !is.na(dbmy09)
+      is.finite(worked_rtmnyr),
+      is.finite(dbmy09)
     ) %>%
     mutate(age_at_cycle = (worked_rtmnyr - dbmy09) / 12) %>%
     arrange(id, age_at_cycle)
@@ -215,8 +255,8 @@ prepare_riskset_inputs <- function(input_path,
     filter(
       participated == 1,
       cycle %in% target_cycles,
-      !is.na(worked_rtmnyr),
-      !is.na(dbmy09)
+      is.finite(worked_rtmnyr),
+      is.finite(dbmy09)
     ) %>%
     mutate(
       observed_raw = TRUE,
@@ -244,7 +284,7 @@ prepare_riskset_inputs <- function(input_path,
 
   # Participation, rather than the number or span of FI outcomes over the full
   # record, defines the population that can enter an index-time risk set.
-  # Index-specific FI support is evaluated later using only rows on/before index.
+  # FI availability never determines matching eligibility.
   person_level <- observation_panel %>%
     group_by(id) %>%
     arrange(age_at_cycle, .by_group = TRUE) %>%
@@ -296,11 +336,8 @@ prepare_riskset_inputs <- function(input_path,
 
 match_one_cohort <- function(case_df,
                              pool,
-                             observation_by_id,
                              ratio,
                              age_caliper,
-                             cycle_caliper,
-                             min_visits,
                              cohort_label,
                              seed = 20260703) {
   match_case <- function(i) {
@@ -310,52 +347,19 @@ match_one_cohort <- function(case_df,
     icyc  <- case_df$index_cycle[[i]]
 
     age_at_index <- (idate - pool$dob) / 12
-    not_self <- pool$id != cid
-    alive <- is.na(pool$dth) | pool$dth > idate
-    cancer_free <- is.na(pool$canc) | pool$canc > idate
-    age_ok <- abs(age_at_index - iage) <= age_caliper
-    base_elig <- not_self & alive & cancer_free & age_ok
-    base_idx <- which(base_elig)
-    base_ids <- pool$id[base_idx]
-    base_age_at_index <- age_at_index[base_idx]
-
-    support <- lapply(base_ids, function(pid) {
-      obs <- observation_by_id[[as.character(pid)]]
-      preindex_support(obs, idate, icyc, cycle_caliper, min_visits)
-    })
-    active_cycle <- vapply(support, `[[`, character(1), "active_cycle")
-    active_date <- vapply(support, `[[`, numeric(1), "active_date")
-    cycle_gap <- vapply(support, `[[`, numeric(1), "cycle_gap")
-    n_preindex_fi <- vapply(support, `[[`, integer(1), "n_preindex_fi")
-    latest_preindex_fi_date <- vapply(support, `[[`, numeric(1), "latest_preindex_fi_date")
-    active_followup <- vapply(support, `[[`, logical(1), "has_active_return")
-    cycle_ok <- vapply(support, `[[`, logical(1), "cycle_ok")
-    fi_ok <- vapply(support, `[[`, logical(1), "fi_ok")
-    elig_post_base <- active_followup & cycle_ok & fi_ok
-    cand <- data.frame(
-      id = base_ids[elig_post_base],
-      control_index_age = base_age_at_index[elig_post_base],
-      age_gap = base_age_at_index[elig_post_base] - iage,
-      control_active_cycle = active_cycle[elig_post_base],
-      control_active_date = active_date[elig_post_base],
-      cycle_gap = cycle_gap[elig_post_base],
-      n_preindex_fi = n_preindex_fi[elig_post_base],
-      latest_preindex_fi_date = latest_preindex_fi_date[elig_post_base],
-      stringsAsFactors = FALSE
-    )
-
-    fail <- data.frame(
-      match_set = cid,
-      Cohort = cohort_label,
+    flags <- riskset_control_flags(pool, cid, idate, iage, age_caliper)
+    base_idx <- which(flags$eligible)
+    cand <- data.frame(id = pool$id[base_idx],
+                       control_index_age = age_at_index[base_idx],
+                       age_gap = age_at_index[base_idx] - iage,
+                       stringsAsFactors = FALSE)
+    fail <- with(flags, data.frame(
+      match_set = cid, Cohort = cohort_label,
       failed_not_self = sum(!not_self, na.rm = TRUE),
-      failed_alive = sum(not_self & !alive, na.rm = TRUE),
-      failed_cancer_free = sum(not_self & alive & !cancer_free, na.rm = TRUE),
-      failed_age_caliper = sum(not_self & alive & cancer_free & !age_ok, na.rm = TRUE),
-      failed_active_followup = sum(!active_followup, na.rm = TRUE),
-      failed_cycle_caliper = sum(active_followup & !cycle_ok, na.rm = TRUE),
-      failed_preindex_fi = sum(active_followup & cycle_ok & !fi_ok, na.rm = TRUE),
-      stringsAsFactors = FALSE
-    )
+      failed_cohort_entry = sum(not_self & !entered, na.rm = TRUE),
+      failed_alive = sum(not_self & entered & !alive, na.rm = TRUE),
+      failed_cancer_free = sum(not_self & entered & alive & !cancer_free, na.rm = TRUE),
+      failed_age_caliper = sum(not_self & entered & alive & cancer_free & !age_ok, na.rm = TRUE)))
     if (nrow(cand) == 0) {
       return(list(assignment = NULL, n_eligible = 0L, fail = fail))
     }
@@ -378,11 +382,6 @@ match_one_cohort <- function(case_df,
       donor_case_id = cid,
       riskset_size = nrow(cand),
       age_gap = picked$age_gap,
-      cycle_gap = picked$cycle_gap,
-      control_active_cycle = picked$control_active_cycle,
-      control_active_date = picked$control_active_date,
-      n_preindex_fi = picked$n_preindex_fi,
-      latest_preindex_fi_date = picked$latest_preindex_fi_date,
       role = "Control",
       Cohort = cohort_label,
       stringsAsFactors = FALSE
@@ -416,14 +415,9 @@ match_one_cohort <- function(case_df,
     index_cycle_rule = case_df$index_cycle_rule,
     donor_case_id = case_df$id,
     riskset_size = n_eligible,
-    age_gap = 0,
-    cycle_gap = case_df$case_cycle_gap,
-    control_active_cycle = case_df$case_active_cycle,
-    control_active_date = case_df$case_active_date,
-    n_preindex_fi = case_df$n_preindex_fi,
-    latest_preindex_fi_date = case_df$latest_preindex_fi_date,
-    role = "Case",
-    Cohort = cohort_label,
+    age_gap = rep(0, nrow(case_df)),
+    role = rep("Case", nrow(case_df)),
+    Cohort = rep(cohort_label, nrow(case_df)),
     stringsAsFactors = FALSE
   )
 
@@ -448,93 +442,32 @@ build_riskset_matched_long <- function(input_path,
                                        target_cycles,
                                        match_ratio,
                                        age_caliper,
-                                       cycle_caliper = 1L,
-                                       min_visits,
-                                       seed,
+                                           seed,
                                        index_age_scaling = NULL,
                                        max_unmatched_fraction = 0.10,
                                        max_absolute_smd = 0.05) {
   prepped <- prepare_riskset_inputs(
     input_path = input_path,
     target_cycles = target_cycles,
-    min_visits = min_visits,
     classification_vars = classification_vars
   )
 
   person_level <- prepped$person_level
   person_level$case_cohort <- classify_fn(person_level)
 
-  observation_by_id <- split(
-    prepped$observation_panel[, c("id", "cycle", "worked_rtmnyr", "fi_score_nocancer")],
-    prepped$observation_panel$id
-  )
-  observation_by_id <- lapply(observation_by_id, function(obs) {
-    obs <- obs[order(obs$worked_rtmnyr), , drop = FALSE]
-    fi_seen <- !is.na(obs$fi_score_nocancer)
-    distinct_fi <- logical(nrow(obs))
-    fi_pos <- which(fi_seen)
-    distinct_fi[fi_pos] <- !duplicated(obs$worked_rtmnyr[fi_pos])
-    obs$cum_distinct_fi <- cumsum(distinct_fi)
-    latest_marker <- ifelse(fi_seen, obs$worked_rtmnyr, -Inf)
-    obs$cum_latest_fi_date <- cummax(latest_marker)
-    obs$cum_latest_fi_date[!is.finite(obs$cum_latest_fi_date)] <- NA_real_
-    obs
-  })
-
   case_candidates <- person_level %>%
     filter(
       is_case == 1,
-      !is.na(true_age_at_cancer),
+      is.finite(true_age_at_cancer),
       !is.na(case_cohort),
       !is.na(index_cycle)
     ) %>%
     arrange(cancer_dateca)
 
-  case_support <- lapply(seq_len(nrow(case_candidates)), function(i) {
-    preindex_support(
-      observation_by_id[[case_candidates$id[[i]]]],
-      case_candidates$cancer_dateca[[i]],
-      case_candidates$index_cycle[[i]],
-      cycle_caliper,
-      min_visits
-    )
-  })
-  if (nrow(case_candidates) > 0) {
-    case_candidates <- case_candidates %>%
-      mutate(
-        case_active_cycle = vapply(case_support, `[[`, character(1), "active_cycle"),
-        case_active_date = vapply(case_support, `[[`, numeric(1), "active_date"),
-        case_cycle_gap = vapply(case_support, `[[`, numeric(1), "cycle_gap"),
-        n_preindex_fi = vapply(case_support, `[[`, integer(1), "n_preindex_fi"),
-        latest_preindex_fi_date = vapply(case_support, `[[`, numeric(1), "latest_preindex_fi_date"),
-        has_active_return = vapply(case_support, `[[`, logical(1), "has_active_return"),
-        active_cycle_ok = vapply(case_support, `[[`, logical(1), "cycle_ok"),
-        preindex_fi_ok = vapply(case_support, `[[`, logical(1), "fi_ok"),
-        active_at_index = vapply(case_support, `[[`, logical(1), "eligible"),
-        exclusion_reason = case_when(
-          !has_active_return ~ "no_participated_return_on_or_before_index",
-          !active_cycle_ok ~ "latest_participated_cycle_outside_caliper",
-          !preindex_fi_ok ~ "insufficient_preindex_fi",
-          TRUE ~ NA_character_
-        )
-      )
-  } else {
-    case_candidates <- case_candidates %>%
-      mutate(
-        case_active_cycle = character(),
-        case_active_date = numeric(),
-        case_cycle_gap = numeric(),
-        n_preindex_fi = integer(),
-        latest_preindex_fi_date = numeric(),
-        has_active_return = logical(),
-        active_cycle_ok = logical(),
-        preindex_fi_ok = logical(),
-        active_at_index = logical(),
-        exclusion_reason = character()
-      )
-  }
-  inactive_cases <- case_candidates %>% filter(!active_at_index)
-  cases <- case_candidates %>% filter(active_at_index)
+  # No FI or response-recency exclusion is applied to incident case candidates.
+  cases <- case_candidates
+  inactive_cases <- case_candidates[FALSE, , drop = FALSE]
+  inactive_cases$exclusion_reason <- character(0)
 
   pool <- list(
     id = person_level$id,
@@ -550,11 +483,8 @@ build_riskset_matched_long <- function(input_path,
     match_one_cohort(
       case_df = cdf,
       pool = pool,
-      observation_by_id = observation_by_id,
       ratio = match_ratio,
       age_caliper = age_caliper,
-      cycle_caliper = cycle_caliper,
-      min_visits = min_visits,
       cohort_label = cl,
       seed = seed
     )
@@ -562,6 +492,7 @@ build_riskset_matched_long <- function(input_path,
   names(matched_by_cohort) <- cohort_levels
 
   assignments <- bind_rows(lapply(matched_by_cohort, `[[`, "assignments"))
+  if (!nrow(assignments)) stop("No eligible matched assignments; no output saved.")
   unmatched_cases <- bind_rows(lapply(matched_by_cohort, `[[`, "unmatched_cases"))
 
   keep_cols <- c(
@@ -576,9 +507,7 @@ build_riskset_matched_long <- function(input_path,
 
   fi_rows <- prepped$fi_trajectory %>%
     semi_join(person_level, by = "id") %>%
-    select(all_of(fi_keep_cols)) %>%
-    left_join(prepped$baseline_covs, by = "id") %>%
-    left_join(select(person_level, id, dbmy09, cancer_dateca, true_age_at_cancer), by = "id")
+    select(all_of(fi_keep_cols))
 
   assignment_ages <- assignments %>%
     left_join(select(person_level, id, dbmy09), by = "id") %>%
@@ -613,91 +542,38 @@ build_riskset_matched_long <- function(input_path,
     stringsAsFactors = FALSE
   )
 
-  matched_long <- assignments %>%
-    inner_join(fi_rows, by = "id", relationship = "many-to-many") %>%
-    mutate(
-      index_age    = (index_date - dbmy09) / 12,
-      Age_Centered = age_at_cycle - index_age,
-      Post         = if_else(Age_Centered > 0, 1L, 0L),
-      Age_Post     = if_else(Post == 1L, Age_Centered, 0),
-      Group        = if_else(role == "Case", "Cancer Case", "Control"),
-      in_win_8     = abs(Age_Centered) <= 8,
-      in_win_12    = abs(Age_Centered) <= 12,
-      in_win_16    = abs(Age_Centered) <= 16,
-      in_win_20    = abs(Age_Centered) <= 20,
-      own_cancer_after_index = !is.na(cancer_dateca) & cancer_dateca > index_date,
-      post_own_cancer = role == "Control" &
-        own_cancer_after_index &
-        !is.na(worked_rtmnyr) &
-        worked_rtmnyr >= cancer_dateca,
-      trajectory_id = paste(Cohort, match_set, id, role, sep = "__")
-    ) %>%
-    mutate(index_age_z = (index_age - index_age_mean) / index_age_sd) %>%
-    mutate(
-      Cohort    = factor(Cohort, levels = cohort_levels),
-      Group     = factor(Group, levels = c("Control", "Cancer Case")),
-      match_set = factor(match_set),
-      id        = factor(id),
-      role      = factor(role, levels = c("Control", "Case")),
-      index_cycle = factor(index_cycle, levels = target_cycles)
-    )
-
-  duplicate_rows <- matched_long %>%
-    count(trajectory_id, cycle) %>%
-    filter(n > 1)
-
-  if (nrow(duplicate_rows) > 0) {
-    stop("Duplicated trajectory_id x cycle rows detected in matched output.")
-  }
-
-  set_integrity <- matched_long %>%
-    distinct(Cohort, match_set, id, role, trajectory_id) %>%
-    group_by(Cohort, match_set) %>%
-    summarize(
-      n_cases = sum(role == "Case"),
-      n_controls = sum(role == "Control"),
-      valid_set = n_cases == 1L & n_controls >= 1L,
-      .groups = "drop"
-    )
-  if (any(!set_integrity$valid_set)) {
-    stop("Post-expansion matched-set integrity failed: every set must contain exactly one case and at least one control.")
-  }
-  caliper_integrity <- assignments %>%
-    summarize(
-      max_abs_age_gap = max(abs(age_gap), na.rm = TRUE),
-      max_cycle_gap_years = max(cycle_gap, na.rm = TRUE),
-      all_age_ok = all(abs(age_gap) <= age_caliper),
-      all_cycle_ok = all(cycle_gap <= 4L * cycle_caliper),
-      all_preindex_fi_ok = all(n_preindex_fi >= min_visits),
-      .groups = "drop"
-    )
-  if (!all(caliper_integrity$all_age_ok, caliper_integrity$all_cycle_ok,
-           caliper_integrity$all_preindex_fi_ok)) {
-    stop("Post-matching age, cycle, or pre-index FI integrity check failed.")
-  }
+  expanded <- expand_matched_assignments(assignments, person_level,
+    prepped$baseline_covs, fi_rows, cohort_levels, target_cycles,
+    index_age_mean, index_age_sd)
+  assignment_ledger <- expanded$assignments
+  matched_long <- expanded$matched_long
+  set_integrity <- expanded$set_integrity
+  caliper_integrity <- assignment_ledger %>% summarize(
+    max_abs_age_gap = max(abs(age_gap)),
+    all_age_ok = all(abs(age_gap) <= age_caliper),
+    all_entry_ok = all(first_return <= index_date), .groups = "drop")
+  if (!all(caliper_integrity$all_age_ok, caliper_integrity$all_entry_ok))
+    stop("Post-matching age or cohort-entry integrity check failed.")
 
   diagnostics <- bind_rows(lapply(cohort_levels, function(cl) {
     res <- matched_by_cohort[[cl]]
     data.frame(
       Cohort = cl,
       cases_identified = sum(case_candidates$case_cohort == cl),
-      cases_excluded_inactive = sum(inactive_cases$case_cohort == cl),
       cases_attempted = length(res$n_eligible),
       cases_with_controls = sum(res$n_eligible > 0),
       cases_without_controls = sum(res$n_eligible == 0),
       control_records = sum(res$assignments$role == "Control"),
       distinct_controls = n_distinct(res$assignments$id[res$assignments$role == "Control"]),
-      min_visits = min_visits,
-      match_ratio = match_ratio,
+        match_ratio = match_ratio,
       age_caliper = age_caliper,
-      cycle_caliper_adjacent_cycles = cycle_caliper,
       seed = seed,
       stringsAsFactors = FALSE
     )
   }))
 
   fail_diagnostics <- bind_rows(lapply(matched_by_cohort, `[[`, "fail_counts"))
-  reuse_diagnostics <- matched_long %>%
+  reuse_diagnostics <- assignment_ledger %>%
     filter(role == "Control") %>%
     distinct(Cohort, match_set, id, trajectory_id) %>%
     count(id, name = "control_assignment_count") %>%
@@ -706,15 +582,15 @@ build_riskset_matched_long <- function(input_path,
   post_own_cancer_diagnostics <- matched_long %>%
     filter(role == "Control") %>%
     summarize(
-      control_assignments_with_later_own_cancer = n_distinct(trajectory_id[own_cancer_after_index]),
+      control_assignments_with_later_own_cancer = sum(assignment_ledger$role == "Control" &
+        assignment_ledger$own_cancer_after_index),
       rows_flagged_post_own_cancer = sum(post_own_cancer, na.rm = TRUE),
       .groups = "drop"
     )
 
-  visit_support_diagnostics <- matched_long %>%
-    distinct(Cohort, Group, trajectory_id, cycle, worked_rtmnyr) %>%
-    count(Cohort, Group, trajectory_id, name = "n_analytic_fi_visits") %>%
-    count(Cohort, Group, n_analytic_fi_visits, name = "n_trajectories")
+  visit_support_diagnostics <- assignment_ledger %>%
+    count(Cohort, Group, n_analytic_fi_visits, n_uncensored_fi_visits,
+          name = "n_trajectories")
 
   standardized_difference <- function(x_case, x_control) {
     denom <- sqrt((stats::var(x_case, na.rm = TRUE) + stats::var(x_control, na.rm = TRUE)) / 2)
@@ -762,8 +638,10 @@ build_riskset_matched_long <- function(input_path,
     target_cycles = target_cycles,
     match_ratio = match_ratio,
     age_caliper_years = age_caliper,
-    cycle_caliper_adjacent_cycles = cycle_caliper,
-    min_preindex_fi_visits = min_visits,
+    eligibility_version = "no_fi_requirement_v1",
+    fi_requirement = "none",
+    cohort_entry_rule = "first_participated_analytic_cycle_return",
+    control_entry_on_or_before_index = TRUE,
     max_unmatched_fraction = max_unmatched_fraction,
     max_absolute_smd = max_absolute_smd,
     seed = seed,
@@ -772,6 +650,8 @@ build_riskset_matched_long <- function(input_path,
 
   list(
     matched_long = matched_long,
+    assignments = assignment_ledger,
+    outcome_support = expanded$outcome_support,
     diagnostics = diagnostics,
     fail_diagnostics = fail_diagnostics,
     inactive_cases = inactive_cases,
@@ -789,7 +669,10 @@ build_riskset_matched_long <- function(input_path,
 }
 
 save_riskset_match <- function(matched_result, output_path, label) {
+  assignment_path <- sub("_long[.]rds$", "_assignments.rds", output_path)
+  if (identical(assignment_path, output_path)) stop("Expected a primary *_long.rds output path.")
   saveRDS(matched_result$matched_long, output_path)
+  saveRDS(matched_result$assignments, assignment_path)
   diagnostics_dir <- file.path(dirname(dirname(output_path)), "Results", "cancer", "data", "matching_diagnostics")
   if (!dir.exists(diagnostics_dir)) dir.create(diagnostics_dir, recursive = TRUE)
   output_stem <- tools::file_path_sans_ext(basename(output_path))
@@ -814,6 +697,10 @@ save_riskset_match <- function(matched_result, output_path, label) {
   write.csv(matched_result$visit_support_diagnostics,
             file.path(diagnostics_dir, paste0(output_stem, "_visit_support.csv")),
             row.names = FALSE)
+  write.csv(matched_result$outcome_support,
+            file.path(diagnostics_dir, paste0(output_stem, "_outcome_support.csv")), row.names = FALSE)
+  write.csv(matched_result$assignments %>% filter(!contributes_fi),
+            file.path(diagnostics_dir, paste0(output_stem, "_zero_fi_assignments.csv")), row.names = FALSE)
   write.csv(matched_result$set_integrity,
             file.path(diagnostics_dir, paste0(output_stem, "_set_integrity.csv")),
             row.names = FALSE)
@@ -830,6 +717,8 @@ save_riskset_match <- function(matched_result, output_path, label) {
           file.path(diagnostics_dir, paste0(output_stem, "_scaling_metadata.rds")))
   matched_result$run_metadata$output_path <- normalizePath(output_path, mustWork = FALSE)
   matched_result$run_metadata$output_md5 <- unname(tools::md5sum(output_path))
+  matched_result$run_metadata$assignment_path <- normalizePath(assignment_path, mustWork = FALSE)
+  matched_result$run_metadata$assignment_md5 <- unname(tools::md5sum(assignment_path))
   saveRDS(matched_result$run_metadata,
           file.path(diagnostics_dir, paste0(output_stem, "_run_metadata.rds")))
   saveRDS(
@@ -845,6 +734,9 @@ save_riskset_match <- function(matched_result, output_path, label) {
 
   cat("\n", label, "\n", sep = "")
   cat("Saved matched dataset to: ", output_path, "\n", sep = "")
+  cat("Saved complete assignment ledger to: ", assignment_path, "\n", sep = "")
+  cat("Selected assignments: ", nrow(matched_result$assignments), "\n", sep = "")
+  cat("Assignments without uncensored FI: ", sum(!matched_result$assignments$contributes_fi), "\n", sep = "")
   cat("Matched analytic rows: ", nrow(matched_result$matched_long), "\n", sep = "")
   print(table(Cohort = matched_result$matched_long$Cohort,
               Group = matched_result$matched_long$Group))

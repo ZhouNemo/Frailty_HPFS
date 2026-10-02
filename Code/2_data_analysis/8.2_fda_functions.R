@@ -4,7 +4,7 @@
 # Script:  8.2_fda_functions.R
 # Author:  Nemo Zhou
 # Date started:      2026-06-29
-# Date last updated: 2026-07-22 (renamed from 5.0_fda_functions.R)
+# Date last updated: 2026-09-28 (recent-FI eligibility and retired matching designs)
 #
 # Purpose:
 #   Shared functional data analysis (FDA) utilities used by 8.3+. Converts a
@@ -49,6 +49,8 @@ prepare_fda_input <- function(matched_path,
     stop("Matched dataset not found at ", matched_path,
          if (!is.null(builder_script)) paste0(". Run ", builder_script, " first.") else "")
   }
+  source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
+  validate_matching_provenance(matched_path)
   ml <- readRDS(matched_path)
   miss <- setdiff(req, names(ml))
   if (length(miss) > 0) stop("Matched dataset missing columns: ", paste(miss, collapse = ", "))

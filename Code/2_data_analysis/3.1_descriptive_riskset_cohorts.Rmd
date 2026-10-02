@@ -15,7 +15,7 @@ Project: Frailty Trajectories Before and After Incident Cancer in the
 Script:  3.1_descriptive_riskset_cohorts.Rmd
 Author:  Nemo Zhou
 Date started:      2026-06-29
-Date last updated: 2026-07-18 (added primary pre-GLME QC gate)
+Date last updated: 2026-09-29 (FI-independent matching and complete assignment ledgers)
 
 Purpose:
   Matching-cohort descriptive EDA report for the risk-set matched analytic
@@ -100,6 +100,8 @@ read_matched <- function(analysis, matched_path) {
   if (!file.exists(matched_path)) {
     stop("Matched dataset not found for ", analysis, ": ", matched_path)
   }
+  source("/Users/nemo/Library/CloudStorage/OneDrive-HarvardUniversity/Research/Frailty HPFS/Code/2_data_analysis/2.0_matching_provenance.R")
+  validate_matching_provenance(matched_path)
   dat <- readRDS(matched_path)
   missing_cols <- setdiff(required_matched_cols, names(dat))
   if (length(missing_cols) > 0) {
@@ -248,6 +250,10 @@ matched_long_raw <- bind_rows(lapply(seq_len(nrow(matched_files)), function(i) {
   read_matched(matched_files$Analysis[i], matched_files$matched_path[i])
 }))
 
+matched_assignments <- bind_rows(lapply(seq_len(nrow(matched_files)), function(i) {
+  read_matching_assignments(matched_files$matched_path[i]) %>% mutate(Analysis = matched_files$Analysis[i])
+}))
+
 overall_pre_glme_qc_gate <- matched_long_raw %>%
   filter(Analysis == "Overall Incident Cancer", Cohort == "All Cancer Cohort") %>%
   group_by(Group) %>%
@@ -260,6 +266,12 @@ overall_pre_glme_qc_gate <- matched_long_raw %>%
     n_rows_after_primary_censoring = sum(!post_own_cancer),
     .groups = "drop"
   )
+
+overall_pre_glme_qc_gate <- matched_assignments %>%
+  filter(Analysis == "Overall Incident Cancer", Cohort == "All Cancer Cohort") %>%
+  group_by(Group) %>% summarize(n_matched_assignments = n(),
+    n_assignments_without_usable_fi = sum(!contributes_fi), .groups = "drop") %>%
+  left_join(overall_pre_glme_qc_gate, by = "Group")
 
 overall_yield_path <- file.path(results_dir, "matching_diagnostics",
                                  "riskset_matched_overall_long_yield.csv")
@@ -299,7 +311,7 @@ if (file.exists(raw_path)) {
 
 
 # -----------------------------------------------------------------------------
-# 4. Assignment-level analytic summaries
+# 4. All matched assignments, with observed-FI summaries
 # -----------------------------------------------------------------------------
 
 assignment_summary <- matched_long %>%
@@ -326,6 +338,11 @@ assignment_summary <- matched_long %>%
     has_pre_index_fi = n_pre_index_fi > 0,
     has_post_index_fi = n_post_index_fi > 0
   )
+
+assignment_summary <- complete_assignment_summary(matched_assignments, assignment_summary,
+  keys = c("Analysis", "Cohort", "match_set", "id", "role", "Group"),
+  count_columns = c("n_fi_observations", "n_pre_index_fi", "n_post_index_fi")) %>%
+  mutate(has_pre_index_fi = n_pre_index_fi > 0, has_post_index_fi = n_post_index_fi > 0)
 
 if (!is.null(baseline_extra)) {
   assignment_summary <- assignment_summary %>%
@@ -532,7 +549,7 @@ p_overall_matched_relative_fi <- ggplot(
   ) +
   theme(legend.position = "bottom")
 
-overall_index_age_distribution <- matched_long %>%
+overall_index_age_distribution <- matched_assignments %>%
   filter(Analysis == "Overall Incident Cancer") %>%
   mutate(
     assignment_id = paste(match_set, id, role, sep = "__")
